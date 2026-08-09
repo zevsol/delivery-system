@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -18,6 +19,10 @@ def load_json(path: Path) -> dict:
     require(path)
     with path.open(encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def main() -> None:
@@ -86,7 +91,19 @@ def main() -> None:
         if case_id not in conformance:
             raise ValueError(f"Missing conformance scenario: {case_id}")
 
-    print("V0 repository structure and projection validation passed.")
+    distribution_root = ROOT / "plugins" / "delivery-system-openai"
+    distribution = load_json(distribution_root / "DISTRIBUTION-MANIFEST.json")
+    if distribution.get("source") != "adapters/delivery-system-openai":
+        raise ValueError("Unexpected distribution source")
+    for relative_path, expected_hash in distribution.get("files", {}).items():
+        source_file = adapter_root / relative_path
+        distribution_file = distribution_root / relative_path
+        require(source_file)
+        require(distribution_file)
+        if digest(source_file) != expected_hash or digest(distribution_file) != expected_hash:
+            raise ValueError(f"Distribution is out of sync: {relative_path}")
+
+    print("V0 repository, projection, and distribution validation passed.")
 
 
 if __name__ == "__main__":

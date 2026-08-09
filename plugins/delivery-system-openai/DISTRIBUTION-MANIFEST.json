@@ -1,0 +1,13 @@
+{
+  "generated": true,
+  "source": "adapters/delivery-system-openai",
+  "generator": "scripts/build_openai_distribution.py",
+  "files": {
+    "skills/audit-delivery/SKILL.md": "d5afc3f862109bad7bea294a11aade0be2fd3e99febb2ec020906bd128a342ca",
+    "skills/execute-delivery/SKILL.md": "0b84825d7d946cd5655e712993a05170ca7130f3253a305d98433e28e7b257e6",
+    "skills/idea-to-delivery/SKILL.md": "4788136c163d4550c0ab8bbe2a61fcd2b059ec7132a31803ff98aba733933787",
+    "skills/idea-to-delivery/references/core-projection.md": "2ece23e6c1916ab6d5e07754cd59bf77c6b12095ed54d42fc10c78eb5c3f8263",
+    "skills/execute-delivery/references/core-projection.md": "0b544984aa86d7d8de25eb975d0592ddfae935e693c0fdf2fc570d6732ff6b88",
+    "skills/audit-delivery/references/core-projection.md": "14e45ee84d89c8d986647985507a52ab95e5e937b955e2da3ed2f4ff0cb3bd59"
+  }
+}
