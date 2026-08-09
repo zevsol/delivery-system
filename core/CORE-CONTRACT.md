@@ -32,9 +32,10 @@ core/
 ├── workflows/       角色如何推进交付阶段
 ├── policies/        所有角色共同遵守的治理规则
 ├── schemas/         机器可读的稳定产物结构
-├── templates/       可按项目规模裁剪的产物模板
-└── conformance/     行为与语义一致性规则
+└── templates/       可按项目规模裁剪的产物模板
 ```
+
+平台无关的行为场景位于 `tests/conformance/`；它们验证 Core 语义，但不属于 Core 的规范源文件。
 
 Core 不直接连接 GitHub、Linear、Jira、文档系统或 MCP Server。外部系统连接属于 Optional Tool Layer；宿主平台对工具、权限、审批与安装的支持属于 Platform Adapter。
 
@@ -225,17 +226,3 @@ Core Contract 使用语义化版本原则：
 - 修订版本：澄清、示例和不改变语义的修正。
 
 变更 Core Contract 必须记录动机、受影响的 Schema/模板/测试、Adapter 影响和迁移策略。适配器必须声明其支持的 Core 版本；不兼容时不得声称完全符合。
-
-## 15. Phase 1 已确认决策与待决事项
-
-已确认：
-
-- 使用 MIT License；
-- 首版 Core 文档只维护中文；多语言维护作为后续范围；
-- 小型项目允许省略 `MILE-` 与 `FEAT-` 编号；
-- 首个 Git 提交包含项目骨架与已审查的 Core Contract；本地规格源文档和 `temp.txt` 不纳入版本控制。
-
-仍待后续设计确认：
-
-- JSON Schema 采用 Draft 2020-12；具体校验工具待确定性校验需求明确后决定；
-- 公开支持渠道、漏洞报告地址和发布平台，待公开发布规划阶段决定。
