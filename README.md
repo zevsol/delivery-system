@@ -25,3 +25,9 @@ Delivery System 是一个平台无关的软件交付工作流系统。它把模�
 ## 贡献与支持
 
 贡献方式见 [CONTRIBUTING.md](CONTRIBUTING.md)。安全问题见 [SECURITY.md](SECURITY.md)。公开支持渠道将在项目发布准备阶段确定。
+
+## 使用与维护
+
+- [本地安装与更新](docs/guides/local-install.md)
+- [Adapter 与分发包维护](docs/guides/adapter-maintenance.md)
+- [发布前检查清单](docs/release/openai-codex-release-checklist.md)

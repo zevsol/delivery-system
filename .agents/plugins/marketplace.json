@@ -1,7 +1,7 @@
 {
-  "name": "personal",
+  "name": "delivery-system",
   "interface": {
-    "displayName": "Personal"
+    "displayName": "Delivery System"
   },
   "plugins": [
     {

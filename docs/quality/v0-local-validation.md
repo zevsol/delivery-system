@@ -1,6 +1,6 @@
 # V0 本地验收报告
 
-> 状态：结构、静态与投影一致性验证通过；宿主安装与触发验证待执行。
+> 状态：结构、静态、投影一致性与本地 marketplace 安装通过；真实 Skill 场景验证待执行。
 
 ## V0 范围
 
@@ -16,9 +16,10 @@
 | JSON Schema 可解析 | 通过 | `ConvertFrom-Json` |
 | Plugin manifest 官方校验 | 通过 | `validate_plugin.py` |
 | 三份 Skill 官方快速校验 | 通过 | `quick_validate.py`，UTF-8 模式 |
-| V0 结构与投影一致性 | 通过 | `python scripts/validate_v0.py` |
+| V0 结构、投影与分发一致性 | 通过 | `python scripts/validate_v0.py` |
 | Core Behavior 场景 | 已定义 | `tests/conformance/core-behavior.md` |
-| 宿主安装和触发 | 待执行 | 需要本地 marketplace 与新会话 |
+| 本地 marketplace 安装 | 通过 | `delivery-system-openai@delivery-system`，版本 `0.1.0` |
+| 真实 Skill 场景触发 | 待执行 | 需要目标宿主的新会话 |
 
 ## 已知限制
 
@@ -33,6 +34,6 @@ V0 在以下条件全部满足后可标记为本地可用：
 
 1. `python scripts/validate_v0.py` 通过；
 2. 官方 Plugin 和 Skill 校验器通过；
-3. 插件经本地 marketplace 安装后，在新会话中可显式发现三项 Skill；当前 Adapter 目录与官方 marketplace 脚手架的 `plugins/<plugin-name>` 约定存在布局决策待定；
+3. 插件经本地 marketplace 安装后，在新会话中可显式发现三项 Skill；
 4. 使用 CB-001、CB-005、CB-006 的代表输入验证角色边界；
 5. 安装或测试未改变用户项目文件，且所有限制均在报告中保留。
