@@ -34,5 +34,6 @@ Delivery System 是一个平台无关的软件交付工作流系统。它把模�
 - [Adapter 与分发包维护](docs/guides/adapter-maintenance.md)
 - [版本与发布维护](docs/maintainers/versioning-and-releases.md)
 - [跨平台 Adapter 路线](docs/roadmap/cross-platform-adapters.md)
+- [新平台 Adapter 开发指南](docs/maintainers/adapter-development.md)
 - [发布前检查清单](docs/release/openai-codex-release-checklist.md)
 - [V0 完善任务总览](docs/tasks/v0-completion/README.md)
