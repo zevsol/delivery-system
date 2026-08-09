@@ -26,7 +26,7 @@
 - Core 投影目前采用受控同步副本；`SYNC-MANIFEST.json` 与 `validate_v0.py` 检查其来源版本与关键条款，尚未实现自动生成器。
 - OpenAI/Codex 的文件读写、审批和隐式触发需要在实际宿主环境验证。
 - 未实现外部工具层或任何对外写操作。
-- 未开始 Claude、Cursor、Generic Agent 或 CLI Adapter；它们均为 TBD / Requires verification。
+- 未开始 Claude、Cursor、GitHub Copilot、Gemini、Generic Agent 或 CLI Adapter；这些对接均已搁置，且在恢复前均为 TBD / Requires verification。
 
 ## V0 通过条件
 

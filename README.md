@@ -16,7 +16,7 @@ Delivery System 是一个平台无关的软件交付工作流系统。它把模�
 
 ## 项目状态
 
-尚未公开发布、尚未提供外部集成或自有 MCP。OpenAI/Codex Adapter 已完成本地结构校验与 marketplace 安装；新会话中的显式/隐式触发仍需人工体验验证。未核验的平台能力必须标记为 `TBD / Requires verification`。
+尚未公开发布、尚未提供外部集成或自有 MCP。OpenAI/Codex Adapter 已完成本地结构校验与 marketplace 安装；新会话中的显式/隐式触发仍需人工体验验证。其他平台的 Adapter 工作目前已搁置；未核验的平台能力必须标记为 `TBD / Requires verification`。
 
 ## 许可证
 

@@ -2,7 +2,7 @@
 
 ## 先验证，再实现
 
-在创建 Claude、Cursor、Generic Agent、CLI 或其他 Adapter 前，先查询目标平台当前官方文档，并记录其触发机制、资源读取、文件写入、审批、工具、安装和分发能力。未知能力必须保持 `TBD / Requires verification`。
+当前仅维护 OpenAI/Codex Adapter；Claude、Cursor、GitHub Copilot、Gemini、Generic Agent、CLI 及其他 Adapter 工作已搁置。项目所有者明确恢复某个平台后，才可查询其当前官方文档，并记录触发机制、资源读取、文件写入、审批、工具、安装和分发能力。未知能力必须保持 `TBD / Requires verification`。
 
 ## 实现顺序
 
