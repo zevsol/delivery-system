@@ -46,3 +46,4 @@ V0 范围仅包含 Core 与 OpenAI/Codex Adapter；不包含 MCP Server、外部
 - [Core Contract](core/CORE-CONTRACT.md)
 - [V0 工程计划与验证状态](docs/tasks/v0-completion/README.md)
 - [跨平台 Adapter 路线](docs/roadmap/cross-platform-adapters.md)
+- [仓库分支与 PR 工作流](docs/project/repository-workflow.md)
