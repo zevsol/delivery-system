@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://delivery-system.dev/schemas/finding.schema.json",
+  "title": "Delivery System Audit Finding",
+  "allOf": [
+    { "$ref": "artifact.schema.json" },
+    {
+      "type": "object",
+      "required": ["severity", "category", "evidence", "impact", "recommendation", "affectedArtifacts", "decisionRequired"],
+      "properties": {
+        "type": { "const": "finding" },
+        "severity": { "enum": ["blocker", "high", "medium", "low", "note"] },
+        "category": { "type": "string", "minLength": 1 },
+        "evidence": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+        "impact": { "type": "string", "minLength": 1 },
+        "recommendation": { "type": "string", "minLength": 1 },
+        "affectedArtifacts": { "type": "array", "items": { "type": "string" } },
+        "decisionRequired": { "type": "string", "minLength": 1 }
+      }
+    }
+  ]
+}
