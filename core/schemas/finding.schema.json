@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://delivery-system.dev/schemas/finding.schema.json",
+  "$id": "urn:delivery-system:schema:finding:0.1",
   "title": "Delivery System Audit Finding",
   "allOf": [
     { "$ref": "artifact.schema.json" },

@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://delivery-system.dev/schemas/issue.schema.json",
+  "$id": "urn:delivery-system:schema:issue:0.1",
   "title": "Delivery System Issue",
   "allOf": [
     { "$ref": "artifact.schema.json" },

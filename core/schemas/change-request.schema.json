@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://delivery-system.dev/schemas/change-request.schema.json",
+  "$id": "urn:delivery-system:schema:change-request:0.1",
   "title": "Delivery System Change Request",
   "allOf": [
     { "$ref": "artifact.schema.json" },

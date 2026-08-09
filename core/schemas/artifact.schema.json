@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://delivery-system.dev/schemas/artifact.schema.json",
+  "$id": "urn:delivery-system:schema:artifact:0.1",
   "title": "Delivery System Artifact",
   "type": "object",
   "required": ["id", "type", "title", "status", "owner", "source", "relationships"],
