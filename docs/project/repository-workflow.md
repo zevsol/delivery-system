@@ -39,4 +39,4 @@
 - 不提交凭据、真实用户数据、缓存或本地规划输入；
 - 若修改 canonical Adapter，同步生成 `plugins/` 分发包并说明校验结果；
 - 如有未运行的测试或宿主验证，明确标记为未验证，而不宣称通过；
-- 合并到 `main` 前遵循 [发布前检查清单](../release/openai-codex-release-checklist.md)。
+- 合并到 `main` 前遵循 [发布前检查清单](../maintainers/openai-codex-release-checklist.md)。

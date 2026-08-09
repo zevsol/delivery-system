@@ -4,7 +4,7 @@
 >
 > Core Version：`0.1.0-draft`
 >
-> 状态：本地开发中，尚未安装或发布
+> 状态：实验性 Adapter；已完成本地 marketplace 安装，尚未完成真实宿主端到端验证或官方目录发布
 
 ## 目标平台与角色映射
 
@@ -30,4 +30,4 @@ Skill 下的 `references/core-projection.md` 是针对该角色的受控同步�
 
 ## Conformance
 
-本 Adapter 尚未完成安装测试。发布或宣称支持前，必须通过 `tests/conformance/core-behavior.md` 中适用场景以及平台特定触发、权限和本地安装测试。
+本 Adapter 已完成本地 marketplace 安装与仓库级一致性校验。发布或宣称完整支持前，仍必须通过 `tests/conformance/core-behavior.md` 中适用场景，以及平台特定的触发、权限和真实宿主测试。当前验证边界见 `docs/maintainers/validation-status.md`。
