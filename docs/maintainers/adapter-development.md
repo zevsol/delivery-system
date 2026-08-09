@@ -2,7 +2,7 @@
 
 ## 先验证，再实现
 
-当前仅维护 OpenAI/Codex Adapter；Claude、Cursor、GitHub Copilot、Gemini、Generic Agent、CLI 及其他 Adapter 工作已搁置。项目所有者明确恢复某个平台后，才可查询其当前官方文档，并记录触发机制、资源读取、文件写入、审批、工具、安装和分发能力。未知能力必须保持 `TBD / Requires verification`。
+当前仅维护 OpenAI/Codex Adapter；Claude、Cursor、GitHub Copilot、Gemini、Generic Agent、CLI 及其他 Adapter 不属于 V0 范围。维护者将某个平台纳入路线图后，才可查询其当前官方文档，并记录触发机制、资源读取、文件写入、审批、工具、安装和分发能力。未知能力必须保持 `TBD / Requires verification`。
 
 ## 实现顺序
 
@@ -11,7 +11,7 @@
 3. 选择 Core 同步方式，并记录来源版本；
 4. 为不可表达的审批、只读或外部写入语义设计安全降级；
 5. 建立安装包与维护流程；
-6. 将测试场景保留到项目所有者启动最终测试阶段；
+6. 在端到端测试阶段执行测试场景；
 7. 通过 Conformance 后才将 Adapter 标为 Supported。
 
 ## 禁止事项

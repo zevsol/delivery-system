@@ -2,7 +2,7 @@
 
 ## 状态
 
-pending — 依赖 TASK-004。
+pending — 依赖 TASK-004 的端到端测试证据。
 
 ## 目标
 

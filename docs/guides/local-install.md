@@ -1,5 +1,7 @@
 # 本地安装与更新
 
+> 当前版本为开发预览版。本地安装用于评估与贡献开发，尚未构成稳定版或官方目录发布。
+
 ## 前提
 
 - 已安装 Codex CLI；
@@ -31,11 +33,11 @@ $audit-delivery
 $execute-delivery
 ```
 
-也可根据每项 Skill 的描述由宿主隐式匹配。首次使用应以 `tests/conformance/core-behavior.md` 的 CB-001、CB-005、CB-006 验证角色边界。
+也可根据每项 Skill 的描述由宿主隐式匹配。宿主对隐式匹配的实际行为会随版本和配置变化；请优先使用显式调用，并在使用前阅读 [使用指南](using-delivery-system.md)。
 
 ## 更新与卸载
 
-仓库更新后，维护者先运行：
+从源码更新后，维护者应先重新生成分发包并执行仓库校验：
 
 ```powershell
 python scripts/build_openai_distribution.py
