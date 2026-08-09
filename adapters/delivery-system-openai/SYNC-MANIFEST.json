@@ -11,5 +11,10 @@
     "skills/audit-delivery/references/core-projection.md",
     "skills/execute-delivery/references/core-projection.md"
   ],
+  "requiredClauses": {
+    "idea-to-delivery": ["关键未知", "Change Management", "用户批准"],
+    "audit-delivery": ["独立、只读", "Finding", "不得直接修复"],
+    "execute-delivery": ["Implementation Ready", "范围外", "不可逆"]
+  },
   "verification": "tests/conformance/core-behavior.md"
 }

@@ -7,14 +7,15 @@ Delivery System 是一个平台无关的软件交付工作流系统。它把模�
 ## 当前范围
 
 - `core/`：角色、工作流、策略、产物协议与一致性规则的唯一事实来源；
-- `adapters/`：未来的平台适配器，尚未创建；
-- `tests/`：未来的 Core 行为与适配器一致性测试，尚未创建。
+- `adapters/delivery-system-openai/`：OpenAI/Codex 的 skills-only Adapter；
+- `tests/`：Core 行为、fixture 与预期结果；
+- `scripts/validate_v0.py`：不依赖第三方包的 V0 结构一致性校验。
 
 当前 Core 审查稿见 [CORE-CONTRACT.md](core/CORE-CONTRACT.md)。
 
 ## 项目状态
 
-尚未发布、尚未提供外部集成，也尚未承诺任何特定平台的适配格式或能力。未核验的平台能力必须标记为 `TBD / Requires verification`。
+尚未公开发布、尚未提供外部集成或自有 MCP。OpenAI/Codex Adapter 已完成本地结构校验，仍需在目标宿主中完成安装与触发验证。未核验的平台能力必须标记为 `TBD / Requires verification`。
 
 ## 许可证
 
