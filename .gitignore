@@ -1,0 +1,58 @@
+# Local development inputs
+.dev/
+
+# Environment and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.secret
+secrets/
+
+# Python and test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+htmlcov/
+
+# Node and test caches
+node_modules/
+.npm/
+.pnpm-store/
+.yarn/
+coverage/
+.nyc_output/
+
+# Logs
+*.log
+logs/
+
+# IDE and operating-system files
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Build and release artifacts
+build/
+dist/
+out/
+*.zip
+*.tar.gz
+*.tgz
+
+# Local plugin install and packaging artifacts
+.codex-plugin-cache/
+.plugin-cache/
+plugin-package/
