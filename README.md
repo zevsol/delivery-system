@@ -1,19 +1,26 @@
-# Codex Skill Engineering Foundation
+# Delivery System
 
-This repository is a small, durable foundation for engineering public, testable, installable Codex Skills and Plugins. It addresses the gap between an idea for a reusable workflow and evidence-backed, maintainable delivery.
+Delivery System is a Corrective Runtime Prototype for deterministic work-item planning.
 
-It provides engineering rules only. It contains no business Skill, Plugin package, connector, or product implementation.
+It provides a structured planning protocol with:
 
-## Use a local brief
+- explicit User-asserted, model-proposed, and model-assumption values;
+- deterministic canonical payloads and plan digests;
+- Runtime-owned request, preview, revision, and item lineage;
+- typed audit and approval record schemas and validators;
+- a local PreviewStore contract with SQLite preflight checks;
+- an official MCP SDK stdio server exposed through `delivery-system-mcp`.
 
-Copy the prompts in `.dev/skill-brief.md` into a completed local brief, or edit that file directly. The brief is ignored by Git. Codex checks its completeness, asks about material gaps, previews the contract, and waits for approval before implementation. A brief is development input, not the eventual user documentation for a Skill.
+The Planner does not write to GitHub. The Runtime may write local PreviewStore state under the explicitly supplied workspace root. A workspace is started with:
 
-## How work is governed
+```text
+delivery-system-mcp --workspace-root <absolute-path>
+```
 
-[`AGENTS.md`](AGENTS.md) requires a clear user problem, one core responsibility, inputs, outputs, non-goals, permissions, examples, and evidence before a Skill is built. Use official `$skill-creator` after those boundaries are approved when it helps scaffold or refine a Skill; it does not replace the repository rules.
+The current Prototype has no real GitHub Driver, GitHub authentication, GitHub write operation, Auditor product, Human Approval Workflow, or Applier product. Audit and Approval are schema and validation capabilities only.
 
-The official model treats a Skill as a focused `SKILL.md` workflow with optional resources, while a Plugin is an installable distribution package. Validate a Skill's behavior first; package or publish it only after behavior evidence supports that later step. See the official [Skill documentation](https://developers.openai.com/plugins/build/skills) and [Plugin packaging documentation](https://developers.openai.com/plugins/build/plugins).
+The current package is source code and a Python runtime prototype. It is not a ChatGPT or Codex Plugin, Universal Public Plugin, Personal Repository Beta, Host Tested installation, or external Integration Tested release.
 
-Evidence is reported as Designed, Implemented, Statically Validated, Deterministically Tested, Host Tested, Integration Tested, Install Tested, or Released. Each label has the meaning defined in `AGENTS.md`; none implies a stronger label.
+The bundled local state database is `.delivery-system/state.sqlite3` and is excluded from Git. It does not store tokens, cookies, or authentication configuration. The Planner does not provide destructive cleanup operations.
 
-Public versions exclude local briefs, credentials, caches, logs, generated packages, and other development-only material.
+Skills and MCP host registration are not part of the current distributable prototype. Host, installation, GitHub, and semantic Skill Forward validation remain outside the verified capability boundary.

@@ -5,6 +5,8 @@
 .env
 .env.*
 !.env.example
+.venv/
+.delivery-system/state.sqlite3*
 *.pem
 *.key
 *.p12
