@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 from typing import Callable
 
 from delivery_system.protocol import digest
 from delivery_system.runtime import ApprovalRecord, AuditRecord, AuditResult, AuditStatus, EvidenceRecord, TypedRemoteSnapshot
+from delivery_system.auditor import RuleEvaluationDraft
+from delivery_system.rules import SemanticOutcome
 
 
 def run_store_contract(testcase, store_factory: Callable[[], tuple[object, str]]) -> int:
@@ -103,6 +106,70 @@ def run_store_contract(testcase, store_factory: Callable[[], tuple[object, str]]
         store.resolve_item_id(workspace, "atomic-failure", "first", 1)
 
     return 13
+
+
+def run_auditor_store_contract(testcase, context, store, auditor, preview) -> int:
+    """Replay the Slice 2B audit persistence contract against one adapter."""
+    canonical = store.get_preview_revision(context.workspace_identity, preview["preview_id"], preview["revision"])["canonical_payload"]
+    evaluations = [
+        RuleEvaluationDraft(rule.rule_id, rule.rule_version, SemanticOutcome.PASSED, "contract pass")
+        for rule in auditor.registry.semantic_rules if auditor._applicable(rule, canonical)
+    ]
+    context_payload = auditor.get_context(preview["preview_id"], preview["revision"])
+    # The helper deliberately obtains the digest from the Runtime context service.
+    first = auditor.record_audit(preview["preview_id"], preview["revision"], context_payload["audit_context_digest"], evaluations, [])
+    retry = auditor.record_audit(preview["preview_id"], preview["revision"], context_payload["audit_context_digest"], evaluations, [])
+    testcase.assertEqual(first.audit_id, retry.audit_id)
+    testcase.assertEqual(first.audit_payload_digest, retry.audit_payload_digest)
+    testcase.assertEqual(store.get_audit(context.workspace_identity, first.audit_id).audit_id, first.audit_id)
+    testcase.assertTrue(any(entry["outcome"] == "NotApplicable" for entry in first.rule_evaluations))
+    forged_registry = replace(first, audit_id="forged-registry", rule_registry_version="666")._with_digest()
+    with testcase.assertRaisesRegex(ValueError, "^audit_commit_boundary_required$"):
+        store.commit_audit(forged_registry)
+    with testcase.assertRaisesRegex(ValueError, "^audit_not_found$"):
+        store.get_audit(context.workspace_identity, "forged-registry")
+    malformed_evaluation = dict(first.rule_evaluations[0])
+    malformed_evaluation["runtime_gate_passed"] = True
+    malformed = replace(
+        first,
+        audit_id="malformed-evaluation",
+        rule_evaluations=(malformed_evaluation,) + first.rule_evaluations[1:],
+    )._with_digest()
+    with testcase.assertRaisesRegex(ValueError, "^audit_commit_boundary_required$"):
+        store.commit_audit(malformed)
+    with testcase.assertRaisesRegex(ValueError, "^audit_not_found$"):
+        store.get_audit(context.workspace_identity, "malformed-evaluation")
+    stale_direct = first.transition(AuditStatus.STALE, "contract")
+    with testcase.assertRaisesRegex(ValueError, "^audit_commit_boundary_required$"):
+        store.commit_audit(stale_direct)
+    changed_evaluations = [replace(item, rationale="changed") for item in evaluations]
+    replacement = auditor.record_audit(
+        preview["preview_id"], preview["revision"], context_payload["audit_context_digest"], changed_evaluations, []
+    )
+    testcase.assertNotEqual(replacement.audit_id, first.audit_id)
+    testcase.assertEqual(store.get_audit(context.workspace_identity, first.audit_id).status, AuditStatus.STALE)
+    testcase.assertEqual(store.list_active_audits(context.workspace_identity, preview["preview_id"], preview["revision"])[0].audit_id, replacement.audit_id)
+    with testcase.assertRaisesRegex(ValueError, "^audit_coverage_incomplete$"):
+        auditor.record_audit(
+            preview["preview_id"], preview["revision"], context_payload["audit_context_digest"],
+            evaluations[:-1], [],
+        )
+    for rule_id, expected in (
+        ("RT-PREVIEW-SCHEMA", "invalid_runtime_rule_submission"),
+        ("RT-UNKNOWN", "invalid_input"),
+        ("SEM-UNKNOWN", "invalid_input"),
+        ("SEM-DUPLICATE-OVERLAP", "invalid_not_applicable_submission"),
+    ):
+        with testcase.assertRaisesRegex(ValueError, f"^{expected}$"):
+            auditor.record_audit(
+                preview["preview_id"], preview["revision"], context_payload["audit_context_digest"],
+                [RuleEvaluationDraft(rule_id, "1.0", "NotApplicable" if rule_id.startswith("SEM-") else SemanticOutcome.PASSED, "invalid")], [],
+            )
+    with testcase.assertRaisesRegex(ValueError, "^invalid_input$"):
+        auditor.record_audit(preview["preview_id"], preview["revision"], "wrong", evaluations, [])
+    with testcase.assertRaisesRegex(ValueError, "^audit_not_found$"):
+        store.get_audit(context.workspace_identity, "missing-audit")
+    return 4
 
 
 def run_trust_boundary_contract(testcase, store_factory: Callable[[], tuple[object, str]]) -> int:

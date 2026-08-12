@@ -8,11 +8,12 @@ import hashlib
 import os
 from pathlib import Path
 import sqlite3
+import threading
 from contextlib import closing
 import subprocess
 from typing import Any, Callable, Generic, Mapping, Protocol, TypeVar
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timezone
 
 def canonical_payload(value: Mapping[str, Any]) -> str:
     from delivery_system.protocol import canonical_payload as _canonical_payload
@@ -501,20 +502,44 @@ class AuditRecord:
     preview_id: str
     revision: int
     plan_digest: str
-    remote_snapshot_digest: str
+    remote_snapshot_digest: str | None
     audit_digest: str
     result: AuditResult
     operation_set_digest: str
     status: AuditStatus
+    sealed_preview_digest: str = ""
+    workspace_identity: str = ""
+    audit_scope: str = "Conceptual"
+    audit_payload_digest: str = ""
+    audit_context_digest: str = ""
+    rule_registry_version: str | None = None
+    rule_registry_digest: str | None = None
+    rule_evaluations: tuple[dict[str, Any], ...] = ()
+    findings: tuple[dict[str, Any], ...] = ()
+    evidence_refs: tuple[str, ...] = ()
+    created_at: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.result, AuditResult) or not isinstance(self.status, AuditStatus):
             raise TypeError("AuditRecord result and status must use approved enums")
-        if self.revision < 1 or any(not isinstance(value, str) or not value for value in (
-            self.audit_id, self.preview_id, self.plan_digest, self.remote_snapshot_digest,
+        if (not isinstance(self.revision, int) or isinstance(self.revision, bool) or self.revision < 1 or
+                any(not isinstance(value, str) or not value for value in (
+            self.audit_id, self.preview_id, self.plan_digest,
             self.audit_digest, self.operation_set_digest,
-        )):
+        )) or (self.remote_snapshot_digest is not None and
+                (not isinstance(self.remote_snapshot_digest, str) or not self.remote_snapshot_digest))):
             raise ValueError("AuditRecord required fields are invalid")
+        if self.audit_payload_digest:
+            if (not self.sealed_preview_digest or not self.workspace_identity or
+                    not self.audit_context_digest or not self.rule_registry_version or
+                    not self.rule_registry_digest or not self.created_at):
+                raise ValueError("audit_record_formal_fields_invalid")
+            try:
+                parsed = datetime.fromisoformat(self.created_at.replace("Z", "+00:00"))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("audit_created_at_invalid") from exc
+            if parsed.tzinfo is None or parsed.utcoffset() is None or parsed.utcoffset().total_seconds() != 0:
+                raise ValueError("audit_created_at_invalid")
 
     @classmethod
     def create(
@@ -523,13 +548,28 @@ class AuditRecord:
         preview_id: str,
         revision: int,
         plan_digest: str,
-        remote_snapshot_digest: str,
+        remote_snapshot_digest: str | None,
         operation_set_digest: str,
         result: AuditResult,
+        *,
+        sealed_preview_digest: str = "",
+        workspace_identity: str = "",
+        audit_scope: str = "Conceptual",
+        audit_payload_digest: str = "",
+        audit_context_digest: str = "",
+        rule_registry_version: str | None = None,
+        rule_registry_digest: str | None = None,
+        rule_evaluations: tuple[dict[str, Any], ...] = (),
+        findings: tuple[dict[str, Any], ...] = (),
+        evidence_refs: tuple[str, ...] = (),
+        created_at: str = "",
     ) -> "AuditRecord":
         record = cls(
             audit_id, preview_id, revision, plan_digest, remote_snapshot_digest,
             "pending", result, operation_set_digest, AuditStatus.ACTIVE,
+            sealed_preview_digest, workspace_identity, audit_scope, audit_payload_digest, audit_context_digest,
+            rule_registry_version, rule_registry_digest, tuple(rule_evaluations), tuple(findings),
+            tuple(evidence_refs), created_at,
         )
         return replace(record, audit_digest=record._computed_digest())
 
@@ -542,8 +582,15 @@ class AuditRecord:
             "plan_digest": self.plan_digest,
             "remote_snapshot_digest": self.remote_snapshot_digest,
             "operation_set_digest": self.operation_set_digest,
+            "sealed_preview_digest": self.sealed_preview_digest,
             "result": self.result.value,
             "status": self.status.value,
+            "workspace_identity": self.workspace_identity,
+            "audit_scope": self.audit_scope,
+            "audit_payload_digest": self.audit_payload_digest,
+            "audit_context_digest": self.audit_context_digest,
+            "rule_registry_version": self.rule_registry_version,
+            "rule_registry_digest": self.rule_registry_digest,
         })
 
     def verify_digest(self) -> bool:
@@ -573,6 +620,34 @@ class AuditRecord:
         result["result"] = self.result.value
         result["status"] = self.status.value
         return result
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "AuditRecord":
+        formal = all(key in data for key in (
+            "sealed_preview_digest", "workspace_identity", "audit_scope",
+            "audit_payload_digest", "audit_context_digest", "rule_registry_version",
+            "rule_registry_digest", "created_at",
+        ))
+        return cls(
+            data["audit_id"], data["preview_id"], data["revision"], data["plan_digest"],
+            data["remote_snapshot_digest"], data["audit_digest"], AuditResult(data["result"]),
+            data["operation_set_digest"], AuditStatus(data["status"]),
+            data.get("sealed_preview_digest", "") if formal else "",
+            data.get("workspace_identity", "") if formal else "",
+            data.get("audit_scope", "Conceptual") if formal else "Conceptual",
+            data.get("audit_payload_digest", "") if formal else "",
+            data.get("audit_context_digest", "") if formal else "",
+            data.get("rule_registry_version") if formal else None,
+            data.get("rule_registry_digest") if formal else None,
+            tuple(data.get("rule_evaluations", ())) if formal else (),
+            tuple(data.get("findings", ())) if formal else (),
+            tuple(data.get("evidence_refs", ())) if formal else (),
+            data.get("created_at", "") if formal else "",
+        )
+
+    @property
+    def approval_eligible(self) -> bool:
+        return self.audit_scope == PreviewLevel.WRITE_ELIGIBLE.value and self.status is AuditStatus.ACTIVE and self.result is AuditResult.PASSED
 
 
 @dataclass(frozen=True)
@@ -778,15 +853,19 @@ class PreviewStore(Protocol):
     def save_preview_revision(self, request_id: str, preview_id: str, revision: int,
                               plan_digest: str, remote_snapshot_digest: str | None,
                               operation_set_digest: str, repository_identity: str | None,
-                              items: list[dict[str, object]], workspace_identity: str,
-                              canonical_payload: dict[str, object],
-                              evidence_records: list[dict[str, object]]) -> None: ...
+                              items: list[dict[str, object]], workspace_identity: str | None = None,
+                              canonical_payload: dict[str, object] | None = None,
+                              preview_level: str | None = None,
+                              evidence_records: list[dict[str, object]] | None = None) -> None: ...
     def get_preview(self, workspace_identity: str, preview_id: str) -> dict[str, object]: ...
     def get_preview_revision(self, workspace_identity: str, preview_id: str, revision: int | None = None) -> dict[str, object]: ...
     def get_evidence_records(self, workspace_identity: str, evidence_ids: list[str]) -> list[dict[str, object]]: ...
     def resolve_item_id(self, workspace_identity: str, previous_preview_id: str, client_ref: str) -> str: ...
     def record_audit(self, audit: AuditRecord) -> None: ...
+    def commit_audit(self, audit: AuditRecord) -> AuditRecord: ...
     def get_audit(self, workspace_identity: str, audit_id: str) -> AuditRecord: ...
+    def find_audit_by_payload(self, workspace_identity: str, preview_id: str, revision: int, audit_payload_digest: str) -> AuditRecord | None: ...
+    def list_active_audits(self, workspace_identity: str, preview_id: str, revision: int) -> list[AuditRecord]: ...
     def transition_audit_status(self, audit_id: str, status: AuditStatus, reason: str) -> AuditRecord: ...
     def record_approval(self, approval: ApprovalRecord) -> None: ...
     def get_approval(self, workspace_identity: str, approval_id: str) -> ApprovalRecord: ...
@@ -883,6 +962,69 @@ def _preview_is_approval_eligible(preview: Mapping[str, Any]) -> bool:
     return False
 
 
+def _validate_formal_audit_boundary(audit: AuditRecord, canonical: Mapping[str, Any], expected_workspace_identity: str) -> None:
+    """Validate the Runtime-owned formal AuditRecord before Store commit."""
+    if not audit.audit_payload_digest or not audit.audit_context_digest or not audit.sealed_preview_digest:
+        raise ValueError("audit_commit_boundary_required")
+    if audit.workspace_identity != expected_workspace_identity:
+        raise ValueError("audit_commit_boundary_required")
+    if audit.preview_id != canonical.get("preview_id") or audit.revision != canonical.get("revision"):
+        raise ValueError("audit_commit_boundary_required")
+    if audit.audit_scope not in {level.value for level in PreviewLevel} or audit.audit_scope != canonical.get("preview_level"):
+        raise ValueError("audit_commit_boundary_required")
+    if audit.sealed_preview_digest != canonical.get("sealed_preview_digest"):
+        raise ValueError("audit_commit_boundary_required")
+    if audit.plan_digest != canonical.get("plan_digest") or audit.operation_set_digest != canonical.get("operation_set_digest"):
+        raise ValueError("audit_commit_boundary_required")
+    if audit.remote_snapshot_digest != canonical.get("remote_snapshot_digest"):
+        raise ValueError("audit_commit_boundary_required")
+    if not audit.rule_registry_version or not audit.rule_registry_digest:
+        raise ValueError("audit_commit_boundary_required")
+    if not audit.rule_evaluations or not audit.created_at:
+        raise ValueError("audit_commit_boundary_required")
+    try:
+        created = datetime.fromisoformat(audit.created_at.replace("Z", "+00:00"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("audit_commit_boundary_required") from exc
+    if created.tzinfo is None or created.utcoffset() is None or created.utcoffset().total_seconds() != 0:
+        raise ValueError("audit_commit_boundary_required")
+    if any("finding_ref" in finding or not finding.get("finding_id") for finding in audit.findings):
+        raise ValueError("audit_commit_boundary_required")
+    canonical_evidence_ids = canonical.get("evidence_ids", [])
+    if sorted(audit.evidence_refs) != sorted(canonical_evidence_ids) or len(set(audit.evidence_refs)) != len(audit.evidence_refs):
+        raise ValueError("audit_commit_boundary_required")
+    if any(any(not str(ref).startswith("finding_") for ref in evaluation.get("finding_refs", ()))
+           for evaluation in audit.rule_evaluations):
+        raise ValueError("audit_commit_boundary_required")
+    if any(not isinstance(evaluation.get("rule_id"), str) or not isinstance(evaluation.get("outcome"), str)
+           for evaluation in audit.rule_evaluations):
+        raise ValueError("audit_commit_boundary_required")
+    outcomes = {evaluation.get("outcome") for evaluation in audit.rule_evaluations}
+    expected_result = (AuditResult.BLOCKED if "Blocked" in outcomes else
+                       AuditResult.NEEDS_INFORMATION if "Unknown" in outcomes else
+                       AuditResult.CHANGES_REQUIRED if "Failed" in outcomes else AuditResult.PASSED)
+    if audit.result is not expected_result:
+        raise ValueError("audit_commit_boundary_required")
+    payload = {
+        "workspace_identity": audit.workspace_identity,
+        "preview_id": audit.preview_id,
+        "revision": audit.revision,
+        "audit_scope": audit.audit_scope,
+        "sealed_preview_digest": audit.sealed_preview_digest,
+        "plan_digest": audit.plan_digest,
+        "operation_set_digest": audit.operation_set_digest,
+        "remote_snapshot_digest": audit.remote_snapshot_digest,
+        "audit_context_digest": audit.audit_context_digest,
+        "rule_registry_version": audit.rule_registry_version,
+        "rule_registry_digest": audit.rule_registry_digest,
+        "semantic_evaluations": list(audit.rule_evaluations),
+        "findings": list(audit.findings),
+        "result": audit.result.value,
+    }
+    if digest(payload) != audit.audit_payload_digest or not audit.verify_digest():
+        raise ValueError("audit_commit_boundary_required")
+
+
 def _preview_binding_value(preview: Mapping[str, Any], key: str) -> Any:
     canonical = preview.get("canonical_payload")
     if isinstance(canonical, Mapping):
@@ -894,8 +1036,9 @@ def build_audit_context_payload(workspace_identity: str, preview_id: str, revisi
                                 sealed_preview_digest: str,
                                 evidence_records: list[Mapping[str, Any]],
                                 rule_registry_version: str | None = None,
-                                rule_registry_digest: str | None = None) -> dict[str, Any]:
-    return {
+                                rule_registry_digest: str | None = None,
+                                audit_scope: str | None = None) -> dict[str, Any]:
+    payload = {
         "workspace_identity": workspace_identity,
         "preview_id": preview_id,
         "revision": revision,
@@ -907,16 +1050,20 @@ def build_audit_context_payload(workspace_identity: str, preview_id: str, revisi
             key=lambda pair: pair[0],
         ),
     }
+    if audit_scope is not None:
+        payload["audit_scope"] = audit_scope
+    return payload
 
 
 def compute_audit_context_digest(workspace_identity: str, preview_id: str, revision: int,
                                  sealed_preview_digest: str,
                                  evidence_records: list[Mapping[str, Any]],
                                  rule_registry_version: str | None = None,
-                                 rule_registry_digest: str | None = None) -> str:
+                                 rule_registry_digest: str | None = None,
+                                 audit_scope: str | None = None) -> str:
     return digest(build_audit_context_payload(
         workspace_identity, preview_id, revision, sealed_preview_digest,
-        evidence_records, rule_registry_version, rule_registry_digest,
+        evidence_records, rule_registry_version, rule_registry_digest, audit_scope,
     ))
 
 
@@ -974,6 +1121,7 @@ class InMemoryPreviewStore:
 
     def __init__(self, workspace_identity: str | None = None) -> None:
         self.workspace_identity = workspace_identity
+        self._lock = threading.RLock()
         self._items: list[_ItemRecord] = []
         self._previews: dict[tuple[str, str], dict[str, object]] = {}
         self._preview_history: dict[tuple[str, str, int], dict[str, object]] = {}
@@ -982,6 +1130,20 @@ class InMemoryPreviewStore:
         self._approvals: dict[tuple[str, str], ApprovalRecord] = {}
 
     def save_preview_revision(self, request_id: str, preview_id: str, revision: int,
+                              plan_digest: str, remote_snapshot_digest: str | None,
+                              operation_set_digest: str, repository_identity: str | None,
+                              items: list[dict[str, object]], workspace_identity: str | None = None,
+                              canonical_payload: dict[str, object] | None = None,
+                              preview_level: str | None = None,
+                              evidence_records: list[dict[str, object]] | None = None) -> None:
+        with self._lock:
+            return self._save_preview_revision(
+                request_id, preview_id, revision, plan_digest, remote_snapshot_digest,
+                operation_set_digest, repository_identity, items, workspace_identity,
+                canonical_payload, preview_level, evidence_records,
+            )
+
+    def _save_preview_revision(self, request_id: str, preview_id: str, revision: int,
                               plan_digest: str, remote_snapshot_digest: str | None,
                               operation_set_digest: str, repository_identity: str | None,
                               items: list[dict[str, object]], workspace_identity: str | None = None,
@@ -1092,11 +1254,51 @@ class InMemoryPreviewStore:
         return item.item_id
 
     def record_audit(self, audit: AuditRecord) -> None:
+        with self._lock:
+            return self._record_audit(audit)
+
+    def _record_audit(self, audit: AuditRecord) -> None:
+        if audit.audit_payload_digest:
+            raise ValueError("audit_commit_boundary_required")
         if audit.status is not AuditStatus.ACTIVE or not audit.verify_digest():
             raise ValueError("audit_record_invalid")
+        if audit.audit_payload_digest:
+            if audit.workspace_identity and self.workspace_identity and audit.workspace_identity != self.workspace_identity:
+                raise ValueError("workspace_identity_mismatch")
+            preview = self.get_preview_revision(self.workspace_identity or audit.workspace_identity, audit.preview_id, audit.revision)
+            canonical = preview.get("canonical_payload", {})
+            if audit.audit_scope not in {level.value for level in PreviewLevel}:
+                raise ValueError("audit_scope_invalid")
+            if canonical.get("preview_level") != audit.audit_scope:
+                raise ValueError("audit_scope_mismatch")
         scopes = [scope for (scope, preview_id), value in self._previews.items()
                   if preview_id == audit.preview_id and int(value["revision"]) == audit.revision]
         self._audits[(scopes[0] if len(scopes) == 1 else "", audit.audit_id)] = audit
+
+    def commit_audit(self, audit: AuditRecord) -> AuditRecord:
+        with self._lock:
+            preview = self.get_preview_revision(audit.workspace_identity, audit.preview_id, audit.revision)
+            latest = self.get_preview(audit.workspace_identity, audit.preview_id)
+            if int(latest["revision"]) != audit.revision:
+                raise ValueError("audit_context_stale")
+            from delivery_system.auditor import validate_current_commit_context
+            from delivery_system.rules import build_registry_v1
+            evidence = self.get_evidence_records(audit.workspace_identity, list(preview["canonical_payload"].get("evidence_ids", [])))
+            validate_current_commit_context(audit, preview, evidence, build_registry_v1(), self.workspace_identity or audit.workspace_identity)
+            existing = self.find_audit_by_payload(audit.workspace_identity, audit.preview_id, audit.revision, audit.audit_payload_digest)
+            if existing is not None and existing.status is AuditStatus.ACTIVE:
+                return existing
+            snapshot = (deepcopy(self._audits), deepcopy(self._approvals))
+            try:
+                for active in self.list_active_audits(audit.workspace_identity, audit.preview_id, audit.revision):
+                    self._audits[(audit.workspace_identity, active.audit_id)] = active.transition(AuditStatus.STALE, "new audit payload")
+                if any(identifier == audit.audit_id for (_, identifier) in self._audits):
+                    raise ValueError("audit_persistence_failed")
+                self._audits[(audit.workspace_identity, audit.audit_id)] = audit
+                return audit
+            except Exception as exc:
+                self._audits, self._approvals = snapshot
+                raise ValueError("audit_persistence_failed") from exc
 
     def get_audit(self, workspace_identity: str, audit_id: str) -> AuditRecord:
         try:
@@ -1104,7 +1306,23 @@ class InMemoryPreviewStore:
         except KeyError as exc:
             raise ValueError("audit_not_found") from exc
 
+    def find_audit_by_payload(self, workspace_identity: str, preview_id: str, revision: int, audit_payload_digest: str) -> AuditRecord | None:
+        for (scope, _), audit in self._audits.items():
+            if (scope == workspace_identity and audit.preview_id == preview_id and audit.revision == revision
+                    and audit.audit_payload_digest == audit_payload_digest):
+                return audit
+        return None
+
+    def list_active_audits(self, workspace_identity: str, preview_id: str, revision: int) -> list[AuditRecord]:
+        return [audit for (scope, _), audit in self._audits.items()
+                if scope == workspace_identity and audit.preview_id == preview_id
+                and audit.revision == revision and audit.status is AuditStatus.ACTIVE]
+
     def transition_audit_status(self, audit_id: str, status: AuditStatus, reason: str) -> AuditRecord:
+        with self._lock:
+            return self._transition_audit_status(audit_id, status, reason)
+
+    def _transition_audit_status(self, audit_id: str, status: AuditStatus, reason: str) -> AuditRecord:
         matches = [value for (_, identifier), value in self._audits.items() if identifier == audit_id]
         if len(matches) != 1:
             raise ValueError("audit_not_found")
@@ -1115,6 +1333,10 @@ class InMemoryPreviewStore:
         return updated
 
     def record_approval(self, approval: ApprovalRecord) -> None:
+        with self._lock:
+            return self._record_approval(approval)
+
+    def _record_approval(self, approval: ApprovalRecord) -> None:
         if not approval.is_structurally_valid():
             raise ValueError("approval_invalid")
         if not self.validate_approval_current(approval):
@@ -1404,8 +1626,19 @@ class SQLitePreviewStore:
 
     def record_audit(self, audit: AuditRecord) -> None:
         import json
+        if audit.audit_payload_digest:
+            raise ValueError("audit_commit_boundary_required")
         if audit.status is not AuditStatus.ACTIVE or not audit.verify_digest():
             raise ValueError("audit_record_invalid")
+        if audit.audit_payload_digest:
+            if audit.workspace_identity and audit.workspace_identity != self.context.workspace_identity:
+                raise ValueError("workspace_identity_mismatch")
+            preview = self.get_preview_revision(self.context.workspace_identity, audit.preview_id, audit.revision)
+            canonical = preview.get("canonical_payload", {})
+            if audit.audit_scope not in {level.value for level in PreviewLevel}:
+                raise ValueError("audit_scope_invalid")
+            if canonical.get("preview_level") != audit.audit_scope:
+                raise ValueError("audit_scope_mismatch")
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(
@@ -1414,6 +1647,81 @@ class SQLitePreviewStore:
                  json.dumps(audit.to_dict(), sort_keys=True), "created", datetime.now().astimezone().isoformat()),
             )
             connection.commit()
+
+    def commit_audit(self, audit: AuditRecord) -> AuditRecord:
+        import json
+        with closing(self._connect()) as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                latest_row = connection.execute(
+                    "SELECT MAX(revision) FROM records WHERE workspace_identity=? AND record_type='preview' AND record_id=?",
+                    (self.context.workspace_identity, audit.preview_id),
+                ).fetchone()
+                if latest_row is None or latest_row[0] is None:
+                    raise ValueError("preview_not_found")
+                if int(latest_row[0]) != audit.revision:
+                    raise ValueError("audit_context_stale")
+                preview_row = connection.execute(
+                    "SELECT payload FROM records WHERE workspace_identity=? AND record_type='preview' AND record_id=? AND revision=?",
+                    (self.context.workspace_identity, audit.preview_id, audit.revision),
+                ).fetchone()
+                if preview_row is None:
+                    raise ValueError("preview_not_found")
+                preview_payload = json.loads(preview_row[0])
+                canonical = preview_payload.get("canonical_payload")
+                if not isinstance(canonical, dict):
+                    raise ValueError("sealed_preview_unavailable")
+                evidence = []
+                for evidence_id in canonical.get("evidence_ids", []):
+                    evidence_row = connection.execute(
+                        "SELECT payload FROM records WHERE workspace_identity=? AND record_type='evidence' AND record_id=? AND revision=?",
+                        (self.context.workspace_identity, evidence_id, audit.revision),
+                    ).fetchone()
+                    if evidence_row is None:
+                        raise ValueError("evidence_not_found")
+                    evidence.append(json.loads(evidence_row[0]))
+                from delivery_system.auditor import validate_current_commit_context
+                from delivery_system.rules import build_registry_v1
+                validate_current_commit_context(audit, preview_payload, evidence, build_registry_v1(), self.context.workspace_identity)
+                current_rows = connection.execute(
+                    "SELECT audit_id, payload FROM audit_history WHERE workspace_identity=? ORDER BY audit_id, event_no",
+                    (audit.workspace_identity,),
+                ).fetchall()
+                latest_audits: dict[str, AuditRecord] = {}
+                for audit_id, payload in current_rows:
+                    latest_audits[audit_id] = AuditRecord.from_dict(json.loads(payload))
+                existing = next((value for value in latest_audits.values()
+                                 if value.preview_id == audit.preview_id and value.revision == audit.revision
+                                 and value.audit_payload_digest == audit.audit_payload_digest
+                                 and value.status is AuditStatus.ACTIVE), None)
+                if existing is not None:
+                    connection.commit()
+                    return existing
+                for active in latest_audits.values():
+                    if active.preview_id == audit.preview_id and active.revision == audit.revision and active.status is AuditStatus.ACTIVE:
+                        stale = active.transition(AuditStatus.STALE, "new audit payload")
+                        event_no = connection.execute(
+                            "SELECT COALESCE(MAX(event_no), 0)+1 FROM audit_history WHERE workspace_identity=? AND audit_id=?",
+                            (audit.workspace_identity, active.audit_id),
+                        ).fetchone()[0]
+                        connection.execute(
+                            "INSERT INTO audit_history VALUES (?, ?, ?, ?, ?, ?)",
+                            (audit.workspace_identity, active.audit_id, event_no, json.dumps(stale.to_dict(), sort_keys=True), "new audit payload", datetime.now(timezone.utc).isoformat()),
+                        )
+                if any(identifier == audit.audit_id for identifier in latest_audits):
+                    raise ValueError("audit_persistence_failed")
+                connection.execute(
+                    "INSERT INTO audit_history VALUES (?, ?, ?, ?, ?, ?)",
+                    (audit.workspace_identity, audit.audit_id, 1, json.dumps(audit.to_dict(), sort_keys=True), "created", datetime.now(timezone.utc).isoformat()),
+                )
+                connection.commit()
+                return audit
+            except ValueError:
+                connection.rollback()
+                raise
+            except Exception as exc:
+                connection.rollback()
+                raise ValueError("audit_persistence_failed") from exc
 
     def get_audit(self, workspace_identity: str, audit_id: str) -> AuditRecord:
         import json
@@ -1427,11 +1735,29 @@ class SQLitePreviewStore:
         if row is None:
             raise ValueError("audit_not_found")
         data = json.loads(row[0])
-        return AuditRecord(
-            data["audit_id"], data["preview_id"], data["revision"], data["plan_digest"],
-            data["remote_snapshot_digest"], data["audit_digest"], AuditResult(data["result"]),
-            data["operation_set_digest"], AuditStatus(data["status"]),
-        )
+        return AuditRecord.from_dict(data)
+
+    def _current_audits(self, workspace_identity: str) -> list[AuditRecord]:
+        import json
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                "SELECT audit_id, payload FROM audit_history WHERE workspace_identity=? ORDER BY audit_id, event_no",
+                (workspace_identity,),
+            ).fetchall()
+        latest: dict[str, AuditRecord] = {}
+        for audit_id, payload in rows:
+            latest[audit_id] = AuditRecord.from_dict(json.loads(payload))
+        return list(latest.values())
+
+    def find_audit_by_payload(self, workspace_identity: str, preview_id: str, revision: int, audit_payload_digest: str) -> AuditRecord | None:
+        return next((audit for audit in self._current_audits(workspace_identity)
+                     if audit.preview_id == preview_id and audit.revision == revision
+                     and audit.audit_payload_digest == audit_payload_digest), None)
+
+    def list_active_audits(self, workspace_identity: str, preview_id: str, revision: int) -> list[AuditRecord]:
+        return [audit for audit in self._current_audits(workspace_identity)
+                if audit.preview_id == preview_id and audit.revision == revision
+                and audit.status is AuditStatus.ACTIVE]
 
     def transition_audit_status(self, audit_id: str, status: AuditStatus, reason: str) -> AuditRecord:
         current = self.get_audit(self.context.workspace_identity, audit_id)

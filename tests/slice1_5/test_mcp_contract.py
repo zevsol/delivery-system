@@ -62,7 +62,7 @@ class McpSdkContractTests(unittest.TestCase):
                     return tools, result
 
             tools, result = self.run_async(exercise())
-            self.assertEqual({tool.name for tool in tools.tools}, {"delivery_plan_preview", "delivery_get_audit_context"})
+            self.assertEqual({tool.name for tool in tools.tools}, {"delivery_plan_preview", "delivery_get_audit_context", "delivery_record_audit"})
             self.assertFalse(result.is_error)
             self.assertEqual(result.structured_content["provenance_status"], "declared_unverified")
             self.assertFalse(result.structured_content["write_eligible"])

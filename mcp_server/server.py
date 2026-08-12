@@ -7,9 +7,11 @@ from typing import Any, Literal
 
 from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
 from delivery_system.runtime import AuditContextService, RuntimeContext, RuntimePlanner, SQLitePreviewStore
+from delivery_system.auditor import FindingDraft, RuleEvaluationDraft, RuntimeAuditor
+from delivery_system.rules import ResultClass, RuleRegistry, SemanticOutcome, build_registry_v1
 
 
 SERVER_NAME = "delivery-system-planner"
@@ -107,23 +109,74 @@ class PreviewOutput(StrictModel):
 
 class AuditContextInput(StrictModel):
     preview_id: str = Field(min_length=1)
-    revision: int = Field(ge=1)
+    revision: StrictInt = Field(ge=1)
 
 
 class AuditContextOutput(StrictModel):
-    context_status: Literal["preview_ready_rules_unavailable"]
+    context_status: Literal["audit_ready"]
     workspace_identity: str
     preview_id: str
     revision: int = Field(ge=1)
     sealed_preview: dict[str, Any]
     evidence_records: list[dict[str, Any]]
     audit_context_digest: str
-    rule_registry_version: None = None
-    rule_registry_digest: None = None
+    rule_registry_version: str | None = None
+    rule_registry_digest: str | None = None
+    audit_scope: Literal["Conceptual", "RepositoryAware", "WriteEligible"]
+    semantic_rule_contexts: list[dict[str, Any]]
+
+
+class RuleEvaluationInput(StrictModel):
+    rule_id: str = Field(min_length=1)
+    rule_version: str = Field(min_length=1)
+    outcome: Literal["Passed", "Failed", "Unknown", "Blocked"]
+    rationale: str
+    finding_refs: list[str] = Field(default_factory=list)
+    evidence_refs: list[str] = Field(default_factory=list)
+
+
+class FindingInput(StrictModel):
+    finding_ref: str = Field(min_length=1)
+    rule_id: str = Field(min_length=1)
+    result_class: Literal[
+        "work_item_content_gap", "decomposition_risk", "acceptance_criteria_gap",
+        "assumption_clarity_gap", "relationship_risk", "dependency_risk",
+        "duplicate_overlap_risk", "missing_information", "semantic_blocker",
+    ]
+    severity: Literal["Blocker", "High", "Medium", "Low"]
+    title: str
+    rationale: str
+    evidence_refs: list[str] = Field(default_factory=list)
+    affected_item_ids: list[str] = Field(default_factory=list)
+    required_action: str
+    suggested_resolution: str | None = None
+
+
+class RecordAuditInput(StrictModel):
+    preview_id: str = Field(min_length=1)
+    revision: StrictInt = Field(ge=1)
+    expected_audit_context_digest: str = Field(min_length=1)
+    semantic_evaluations: list[RuleEvaluationInput]
+    finding_drafts: list[FindingInput]
+
+
+class RecordAuditOutput(StrictModel):
+    audit_id: str
+    preview_id: str
+    revision: int
+    audit_scope: Literal["Conceptual", "RepositoryAware", "WriteEligible"]
+    audit_payload_digest: str
+    audit_digest: str
+    result: Literal["Passed", "NeedsInformation", "ChangesRequired", "Blocked"]
+    status: Literal["Active", "Stale", "Invalid"]
+    findings: list[dict[str, Any]]
+    rule_evaluations: list[dict[str, Any]]
+    approval_eligible: Literal[False]
 
 
 def create_server(context: RuntimeContext | None = None, store: Any | None = None, driver: Any = None) -> MCPServer:
     mcp = MCPServer(SERVER_NAME)
+    registry = build_registry_v1()
 
     @mcp.tool(
         name=TOOL_NAME,
@@ -148,9 +201,44 @@ def create_server(context: RuntimeContext | None = None, store: Any | None = Non
     def delivery_get_audit_context(payload: AuditContextInput) -> AuditContextOutput:
         if context is None or store is None:
             raise ValueError("workspace_identity_unavailable")
-        return AuditContextOutput.model_validate(
-            AuditContextService(context, store).get(payload.preview_id, payload.revision)
+        return AuditContextOutput.model_validate(RuntimeAuditor(context, store, registry).get_context(payload.preview_id, payload.revision))
+
+    @mcp.tool(
+        name="delivery_record_audit",
+        description="Record a Runtime-validated audit of a planning preview; writes only local PreviewStore state and never writes GitHub.",
+        annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=False),
+        structured_output=True,
+    )
+    def delivery_record_audit(payload: RecordAuditInput) -> RecordAuditOutput:
+        if context is None or store is None:
+            raise ValueError("workspace_identity_unavailable")
+        audit = RuntimeAuditor(context, store, registry).record_audit(
+            payload.preview_id,
+            payload.revision,
+            payload.expected_audit_context_digest,
+            [RuleEvaluationDraft(
+                item.rule_id, item.rule_version, SemanticOutcome(item.outcome), item.rationale,
+                tuple(item.finding_refs), tuple(item.evidence_refs),
+            ) for item in payload.semantic_evaluations],
+            [FindingDraft(
+                item.finding_ref, item.rule_id, ResultClass(item.result_class), item.severity,
+                item.title, item.rationale, tuple(item.evidence_refs), tuple(item.affected_item_ids),
+                item.required_action, item.suggested_resolution,
+            ) for item in payload.finding_drafts],
         )
+        return RecordAuditOutput.model_validate({
+            "audit_id": audit.audit_id,
+            "preview_id": audit.preview_id,
+            "revision": audit.revision,
+            "audit_scope": audit.audit_scope,
+            "audit_payload_digest": audit.audit_payload_digest,
+            "audit_digest": audit.audit_digest,
+            "result": audit.result.value,
+            "status": audit.status.value,
+            "findings": list(audit.findings),
+            "rule_evaluations": list(audit.rule_evaluations),
+            "approval_eligible": False,
+        })
 
     return mcp
 

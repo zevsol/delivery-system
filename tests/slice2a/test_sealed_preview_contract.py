@@ -352,11 +352,12 @@ class Slice2ASealedPreviewTests(unittest.TestCase):
                     return tools, result
 
             tools, result = asyncio.run(exercise())
-            self.assertEqual({tool.name for tool in tools.tools}, {"delivery_plan_preview", "delivery_get_audit_context"})
+            self.assertEqual({tool.name for tool in tools.tools}, {"delivery_plan_preview", "delivery_get_audit_context", "delivery_record_audit"})
             self.assertFalse(result.is_error)
-            self.assertEqual(result.structured_content["context_status"], "preview_ready_rules_unavailable")
-            self.assertIsNone(result.structured_content["rule_registry_version"])
-            self.assertIsNone(result.structured_content["rule_registry_digest"])
+            self.assertEqual(result.structured_content["context_status"], "audit_ready")
+            self.assertEqual(result.structured_content["rule_registry_version"], "1.0")
+            self.assertTrue(result.structured_content["rule_registry_digest"])
+            self.assertTrue(result.structured_content["semantic_rule_contexts"])
             self.assertIn("audit_context_digest", result.structured_content)
 
 
