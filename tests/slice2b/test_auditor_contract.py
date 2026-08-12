@@ -6,6 +6,7 @@ import sqlite3
 import threading
 from dataclasses import replace
 from copy import deepcopy
+from typing import Any, cast
 
 from delivery_system.auditor import (
     FindingDraft,
@@ -108,11 +109,11 @@ class AuditorContractTests(unittest.TestCase):
             with self.subTest(outcome=outcome):
                 context = self._context()
                 evaluation = RuleEvaluationDraft(
-                    "SEM-WORK-ITEM-COMPLETENESS", "1.0", outcome, "insufficient", ["f-1"],
+                    "SEM-WORK-ITEM-COMPLETENESS", "1.0", outcome, "insufficient", ("f-1",),
                 )
                 finding = FindingDraft(
-                    "f-1", "SEM-WORK-ITEM-COMPLETENESS", result_class, "High", "gap", "reason", [],
-                    [self.preview["items"][0]["item_id"]], "clarify", None,
+                    "f-1", "SEM-WORK-ITEM-COMPLETENESS", result_class, "High", "gap", "reason", (),
+                    (self.preview["items"][0]["item_id"],), "clarify", None,
                 )
                 audit = self.auditor.record_audit(
                     self.preview["preview_id"], 1, context["audit_context_digest"],
@@ -136,11 +137,11 @@ class AuditorContractTests(unittest.TestCase):
     def test_finding_result_class_must_match_rule_outcome(self):
         context = self._context()
         evaluation = RuleEvaluationDraft(
-            "SEM-WORK-ITEM-COMPLETENESS", "1.0", SemanticOutcome.FAILED, "gap", ["f-1"],
+            "SEM-WORK-ITEM-COMPLETENESS", "1.0", SemanticOutcome.FAILED, "gap", ("f-1",),
         )
         finding = FindingDraft(
-            "f-1", "SEM-WORK-ITEM-COMPLETENESS", ResultClass.DEPENDENCY_RISK, "High", "wrong", "wrong", [],
-            [self.preview["items"][0]["item_id"]], "fix", None,
+            "f-1", "SEM-WORK-ITEM-COMPLETENESS", ResultClass.DEPENDENCY_RISK, "High", "wrong", "wrong", (),
+            (self.preview["items"][0]["item_id"],), "fix", None,
         )
         with self.assertRaisesRegex(ValueError, "^invalid_input$"):
             self.auditor.record_audit(
@@ -156,8 +157,8 @@ class AuditorContractTests(unittest.TestCase):
         retry = self.auditor.record_audit(self.preview["preview_id"], 1, context["audit_context_digest"], evaluations, [])
         self.assertEqual(first.audit_id, retry.audit_id)
         changed = list(evaluations)
-        changed[0] = RuleEvaluationDraft(changed[0].rule_id, changed[0].rule_version, SemanticOutcome.UNKNOWN, "needs facts", ["f-2"])
-        finding = FindingDraft("f-2", changed[0].rule_id, ResultClass.MISSING_INFORMATION, "Medium", "missing", "missing", [], [self.preview["items"][0]["item_id"]], "clarify", None)
+        changed[0] = RuleEvaluationDraft(changed[0].rule_id, changed[0].rule_version, SemanticOutcome.UNKNOWN, "needs facts", ("f-2",))
+        finding = FindingDraft("f-2", changed[0].rule_id, ResultClass.MISSING_INFORMATION, "Medium", "missing", "missing", (), (self.preview["items"][0]["item_id"],), "clarify", None)
         second = self.auditor.record_audit(self.preview["preview_id"], 1, context["audit_context_digest"], changed, [finding])
         self.assertNotEqual(first.audit_id, second.audit_id)
         self.assertEqual(self.store.get_audit(self.context.workspace_identity, first.audit_id).status, AuditStatus.STALE)
@@ -188,7 +189,7 @@ class AuditorContractTests(unittest.TestCase):
                 auditor = RuntimeAuditor(context, store_a, self.registry)
                 context_payload = auditor.get_context(preview["preview_id"], 1)
                 candidate = auditor.record_audit(preview["preview_id"], 1, context_payload["audit_context_digest"], self._passed_evaluations(), [])
-                canonical = deepcopy(store_b.get_preview_revision(context.workspace_identity, preview["preview_id"], 1)["canonical_payload"])
+                canonical = cast(dict[str, Any], deepcopy(store_b.get_preview_revision(context.workspace_identity, preview["preview_id"], 1)["canonical_payload"]))
                 canonical["revision"] = 2
                 canonical["evidence_ids"] = []
                 canonical["sealed_preview_digest"] = digest({key: value for key, value in canonical.items() if key != "sealed_preview_digest"})
@@ -490,11 +491,13 @@ class AuditorContractTests(unittest.TestCase):
                     audit_context = auditor.get_context(preview["preview_id"], 1)
                     genuine = auditor.record_audit(preview["preview_id"], 1, audit_context["audit_context_digest"], self._passed_evaluations(), [])
                     if adapter == "inmemory":
-                        for envelope in (store._previews[(context.workspace_identity, preview["preview_id"])], store._preview_history[(context.workspace_identity, preview["preview_id"], 1)]):
+                        memory_store = cast(InMemoryPreviewStore, store)
+                        for envelope in (memory_store._previews[(context.workspace_identity, preview["preview_id"])], memory_store._preview_history[(context.workspace_identity, preview["preview_id"], 1)]):
                             envelope[field] = value
                     else:
                         import json
-                        connection = sqlite3.connect(store.path)
+                        sqlite_store = cast(SQLitePreviewStore, store)
+                        connection = sqlite3.connect(sqlite_store.path)
                         try:
                             row = connection.execute("SELECT payload FROM records WHERE record_type='preview' AND record_id=? AND revision=1", (preview["preview_id"],)).fetchone()
                             envelope = json.loads(row[0])
@@ -559,7 +562,7 @@ class AuditorContractTests(unittest.TestCase):
                 auditor = RuntimeAuditor(local_context, store, self.registry)
                 audit_context = auditor.get_context(preview["preview_id"], 1)
                 candidate = auditor.record_audit(preview["preview_id"], 1, audit_context["audit_context_digest"], self._passed_evaluations(), [])
-                original = deepcopy(store.get_preview_revision(local_context.workspace_identity, preview["preview_id"], 1)["canonical_payload"])
+                original = cast(dict[str, Any], deepcopy(store.get_preview_revision(local_context.workspace_identity, preview["preview_id"], 1)["canonical_payload"]))
                 original["revision"] = 2
                 original["semantic_payload"] = {"changed": True}
                 original["plan_digest"] = digest(original["semantic_payload"])

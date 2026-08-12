@@ -4,6 +4,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+from typing import Any, cast
 from pathlib import Path
 
 from delivery_system.runtime import (
@@ -64,7 +65,7 @@ class Revision22RuntimeTests(unittest.TestCase):
         self.assertEqual(value.declared_source, DeclaredSource.USER_ASSERTED)
         self.assertEqual(value.provenance_status, "declared_unverified")
         with self.assertRaises(FrozenInstanceError):
-            value.declared_source = DeclaredSource.MODEL_PROPOSED
+            cast(Any, value).declared_source = DeclaredSource.MODEL_PROPOSED
 
     def test_lineage_inherits_only_unique_live_previous_client_ref(self):
         store = InMemoryPreviewStore()
@@ -351,7 +352,7 @@ class Revision22RuntimeTests(unittest.TestCase):
             context, store = self._sqlite_store(directory)
             audit, _ = self._preview_and_audit(store, context)
             for repo, timestamp in ((None, "2026-08-11T00:00:00+00:00"), ("", "2026-08-11T00:00:00+00:00"), ("  ", "2026-08-11T00:00:00+00:00"), ("repo", "2026-08-11T00:00:00")):
-                approval = ApprovalRecord.create("a", audit, repo, "operator", timestamp, "批准写入 preview-1 1")
+                approval = ApprovalRecord.create("a", audit, cast(str, repo), "operator", timestamp, "批准写入 preview-1 1")
                 with self.assertRaises(ValueError):
                     store.record_approval(approval)
 

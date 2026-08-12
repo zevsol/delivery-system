@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 
@@ -78,7 +79,7 @@ class AuditorMcpContractTests(unittest.TestCase):
     def test_real_stdio_process_discovers_and_records_audit(self):
         root = Path(__file__).parents[2].resolve()
         params = StdioServerParameters(
-            command=os.fspath(Path(os.sys.executable)),
+            command=os.fspath(Path(sys.executable)),
             args=["-m", "mcp_server.server", "--workspace-root", str(root)],
             cwd=root,
             env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},

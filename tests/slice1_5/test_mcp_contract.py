@@ -1,6 +1,7 @@
 import asyncio
 import os
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 
@@ -103,6 +104,7 @@ class McpSdkContractTests(unittest.TestCase):
                     return (await client.list_tools()).tools[0].annotations
 
             annotations = self.run_async(exercise())
+            assert annotations is not None
             self.assertFalse(annotations.read_only_hint)
             self.assertFalse(annotations.destructive_hint)
             self.assertFalse(annotations.open_world_hint)
@@ -111,7 +113,7 @@ class McpSdkContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(__file__).parents[2].resolve()
             params = StdioServerParameters(
-                command=os.fspath(Path(os.sys.executable)),
+                command=os.fspath(Path(sys.executable)),
                 args=["-m", "mcp_server.server", "--workspace-root", str(root)],
                 cwd=root,
                 env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},

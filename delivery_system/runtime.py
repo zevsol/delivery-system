@@ -11,7 +11,7 @@ import sqlite3
 import threading
 from contextlib import closing
 import subprocess
-from typing import Any, Callable, Generic, Mapping, Protocol, TypeVar
+from typing import Any, Callable, Generic, Mapping, Protocol, Sequence, TypeVar
 from copy import deepcopy
 from datetime import datetime, timezone
 
@@ -295,7 +295,7 @@ class EvidenceRecord:
                 raise ValueError("evidence_verification_status_invalid")
             record = cls(
                 str(data["evidence_id"]), str(data["workspace_identity"]), str(data["preview_id"]), int(data["revision"]),
-                str(data["evidence_type"]), source_kind, None, status, str(data["source_identity"]),
+                str(data["evidence_type"]), source_kind, None, expected_status, str(data["source_identity"]),
                 data.get("repository_identity"), normalize(data.get("query_scope")) if data.get("query_scope") is not None else None,
                 str(data["schema_version"]), str(data["subject_ref"]), normalize(data["payload"]),
                 str(data["evidence_digest"]), data.get("created_at"),
@@ -538,7 +538,8 @@ class AuditRecord:
                 parsed = datetime.fromisoformat(self.created_at.replace("Z", "+00:00"))
             except (TypeError, ValueError) as exc:
                 raise ValueError("audit_created_at_invalid") from exc
-            if parsed.tzinfo is None or parsed.utcoffset() is None or parsed.utcoffset().total_seconds() != 0:
+            offset = parsed.utcoffset()
+            if parsed.tzinfo is None or offset is None or offset.total_seconds() != 0:
                 raise ValueError("audit_created_at_invalid")
 
     @classmethod
@@ -722,6 +723,8 @@ class ApprovalRecord:
                approver_claim: str, approved_at: str, approval_command: str) -> "ApprovalRecord":
         if audit.result is not AuditResult.PASSED or audit.status is not AuditStatus.ACTIVE:
             raise ValueError("approval_requires_passed_active_audit")
+        if not isinstance(audit.remote_snapshot_digest, str) or not audit.remote_snapshot_digest:
+            raise ValueError("approval_requires_remote_snapshot_digest")
         return cls(
             approval_id, audit.audit_id, audit.audit_digest, audit.result,
             audit.preview_id, audit.revision, audit.plan_digest,
@@ -860,7 +863,8 @@ class PreviewStore(Protocol):
     def get_preview(self, workspace_identity: str, preview_id: str) -> dict[str, object]: ...
     def get_preview_revision(self, workspace_identity: str, preview_id: str, revision: int | None = None) -> dict[str, object]: ...
     def get_evidence_records(self, workspace_identity: str, evidence_ids: list[str]) -> list[dict[str, object]]: ...
-    def resolve_item_id(self, workspace_identity: str, previous_preview_id: str, client_ref: str) -> str: ...
+    def resolve_item_id(self, workspace_identity: str, previous_preview_id: str, client_ref: str,
+                        revision: int | None = None) -> str: ...
     def record_audit(self, audit: AuditRecord) -> None: ...
     def commit_audit(self, audit: AuditRecord) -> AuditRecord: ...
     def get_audit(self, workspace_identity: str, audit_id: str) -> AuditRecord: ...
@@ -917,11 +921,15 @@ def _validate_preview_payload(canonical: Mapping[str, Any], request_id: str,
     if remote_payload is not None:
         if not isinstance(remote_payload, Mapping):
             raise ValueError("remote_snapshot_invalid")
+        query_complete = remote_payload.get("query_complete")
+        pagination_complete = remote_payload.get("pagination_complete")
+        if not isinstance(query_complete, bool) or not isinstance(pagination_complete, bool):
+            raise ValueError("remote_snapshot_invalid")
         snapshot = TypedRemoteSnapshot.from_records(
             repository_identity=str(remote_payload.get("repository_identity", "")),
             query_scope=remote_payload.get("query_scope", {}),
-            query_complete=remote_payload.get("query_complete"),
-            pagination_complete=remote_payload.get("pagination_complete"),
+            query_complete=query_complete,
+            pagination_complete=pagination_complete,
             issue_records=remote_payload.get("issue_records", []),
             permissions=remote_payload.get("permissions", {}),
             capabilities=remote_payload.get("capabilities", []),
@@ -986,7 +994,8 @@ def _validate_formal_audit_boundary(audit: AuditRecord, canonical: Mapping[str, 
         created = datetime.fromisoformat(audit.created_at.replace("Z", "+00:00"))
     except (TypeError, ValueError) as exc:
         raise ValueError("audit_commit_boundary_required") from exc
-    if created.tzinfo is None or created.utcoffset() is None or created.utcoffset().total_seconds() != 0:
+    offset = created.utcoffset()
+    if created.tzinfo is None or offset is None or offset.total_seconds() != 0:
         raise ValueError("audit_commit_boundary_required")
     if any("finding_ref" in finding or not finding.get("finding_id") for finding in audit.findings):
         raise ValueError("audit_commit_boundary_required")
@@ -1034,7 +1043,7 @@ def _preview_binding_value(preview: Mapping[str, Any], key: str) -> Any:
 
 def build_audit_context_payload(workspace_identity: str, preview_id: str, revision: int,
                                 sealed_preview_digest: str,
-                                evidence_records: list[Mapping[str, Any]],
+                                evidence_records: Sequence[Mapping[str, Any]],
                                 rule_registry_version: str | None = None,
                                 rule_registry_digest: str | None = None,
                                 audit_scope: str | None = None) -> dict[str, Any]:
@@ -1057,7 +1066,7 @@ def build_audit_context_payload(workspace_identity: str, preview_id: str, revisi
 
 def compute_audit_context_digest(workspace_identity: str, preview_id: str, revision: int,
                                  sealed_preview_digest: str,
-                                 evidence_records: list[Mapping[str, Any]],
+                                 evidence_records: Sequence[Mapping[str, Any]],
                                  rule_registry_version: str | None = None,
                                  rule_registry_digest: str | None = None,
                                  audit_scope: str | None = None) -> str:
@@ -1182,7 +1191,8 @@ class InMemoryPreviewStore:
                    "canonical_payload": deepcopy(normalized_canonical)}
         if prior is not None and prior == payload:
             return
-        if prior is not None and int(prior["revision"]) >= revision:
+        prior_revision = prior.get("revision") if prior is not None else None
+        if prior is not None and (not isinstance(prior_revision, int) or isinstance(prior_revision, bool) or prior_revision >= revision):
             raise ValueError("preview_revision_write_failed")
         for audit_key, audit in list(self._audits.items()):
             if audit_key[0] == scope and audit.preview_id == preview_id and audit.status is AuditStatus.ACTIVE and (
@@ -1240,7 +1250,13 @@ class InMemoryPreviewStore:
 
     def resolve_item_id(self, workspace_identity: str, previous_preview_id: str, client_ref: str, revision: int | None = None) -> str:
         if revision is None:
-            revision = max((int(p[1]["revision"]) for p in self._previews.items() if p[0] == (workspace_identity, previous_preview_id)), default=1)
+            candidate_revisions = [
+                value.get("revision")
+                for key, value in self._previews.items()
+                if key == (workspace_identity, previous_preview_id)
+            ]
+            valid_revisions = [value for value in candidate_revisions if isinstance(value, int) and not isinstance(value, bool)]
+            revision = max(valid_revisions, default=1)
         matches = [
             item
             for item in self._items
@@ -1267,23 +1283,39 @@ class InMemoryPreviewStore:
                 raise ValueError("workspace_identity_mismatch")
             preview = self.get_preview_revision(self.workspace_identity or audit.workspace_identity, audit.preview_id, audit.revision)
             canonical = preview.get("canonical_payload", {})
+            if not isinstance(canonical, Mapping):
+                raise ValueError("sealed_preview_unavailable")
             if audit.audit_scope not in {level.value for level in PreviewLevel}:
                 raise ValueError("audit_scope_invalid")
             if canonical.get("preview_level") != audit.audit_scope:
                 raise ValueError("audit_scope_mismatch")
-        scopes = [scope for (scope, preview_id), value in self._previews.items()
-                  if preview_id == audit.preview_id and int(value["revision"]) == audit.revision]
+        scopes = [
+            scope
+            for (scope, preview_id), value in self._previews.items()
+            if preview_id == audit.preview_id
+            and isinstance(value.get("revision"), int)
+            and not isinstance(value.get("revision"), bool)
+            and value.get("revision") == audit.revision
+        ]
         self._audits[(scopes[0] if len(scopes) == 1 else "", audit.audit_id)] = audit
 
     def commit_audit(self, audit: AuditRecord) -> AuditRecord:
         with self._lock:
             preview = self.get_preview_revision(audit.workspace_identity, audit.preview_id, audit.revision)
             latest = self.get_preview(audit.workspace_identity, audit.preview_id)
-            if int(latest["revision"]) != audit.revision:
+            latest_revision = latest.get("revision")
+            if (not isinstance(latest_revision, int) or isinstance(latest_revision, bool) or
+                    latest_revision != audit.revision):
                 raise ValueError("audit_context_stale")
             from delivery_system.auditor import validate_current_commit_context
             from delivery_system.rules import build_registry_v1
-            evidence = self.get_evidence_records(audit.workspace_identity, list(preview["canonical_payload"].get("evidence_ids", [])))
+            canonical_payload = preview.get("canonical_payload")
+            if not isinstance(canonical_payload, Mapping):
+                raise ValueError("sealed_preview_unavailable")
+            evidence = self.get_evidence_records(
+                audit.workspace_identity,
+                [str(value) for value in canonical_payload.get("evidence_ids", [])],
+            )
             validate_current_commit_context(audit, preview, evidence, build_registry_v1(), self.workspace_identity or audit.workspace_identity)
             existing = self.find_audit_by_payload(audit.workspace_identity, audit.preview_id, audit.revision, audit.audit_payload_digest)
             if existing is not None and existing.status is AuditStatus.ACTIVE:
@@ -1360,7 +1392,11 @@ class InMemoryPreviewStore:
             return False
         scope, audit = matches[0]
         preview = self._previews.get((scope, approval.preview_id))
-        if preview is None or int(preview["revision"]) != approval.revision:
+        if preview is None:
+            return False
+        preview_revision = preview.get("revision")
+        if (not isinstance(preview_revision, int) or isinstance(preview_revision, bool) or
+                preview_revision != approval.revision):
             return False
         if not _preview_is_approval_eligible(preview):
             return False
@@ -1569,7 +1605,7 @@ class SQLitePreviewStore:
     def get_preview(self, workspace_identity: str, preview_id: str) -> dict[str, object]:
         return self.get_preview_revision(workspace_identity, preview_id, None)
 
-    def get_preview_revision(self, workspace_identity: str, preview_id: str, revision: int | None) -> dict[str, object]:
+    def get_preview_revision(self, workspace_identity: str, preview_id: str, revision: int | None = None) -> dict[str, object]:
         import json
 
         if workspace_identity != self.context.workspace_identity:
@@ -1635,6 +1671,8 @@ class SQLitePreviewStore:
                 raise ValueError("workspace_identity_mismatch")
             preview = self.get_preview_revision(self.context.workspace_identity, audit.preview_id, audit.revision)
             canonical = preview.get("canonical_payload", {})
+            if not isinstance(canonical, Mapping):
+                raise ValueError("sealed_preview_unavailable")
             if audit.audit_scope not in {level.value for level in PreviewLevel}:
                 raise ValueError("audit_scope_invalid")
             if canonical.get("preview_level") != audit.audit_scope:
@@ -1858,7 +1896,9 @@ class SQLitePreviewStore:
         try:
             audit = self.get_audit(self.context.workspace_identity, approval.audit_id)
             preview = self.get_preview(self.context.workspace_identity, approval.preview_id)
-            if int(preview["revision"]) != approval.revision:
+            preview_revision = preview.get("revision")
+            if (not isinstance(preview_revision, int) or isinstance(preview_revision, bool) or
+                    preview_revision != approval.revision):
                 return False
             return (
                 approval.validate_against(audit)
@@ -1913,7 +1953,12 @@ class RuntimePlanner:
             ],
             "planned_relationships": list(plan.get("planned_relationships", ())),
         }
-        operation_intents = list(plan.get("operation_intents", ()))
+        operation_candidates = list(plan.get("operation_intents", ()))
+        operation_intents: list[dict[str, Any]] = []
+        for operation in operation_candidates:
+            if not isinstance(operation, Mapping):
+                raise ValueError("invalid_input")
+            operation_intents.append(dict(operation))
         plan_digest = digest(semantic)
         operation_semantics = {
             "operation_intents": [
@@ -1929,10 +1974,13 @@ class RuntimePlanner:
             prior = self.store.get_preview(self.context.workspace_identity, previous_preview_id)
             request_id = str(prior["request_id"])
             preview_id = previous_preview_id
-            revision = int(prior["revision"]) if (
+            prior_revision = prior.get("revision")
+            if not isinstance(prior_revision, int) or isinstance(prior_revision, bool):
+                raise ValueError("preview_not_found")
+            revision = prior_revision if (
                 _preview_binding_value(prior, "plan_digest") == plan_digest
                 and _preview_binding_value(prior, "operation_set_digest") == operation_set_digest
-            ) else int(prior["revision"]) + 1
+            ) else prior_revision + 1
         prior_items = {
             item["client_ref"]: item for item in (
                 prior.get("canonical_payload", {}).get("items", ())
@@ -1942,12 +1990,12 @@ class RuntimePlanner:
         sealed_items = []
         for item in work_items:
             previous_ref = item.get("previous_client_ref")
-            if previous_preview_id is not None and revision == int(prior["revision"]) and item["client_ref"] in prior_items:
+            if previous_preview_id is not None and revision == prior_revision and item["client_ref"] in prior_items:
                 item_id = prior_items[item["client_ref"]]["item_id"]
             elif previous_ref is not None:
                 item_id = self.store.resolve_item_id(
                     self.context.workspace_identity, previous_preview_id or "", previous_ref,
-                    int(prior["revision"]) if previous_preview_id is not None else None,
+                    prior_revision if previous_preview_id is not None else None,
                 )
             else:
                 item_id = self._id("item")
@@ -2026,7 +2074,8 @@ class AuditContextService:
 
     def get(self, preview_id: str, revision: int) -> dict[str, Any]:
         latest = self.store.get_preview(self.context.workspace_identity, preview_id)
-        if int(latest.get("revision", 0)) != revision:
+        latest_revision = latest.get("revision")
+        if not isinstance(latest_revision, int) or isinstance(latest_revision, bool) or latest_revision != revision:
             raise ValueError("context_stale")
         preview = self.store.get_preview_revision(self.context.workspace_identity, preview_id, revision)
         canonical = preview.get("canonical_payload")
@@ -2055,7 +2104,7 @@ class AuditContextService:
             "preview_id": preview_id,
             "revision": revision,
             "sealed_preview": deepcopy(dict(canonical)),
-            "evidence_records": sorted(deepcopy(evidence), key=lambda record: record["evidence_id"]),
+            "evidence_records": sorted(deepcopy(evidence), key=lambda record: str(record["evidence_id"])),
             "audit_context_digest": context_digest,
             "rule_registry_version": None,
             "rule_registry_digest": None,

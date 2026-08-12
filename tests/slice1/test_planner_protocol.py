@@ -3,6 +3,7 @@ import inspect
 import math
 import unittest
 from dataclasses import FrozenInstanceError
+from typing import Any, cast
 
 from tests.fakes.fake_driver import FakeDriver
 import tests.fakes.fake_driver as fake_module
@@ -66,7 +67,7 @@ class PlannerProtocolTests(unittest.TestCase):
 
     def test_canonical_payload_rejects_non_string_mapping_key(self):
         with self.assertRaises(TypeError):
-            canonical_payload({1: "one"})
+            canonical_payload(cast(Any, {1: "one"}))
 
     def test_canonical_payload_rejects_non_finite_float(self):
         for value in (math.nan, math.inf, -math.inf):
@@ -172,9 +173,9 @@ class PlannerProtocolTests(unittest.TestCase):
         values = (UserFact("x"), Proposed("x"), Assumption("x"))
         self.assertEqual({value.to_dict()["kind"] for value in values}, {"user_fact", "proposed", "assumption"})
         with self.assertRaises(FrozenInstanceError):
-            values[0].value = "changed"
+            cast(Any, values[0]).value = "changed"
         with self.assertRaises(TypeError):
-            UserFact("x", "proposed")
+            cast(Any, UserFact)("x", "proposed")
 
     def test_source_serialization_is_stable(self):
         self.assertEqual(canonical_payload(UserFact({"b": 1, "a": 2}).to_dict()), canonical_payload(UserFact({"a": 2, "b": 1}).to_dict()))

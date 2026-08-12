@@ -4,15 +4,23 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import replace
-from typing import Callable
+from typing import Any, Callable, Mapping, cast
 
 from delivery_system.protocol import digest
-from delivery_system.runtime import ApprovalRecord, AuditRecord, AuditResult, AuditStatus, EvidenceRecord, TypedRemoteSnapshot
+from delivery_system.runtime import (
+    ApprovalRecord,
+    AuditRecord,
+    AuditResult,
+    AuditStatus,
+    EvidenceRecord,
+    PreviewStore,
+    TypedRemoteSnapshot,
+)
 from delivery_system.auditor import RuleEvaluationDraft
 from delivery_system.rules import SemanticOutcome
 
 
-def run_store_contract(testcase, store_factory: Callable[[], tuple[object, str]]) -> int:
+def run_store_contract(testcase, store_factory: Callable[[], tuple[PreviewStore, str]]) -> int:
     """Replay the common Store contract against one adapter factory."""
     store, workspace = store_factory()
     def save(sid, rev, plan="plan", items=None):
@@ -60,7 +68,7 @@ def run_store_contract(testcase, store_factory: Callable[[], tuple[object, str]]
 
     save("contract-stale", 1, items=[])
     stale_preview = store.get_preview(workspace, "contract-stale")
-    stale_canonical = stale_preview["canonical_payload"]
+    stale_canonical = cast(dict[str, Any], stale_preview["canonical_payload"])
     stale_audit = AuditRecord.create("contract-stale-audit", "contract-stale", 1,
                                      stale_canonical["plan_digest"], "remote",
                                      stale_canonical["operation_set_digest"], AuditResult.PASSED)
@@ -172,7 +180,7 @@ def run_auditor_store_contract(testcase, context, store, auditor, preview) -> in
     return 4
 
 
-def run_trust_boundary_contract(testcase, store_factory: Callable[[], tuple[object, str]]) -> int:
+def run_trust_boundary_contract(testcase, store_factory: Callable[[], tuple[PreviewStore, str]]) -> int:
     """Failure-first trust-boundary cases replayed against each Store adapter."""
     store, workspace = store_factory()
     semantic = {"contract_plan": "trust"}
@@ -240,8 +248,10 @@ def run_trust_boundary_contract(testcase, store_factory: Callable[[], tuple[obje
     malformed["query_complete"] = "false"
     with testcase.assertRaisesRegex(ValueError, "^remote_query_completeness_boolean_required$"):
         TypedRemoteSnapshot.from_records(
-            "repo", {"state": "open"}, malformed["query_complete"], "false",
-            malformed["issue_records"], malformed["permissions"], malformed["capabilities"], [],
+            "repo", {"state": "open"}, cast(bool, malformed["query_complete"]), cast(bool, "false"),
+            cast(list[Mapping[str, object]], malformed["issue_records"]),
+            cast(dict[str, bool], malformed["permissions"]),
+            cast(list[str], malformed["capabilities"]), [],
         )
 
     other_snapshot = TypedRemoteSnapshot.from_records(
@@ -266,7 +276,7 @@ def run_trust_boundary_contract(testcase, store_factory: Callable[[], tuple[obje
     return 13
 
 
-def run_strict_type_contract(testcase, store_factory: Callable[[], tuple[object, str]]) -> int:
+def run_strict_type_contract(testcase, store_factory: Callable[[], tuple[PreviewStore, str]]) -> int:
     """Replay strict SealedPreview type rejection against each Store adapter."""
     store, workspace = store_factory()
     semantic = {"strict": True}
@@ -309,7 +319,7 @@ def run_strict_type_contract(testcase, store_factory: Callable[[], tuple[object,
     return 7
 
 
-def run_sealed_schema_contract(testcase, store_factory: Callable[[], tuple[object, str]]) -> int:
+def run_sealed_schema_contract(testcase, store_factory: Callable[[], tuple[PreviewStore, str]]) -> int:
     """Reject non-canonical SealedPreview inputs and verify canonical round-trip."""
     store, workspace = store_factory()
     semantic = {"schema": "valid"}

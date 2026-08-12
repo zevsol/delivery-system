@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 import hashlib
 import re
 import uuid
-from typing import Any
+from typing import Any, Mapping, cast
 
 from delivery_system.protocol import digest
 from delivery_system.rules import ResultClass, RuleCategory, RuleRegistry, SemanticOutcome
@@ -79,9 +79,13 @@ def validate_current_commit_context(audit: AuditRecord, envelope: dict[str, Any]
             len(canonical_evidence_ids) != len(set(canonical_evidence_ids)) or
             tuple(audit.evidence_refs) != tuple(sorted(canonical_evidence_ids))):
         raise ValueError("audit_commit_boundary_required")
+    plan_digest = canonical.get("plan_digest")
+    operation_set_digest = canonical.get("operation_set_digest")
+    if not isinstance(plan_digest, str) or not isinstance(operation_set_digest, str):
+        raise ValueError("audit_commit_boundary_required")
     normalized = _validate_preview_payload(
         canonical, record_request_id, record_preview_id, record_revision,
-        canonical.get("plan_digest"), canonical.get("operation_set_digest"),
+        plan_digest, operation_set_digest,
         canonical.get("remote_snapshot_digest"), canonical.get("repository_identity"),
         evidence_records, expected_workspace_identity,
     )
@@ -178,9 +182,10 @@ def validate_committed_audit(audit: AuditRecord, canonical: dict[str, Any],
     _validate_audit_children(list(audit.rule_evaluations), list(audit.findings))
     if audit.rule_registry_version != registry.registry_version or audit.rule_registry_digest != registry.registry_digest:
         raise ValueError("audit_commit_boundary_required")
+    evidence_context = cast(list[Mapping[str, Any]], evidence_records)
     expected_context = compute_audit_context_digest(
         audit.workspace_identity, audit.preview_id, audit.revision,
-        audit.sealed_preview_digest, evidence_records,
+        audit.sealed_preview_digest, evidence_context,
         registry.registry_version, registry.registry_digest, audit.audit_scope,
     )
     if audit.audit_context_digest != expected_context:
@@ -207,9 +212,13 @@ def validate_committed_audit(audit: AuditRecord, canonical: dict[str, Any],
         if any(ref not in evidence_ids for ref in entry.get("evidence_refs", [])):
             raise ValueError("audit_commit_boundary_required")
     findings = list(audit.findings)
-    findings_by_id = {finding.get("finding_id"): finding for finding in findings}
-    if len(findings_by_id) != len(findings) or any(not key or "finding_ref" in finding for key, finding in findings_by_id.items()):
-        raise ValueError("audit_commit_boundary_required")
+    findings_by_id: dict[str, dict[str, Any]] = {}
+    for finding in findings:
+        finding_id = finding.get("finding_id")
+        if (not isinstance(finding_id, str) or not finding_id or
+                finding_id in findings_by_id or "finding_ref" in finding):
+            raise ValueError("audit_commit_boundary_required")
+        findings_by_id[finding_id] = finding
     referenced_ids: list[str] = []
     for entry in evaluations:
         outcome = entry["outcome"]
@@ -224,11 +233,14 @@ def validate_committed_audit(audit: AuditRecord, canonical: dict[str, Any],
             if finding is None or finding.get("rule_id") != entry["rule_id"]:
                 raise ValueError("audit_commit_boundary_required")
             referenced_ids.append(finding_id)
-    if sorted(referenced_ids) != sorted(findings_by_id):
+    if sorted(referenced_ids) != sorted(findings_by_id.keys()):
         raise ValueError("audit_commit_boundary_required")
     for finding_id, finding in findings_by_id.items():
-        rule = rules.get(finding.get("rule_id"))
-        entry = eval_by_rule.get(finding.get("rule_id"))
+        rule_id = finding.get("rule_id")
+        if not isinstance(rule_id, str):
+            raise ValueError("audit_commit_boundary_required")
+        rule = rules.get(rule_id)
+        entry = eval_by_rule.get(rule_id)
         if rule is None or entry is None or entry["outcome"] == SemanticOutcome.NOT_APPLICABLE.value:
             raise ValueError("audit_commit_boundary_required")
         if (finding.get("rule_version") != rule.rule_version or

@@ -5,6 +5,7 @@ from contextlib import closing
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any, cast
 
 from mcp import Client
 
@@ -112,7 +113,7 @@ class Slice2ASealedPreviewTests(unittest.TestCase):
             context = RuntimeContext.from_workspace_root(directory)
             store = InMemoryPreviewStore()
             result = RuntimePlanner(context, store).preview(plan_payload())
-            tampered = dict(store.get_preview(context.workspace_identity, result["preview_id"])["canonical_payload"])
+            tampered = dict(cast(dict[str, Any], store.get_preview(context.workspace_identity, result["preview_id"])["canonical_payload"]))
             tampered["revision"] = 2
             tampered["provenance_status"] = "driver_verified"
             tampered["sealed_preview_digest"] = digest({key: value for key, value in tampered.items() if key != "sealed_preview_digest"})
@@ -168,20 +169,28 @@ class Slice2ASealedPreviewTests(unittest.TestCase):
             store = InMemoryPreviewStore()
             result = RuntimePlanner(context, store).preview(plan_payload())
             returned = store.get_preview(context.workspace_identity, result["preview_id"])
-            returned["canonical_payload"]["semantic_payload"]["work_items"][0]["client_ref"] = "tampered"
+            returned_canonical = cast(dict[str, Any], returned["canonical_payload"])
+            returned_semantic = cast(dict[str, Any], returned_canonical["semantic_payload"])
+            returned_work_items = cast(list[dict[str, Any]], returned_semantic["work_items"])
+            returned_work_items[0]["client_ref"] = "tampered"
             fresh = store.get_preview(context.workspace_identity, result["preview_id"])
-            self.assertEqual(fresh["canonical_payload"]["semantic_payload"]["work_items"][0]["client_ref"], "inventory")
+            fresh_canonical = cast(dict[str, Any], fresh["canonical_payload"])
+            fresh_semantic = cast(dict[str, Any], fresh_canonical["semantic_payload"])
+            fresh_work_items = cast(list[dict[str, Any]], fresh_semantic["work_items"])
+            self.assertEqual(fresh_work_items[0]["client_ref"], "inventory")
     def test_runtime_owns_one_sealed_preview_and_store_persists_full_payload(self):
         with tempfile.TemporaryDirectory() as directory:
             context = RuntimeContext.from_workspace_root(directory)
             store = InMemoryPreviewStore()
             result = RuntimePlanner(context, store).preview(plan_payload())
             stored = store.get_preview(context.workspace_identity, result["preview_id"])
+            stored_canonical = cast(dict[str, Any], stored["canonical_payload"])
             self.assertEqual(result["preview_level"], PreviewLevel.CONCEPTUAL.value)
             self.assertIn("canonical_payload", stored)
-            self.assertEqual(stored["canonical_payload"]["semantic_payload"], result["semantic_payload"])
-            self.assertIn("planned_relationships", stored["canonical_payload"]["semantic_payload"])
-            self.assertIn("operation_intents", stored["canonical_payload"])
+            stored_semantic = cast(dict[str, Any], stored_canonical["semantic_payload"])
+            self.assertEqual(stored_semantic, result["semantic_payload"])
+            self.assertIn("planned_relationships", stored_semantic)
+            self.assertIn("operation_intents", stored_canonical)
             self.assertIn("sealed_preview_digest", result)
 
     def test_protocol_preview_is_only_runtime_compatibility_alias(self):
@@ -230,7 +239,7 @@ class Slice2ASealedPreviewTests(unittest.TestCase):
             )
 
     def test_remote_snapshot_digest_ignores_observed_at_but_binds_complete_fields(self):
-        kwargs = dict(
+        kwargs: dict[str, Any] = dict(
             repository_identity="owner/repo", query_scope={"state": "open"},
             query_complete=True, pagination_complete=True,
             issue_records=[{"issue_id": "1", "item_type": "issue", "title": "Issue", "updated_at": "2026-01-01T00:00:00+00:00", "repository_identity": "owner/repo"}, {"issue_id": "2", "item_type": "issue", "title": "Other", "updated_at": "2026-01-01T00:00:00+00:00", "repository_identity": "owner/repo"}],
@@ -249,7 +258,8 @@ class Slice2ASealedPreviewTests(unittest.TestCase):
             store = SQLitePreviewStore(context, ignore_checker=lambda _: True, tracked_checker=lambda _: False)
             result = RuntimePlanner(context, store).preview(plan_payload())
             stored = store.get_preview_revision(context.workspace_identity, result["preview_id"], result["revision"])
-            self.assertEqual(stored["canonical_payload"]["sealed_preview_digest"], result["sealed_preview_digest"])
+            stored_canonical = cast(dict[str, Any], stored["canonical_payload"])
+            self.assertEqual(stored_canonical["sealed_preview_digest"], result["sealed_preview_digest"])
             self.assertEqual(store.get_evidence_records(context.workspace_identity, result["evidence_ids"])[0]["evidence_id"], result["evidence_ids"][0])
 
     def test_store_envelope_has_no_second_semantic_source(self):
@@ -311,7 +321,8 @@ class Slice2ASealedPreviewTests(unittest.TestCase):
             legacy = {"legacy": True, "request_id": "r", "preview_id": "legacy", "revision": 1}
             store._previews[(context.workspace_identity, "legacy")] = legacy
             store._preview_history[(context.workspace_identity, "legacy", 1)] = legacy
-            self.assertNotIn("sealed_preview_digest", store.get_preview(context.workspace_identity, "legacy").get("canonical_payload", {}))
+            legacy_payload = cast(dict[str, Any], store.get_preview(context.workspace_identity, "legacy").get("canonical_payload", {}))
+            self.assertNotIn("sealed_preview_digest", legacy_payload)
 
     def test_conceptual_preview_cannot_be_used_for_approval(self):
         with tempfile.TemporaryDirectory() as directory:
