@@ -18,10 +18,10 @@ The Planner does not write to GitHub. The Runtime may write local PreviewStore s
 delivery-system-mcp --workspace-root <absolute-path>
 ```
 
-The current Runtime Auditor records deterministic audit results for Conceptual previews from declared semantic evaluations. It does not implement a user-facing Auditor Skill, real GitHub Driver, GitHub authentication, GitHub write operation, Human Approval Workflow, or Applier product. Conceptual audits are never approval-eligible.
+The current Runtime Auditor records deterministic audit results for Conceptual previews from declared semantic evaluations. The user-facing `audit-github-work-items` Skill reads an existing Sealed Preview, evaluates the returned audit context, and records a local Runtime Audit. It does not approve a Preview, write to GitHub, implement the Applier, or create or modify a Preview. Conceptual audits are never approval-eligible.
 
 The current package is source code and a Python runtime prototype. It is not a ChatGPT or Codex Plugin, Universal Public Plugin, Personal Repository Beta, Host Tested installation, or external Integration Tested release.
 
 The bundled local state database is `.delivery-system/state.sqlite3` and is excluded from Git. It does not store tokens, cookies, or authentication configuration. The Planner does not provide destructive cleanup operations.
 
-The Planner and Runtime Auditor MCP tools are available through the local stdio server. Host, installation, GitHub, and semantic Skill Forward validation remain outside the verified capability boundary.
+The Planner and Runtime Auditor MCP tools are available through the local stdio server. The Auditor Skill is deterministically contract-tested and has been behavior-tested through isolated local execution with three real Runtime audit contexts and independent semantic review. Host, installation, and GitHub integration remain outside the verified capability boundary.
