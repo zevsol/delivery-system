@@ -214,18 +214,47 @@ class EvidenceRecord:
         )
 
     @classmethod
+    def create_verified_driver(cls, workspace_identity: str, preview_id: str, revision: int,
+                               evidence_type: str, subject_ref: str, payload: Any,
+                               source_identity: str, repository_identity: str,
+                               query_scope: Mapping[str, object],
+                               created_at: str | None = None,
+                               schema_version: str = "evidence-v1") -> "EvidenceRecord":
+        """Create Runtime-owned verified Driver evidence.
+
+        Driver adapters provide only facts. Runtime owns the binding and the
+        Evidence ID; the public ``create`` factory remains declared-only.
+        """
+        if (not isinstance(workspace_identity, str) or not workspace_identity.strip()
+                or not isinstance(preview_id, str) or not preview_id.strip()
+                or not isinstance(revision, int) or isinstance(revision, bool) or revision < 1
+                or not isinstance(source_identity, str) or not source_identity.strip()
+                or not isinstance(repository_identity, str) or not repository_identity.strip()
+                or not isinstance(query_scope, Mapping)):
+            raise ValueError("driver_evidence_binding_invalid")
+        return cls._create_controlled(
+            workspace_identity, preview_id, revision, evidence_type, "driver",
+            None, subject_ref, payload, created_at, source_identity,
+            repository_identity, query_scope, schema_version, verified=True,
+        )
+
+    @classmethod
     def _create_controlled(cls, workspace_identity: str, preview_id: str, revision: int,
                            evidence_type: str, source_kind: str,
                            declared_source: DeclaredSource | None, subject_ref: str,
                            payload: Any, created_at: str | None,
                            source_identity: str, repository_identity: str | None,
                            query_scope: Mapping[str, object] | None,
-                           schema_version: str) -> "EvidenceRecord":
+                           schema_version: str, *, verified: bool = False) -> "EvidenceRecord":
         if source_kind not in {"declared", "runtime", "driver"}:
             raise ValueError("invalid_evidence_source_kind")
-        if source_kind != "declared":
+        if not verified and source_kind != "declared":
             raise ValueError("controlled_evidence_source")
-        if source_kind == "declared":
+        if verified:
+            if source_kind not in {"runtime", "driver"} or declared_source is not None:
+                raise ValueError("verified_evidence_source_invalid")
+            verification_status = f"{source_kind}_verified"
+        elif source_kind == "declared":
             if declared_source is None:
                 raise ValueError("declared_source_required")
             verification_status = "declared_unverified"
