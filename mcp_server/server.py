@@ -10,6 +10,7 @@ from mcp.types import ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
 from delivery_system.runtime import AuditContextService, RuntimeContext, RuntimePlanner, SQLitePreviewStore
+from delivery_system.drivers.contract import DriverTrustContext
 from delivery_system.auditor import FindingDraft, RuleEvaluationDraft, RuntimeAuditor
 from delivery_system.rules import ResultClass, RuleRegistry, SemanticOutcome, build_registry_v1
 
@@ -174,7 +175,14 @@ class RecordAuditOutput(StrictModel):
     approval_eligible: Literal[False]
 
 
-def create_server(context: RuntimeContext | None = None, store: Any | None = None, driver: Any = None) -> MCPServer:
+def create_server(context: RuntimeContext | None = None, store: Any | None = None, driver: Any = None,
+                  trust_context: DriverTrustContext | None = None) -> MCPServer:
+    if (driver is None) != (trust_context is None):
+        raise ValueError("driver_trust_context_required")
+    if store is not None and trust_context is not None:
+        existing = getattr(store, "trust_context", None)
+        if existing is not None and existing != trust_context:
+            raise ValueError("driver_trust_context_mismatch")
     mcp = MCPServer(SERVER_NAME)
     registry = build_registry_v1()
 
@@ -187,7 +195,7 @@ def create_server(context: RuntimeContext | None = None, store: Any | None = Non
     def delivery_plan_preview(payload: PreviewRequestInput) -> PreviewOutput:
         if context is None:
             raise ValueError("workspace_identity_unavailable")
-        service = RuntimePlanner(context, store, driver)
+        service = RuntimePlanner(context, store, driver, trust_context)
         if store is None:
             raise ValueError("store_unavailable")
         return PreviewOutput.model_validate(service.preview(payload.plan.model_dump(), payload.previous_preview_id))

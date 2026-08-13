@@ -46,7 +46,8 @@ def _validate_audit_children(evaluations: list[dict[str, Any]], findings: list[d
 
 def validate_current_commit_context(audit: AuditRecord, envelope: dict[str, Any],
                                     evidence_records: list[dict[str, Any]], registry: RuleRegistry,
-                                    expected_workspace_identity: str) -> None:
+                                    expected_workspace_identity: str,
+                                    promotion: Any = None) -> None:
     """Single current-state validator used inside both Store commit boundaries."""
     from delivery_system.runtime import _validate_preview_payload
     if audit.status is not AuditStatus.ACTIVE:
@@ -87,7 +88,7 @@ def validate_current_commit_context(audit: AuditRecord, envelope: dict[str, Any]
         canonical, record_request_id, record_preview_id, record_revision,
         plan_digest, operation_set_digest,
         canonical.get("remote_snapshot_digest"), canonical.get("repository_identity"),
-        evidence_records, expected_workspace_identity,
+         evidence_records, expected_workspace_identity, promotion,
     )
     if normalized != canonical:
         raise ValueError("audit_commit_boundary_required")
@@ -284,10 +285,13 @@ def validate_committed_audit(audit: AuditRecord, canonical: dict[str, Any],
 
 
 class RuntimeAuditor:
-    def __init__(self, context: RuntimeContext, store: Any, registry: RuleRegistry):
+    def __init__(self, context: RuntimeContext, store: Any, registry: RuleRegistry, trust_context: Any = None):
         self.context = context
         self.store = store
         self.registry = registry
+        self.trust_context = trust_context if trust_context is not None else getattr(store, "trust_context", None)
+        if trust_context is not None and getattr(store, "trust_context", None) != trust_context:
+            raise ValueError("driver_trust_context_mismatch")
 
     def _applicable(self, rule, canonical: dict[str, Any]) -> bool:
         return rule_is_applicable(rule, canonical)
@@ -295,7 +299,7 @@ class RuntimeAuditor:
     def get_context(self, preview_id: str, revision: int) -> dict[str, Any]:
         if not isinstance(revision, int) or isinstance(revision, bool) or revision < 1:
             raise ValueError("invalid_input")
-        context = AuditContextService(self.context, self.store).get(preview_id, revision)
+        context = AuditContextService(self.context, self.store, self.trust_context).get(preview_id, revision)
         canonical = context["sealed_preview"]
         semantic_contexts = []
         for rule in self.registry.semantic_rules:

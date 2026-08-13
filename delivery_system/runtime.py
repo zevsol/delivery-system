@@ -512,6 +512,33 @@ class TypedRemoteSnapshot:
         return digest(payload)
 
 
+_PROMOTION_MARKER = object()
+
+
+class RuntimePromotion:
+    """Opaque, single-use Runtime capability; public construction is rejected."""
+    __slots__ = ("trust_context", "evidence_record", "snapshot", "remote_content_digest", "remote_snapshot_digest", "_marker", "_used")
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        if kwargs.pop("_marker", None) is not _PROMOTION_MARKER or kwargs:
+            raise TypeError("runtime_promotion_internal_only")
+        if len(args) != 5:
+            raise TypeError("runtime_promotion_internal_only")
+        self.trust_context, self.evidence_record, self.snapshot, self.remote_content_digest, self.remote_snapshot_digest = args
+        self._marker = _PROMOTION_MARKER
+        self._used = False
+
+    @classmethod
+    def _create(cls, trust_context: Any, evidence_record: EvidenceRecord, snapshot: TypedRemoteSnapshot,
+                remote_content_digest: str, remote_snapshot_digest: str) -> "RuntimePromotion":
+        return cls(trust_context, evidence_record, snapshot, remote_content_digest, remote_snapshot_digest, _marker=_PROMOTION_MARKER)
+
+    def consume(self) -> None:
+        if self._used:
+            raise ValueError("repository_aware_promotion_reused")
+        self._used = True
+
+
 class AuditResult(str, Enum):
     PASSED = "Passed"
     NEEDS_INFORMATION = "NeedsInformation"
@@ -888,7 +915,8 @@ class PreviewStore(Protocol):
                               items: list[dict[str, object]], workspace_identity: str | None = None,
                               canonical_payload: dict[str, object] | None = None,
                               preview_level: str | None = None,
-                              evidence_records: list[dict[str, object]] | None = None) -> None: ...
+                               evidence_records: list[dict[str, object]] | None = None) -> None: ...
+    def _bind_and_save_repository_aware_preview(self, promotion: RuntimePromotion, **kwargs: Any) -> None: ...
     def get_preview(self, workspace_identity: str, preview_id: str) -> dict[str, object]: ...
     def get_preview_revision(self, workspace_identity: str, preview_id: str, revision: int | None = None) -> dict[str, object]: ...
     def get_evidence_records(self, workspace_identity: str, evidence_ids: list[str]) -> list[dict[str, object]]: ...
@@ -907,9 +935,10 @@ def _validate_preview_payload(canonical: Mapping[str, Any], request_id: str,
                               preview_id: str, revision: int,
                               plan_digest: str, operation_set_digest: str,
                               remote_snapshot_digest: str | None,
-                              repository_identity: str | None,
-                              evidence_records: list[dict[str, object]] | None,
-                              expected_workspace_identity: str) -> dict[str, Any]:
+                               repository_identity: str | None,
+                               evidence_records: list[dict[str, object]] | None,
+                               expected_workspace_identity: str,
+                               promotion: RuntimePromotion | None = None) -> dict[str, Any]:
     if not isinstance(canonical, Mapping):
         raise ValueError("sealed_preview_required")
     if (not isinstance(request_id, str) or not request_id or
@@ -929,7 +958,7 @@ def _validate_preview_payload(canonical: Mapping[str, Any], request_id: str,
         raise ValueError("preview_identity_mismatch")
     if canonical.get("workspace_identity") != expected_workspace_identity:
         raise ValueError("workspace_identity_mismatch")
-    validate_sealed_preview_invariants(canonical, expected_workspace_identity)
+    validate_sealed_preview_invariants(canonical, expected_workspace_identity, promotion=promotion)
     semantic = canonical.get("semantic_payload")
     operations = canonical.get("operation_intents")
     if not isinstance(semantic, Mapping) or not isinstance(operations, list):
@@ -978,12 +1007,19 @@ def _validate_preview_payload(canonical: Mapping[str, Any], request_id: str,
     if sorted(canonical_ids) != ids:
         raise ValueError("evidence_reference_mismatch")
     for record in evidence_records:
-        if record.get("source_kind") != "declared":
+        if record.get("source_kind") not in {"declared", "driver"}:
             raise ValueError("controlled_evidence_source")
         parsed = EvidenceRecord.from_dict(record)
         if (parsed.workspace_identity != expected_workspace_identity or
                 parsed.preview_id != preview_id or parsed.revision != revision):
             raise ValueError("evidence_scope_mismatch")
+        if record.get("source_kind") == "driver":
+            if promotion is None or parsed.evidence_id != promotion.evidence_record.evidence_id:
+                raise ValueError("repository_aware_promotion_required")
+            if parsed.source_identity != promotion.trust_context.trusted_driver_identity:
+                raise ValueError("driver_trust_context_mismatch")
+            if parsed.payload is None or digest(parsed.payload) != promotion.remote_content_digest:
+                raise ValueError("remote_content_digest_mismatch")
     unsigned = {key: value for key, value in canonical.items() if key != "sealed_preview_digest"}
     if canonical.get("sealed_preview_digest") != digest(unsigned):
         raise ValueError("sealed_preview_digest_mismatch")
@@ -997,6 +1033,38 @@ def _preview_is_approval_eligible(preview: Mapping[str, Any]) -> bool:
     # OperationIntent is intentionally not an approved operation contract yet.
     # Until that contract exists, no product preview may become WriteEligible.
     return False
+
+
+def _reload_promotion(store: Any, canonical: Mapping[str, Any], evidence: Sequence[Mapping[str, Any]]) -> RuntimePromotion | None:
+    if canonical.get("preview_level") != PreviewLevel.REPOSITORY_AWARE.value:
+        return None
+    trust = getattr(store, "trust_context", None)
+    if trust is None:
+        raise ValueError("driver_trust_context_required")
+    driver_records = [record for record in evidence if record.get("source_kind") == "driver"]
+    if len(driver_records) != 1:
+        raise ValueError("repository_aware_promotion_required")
+    record = EvidenceRecord.from_dict(driver_records[0])
+    if record.source_identity != trust.trusted_driver_identity:
+        raise ValueError("driver_trust_context_mismatch")
+    remote = canonical.get("remote_snapshot")
+    if not isinstance(remote, Mapping):
+        raise ValueError("remote_snapshot_invalid")
+    snapshot = TypedRemoteSnapshot.from_records(
+        str(remote.get("repository_identity")), remote.get("query_scope", {}),
+        remote.get("query_complete"), remote.get("pagination_complete"),
+        remote.get("issue_records", []), remote.get("permissions", {}),
+        remote.get("capabilities", []), remote.get("relationship_records", []),
+        remote.get("evidence_ids", []), remote.get("observed_at"),
+    )
+    if tuple(sorted(snapshot.evidence_ids)) != (record.evidence_id,):
+        raise ValueError("snapshot_evidence_mismatch")
+    if record.evidence_id not in set(canonical.get("evidence_ids", [])):
+        raise ValueError("evidence_reference_mismatch")
+    promotion = RuntimePromotion._create(trust, record, snapshot, digest(record.payload), snapshot.digest())
+    if canonical.get("remote_authority") != trust.remote_authority or canonical.get("remote_snapshot_digest") != promotion.remote_snapshot_digest:
+        raise ValueError("driver_trust_context_mismatch")
+    return promotion
 
 
 def _validate_formal_audit_boundary(audit: AuditRecord, canonical: Mapping[str, Any], expected_workspace_identity: str) -> None:
@@ -1114,7 +1182,8 @@ def _runtime_preview_level(canonical: Mapping[str, Any]) -> PreviewLevel:
     return PreviewLevel.CONCEPTUAL
 
 
-def validate_sealed_preview_invariants(canonical: Mapping[str, Any], expected_workspace_identity: str) -> None:
+def validate_sealed_preview_invariants(canonical: Mapping[str, Any], expected_workspace_identity: str,
+                                       *, promotion: RuntimePromotion | None = None) -> None:
     """Validate the Runtime-owned state machine as one atomic invariant set."""
     if not isinstance(canonical, Mapping):
         raise ValueError("sealed_preview_required")
@@ -1139,9 +1208,12 @@ def validate_sealed_preview_invariants(canonical: Mapping[str, Any], expected_wo
     for issue in remote.get("issue_records", []):
         if issue.get("repository_identity") != repository:
             raise ValueError("repository_identity_mismatch")
-    # No trusted Typed Driver context exists in the current product Runtime.
-    # A caller-controlled authority string can never promote a Preview.
-    raise ValueError("preview_level_unverified")
+    if promotion is None:
+        raise ValueError("preview_level_unverified")
+    if canonical.get("remote_authority") != promotion.trust_context.remote_authority:
+        raise ValueError("driver_trust_context_mismatch")
+    if canonical.get("remote_snapshot_digest") != promotion.remote_snapshot_digest:
+        raise ValueError("remote_snapshot_digest_mismatch")
 
 
 @dataclass(frozen=True)
@@ -1157,8 +1229,9 @@ class _ItemRecord:
 class InMemoryPreviewStore:
     """Deterministic test store; production state is owned by a SQLite adapter."""
 
-    def __init__(self, workspace_identity: str | None = None) -> None:
+    def __init__(self, workspace_identity: str | None = None, trust_context: Any = None) -> None:
         self.workspace_identity = workspace_identity
+        self.trust_context = trust_context
         self._lock = threading.RLock()
         self._items: list[_ItemRecord] = []
         self._previews: dict[tuple[str, str], dict[str, object]] = {}
@@ -1181,13 +1254,40 @@ class InMemoryPreviewStore:
                 canonical_payload, preview_level, evidence_records,
             )
 
+    def _bind_and_save_repository_aware_preview(self, promotion: RuntimePromotion, **kwargs: Any) -> None:
+        with self._lock:
+            if self.trust_context is None:
+                raise ValueError("driver_trust_context_required")
+            if self.trust_context != promotion.trust_context:
+                raise ValueError("driver_trust_context_mismatch")
+            self._validate_promotion(promotion, kwargs)
+            promotion.consume()
+            try:
+                self._save_preview_revision(**kwargs, promotion=promotion)
+            finally:
+                promotion._used = True
+
+    def _validate_promotion(self, promotion: RuntimePromotion, kwargs: Mapping[str, Any]) -> None:
+        if not isinstance(promotion, RuntimePromotion) or promotion._marker is not _PROMOTION_MARKER:
+            raise ValueError("repository_aware_promotion_required")
+        if kwargs.get("workspace_identity") != self.workspace_identity:
+            raise ValueError("workspace_identity_mismatch")
+        if kwargs.get("preview_id") != promotion.evidence_record.preview_id or kwargs.get("revision") != promotion.evidence_record.revision:
+            raise ValueError("repository_aware_promotion_required")
+        if kwargs.get("remote_snapshot_digest") != promotion.remote_snapshot_digest:
+            raise ValueError("remote_snapshot_digest_mismatch")
+        canonical = kwargs.get("canonical_payload")
+        if not isinstance(canonical, Mapping) or canonical.get("remote_authority") != promotion.trust_context.remote_authority:
+            raise ValueError("driver_trust_context_mismatch")
+
     def _save_preview_revision(self, request_id: str, preview_id: str, revision: int,
                               plan_digest: str, remote_snapshot_digest: str | None,
                               operation_set_digest: str, repository_identity: str | None,
                               items: list[dict[str, object]], workspace_identity: str | None = None,
                               canonical_payload: dict[str, object] | None = None,
                               preview_level: str | None = None,
-                              evidence_records: list[dict[str, object]] | None = None) -> None:
+                               evidence_records: list[dict[str, object]] | None = None,
+                               promotion: RuntimePromotion | None = None) -> None:
         if workspace_identity is not None and self.workspace_identity is not None and workspace_identity != self.workspace_identity:
             raise ValueError("workspace_identity_mismatch")
         scope = workspace_identity or self.workspace_identity or ""
@@ -1197,7 +1297,7 @@ class InMemoryPreviewStore:
             raise ValueError("preview_level_runtime_owned")
         normalized_canonical = _validate_preview_payload(canonical_payload, request_id, preview_id, revision,
                                   plan_digest, operation_set_digest,
-                                  remote_snapshot_digest, repository_identity, evidence_records, scope)
+                                  remote_snapshot_digest, repository_identity, evidence_records, scope, promotion)
         if normalized_canonical.get("preview_level") != _runtime_preview_level(normalized_canonical).value:
             raise ValueError("preview_level_runtime_owned")
         if normalized_canonical.get("items") != items:
@@ -1213,7 +1313,7 @@ class InMemoryPreviewStore:
                 str(item["client_ref"]), str(item["item_id"]), False, revision,
             ))
         if len({item.client_ref for item in candidate_items}) != len(candidate_items):
-            raise ValueError("preview_revision_write_failed")
+            raise ValueError("preview_revision_conflict")
         key = (scope, preview_id)
         prior = self._previews.get(key)
         payload = {"request_id": request_id, "preview_id": preview_id, "revision": revision,
@@ -1222,7 +1322,7 @@ class InMemoryPreviewStore:
             return
         prior_revision = prior.get("revision") if prior is not None else None
         if prior is not None and (not isinstance(prior_revision, int) or isinstance(prior_revision, bool) or prior_revision >= revision):
-            raise ValueError("preview_revision_write_failed")
+            raise ValueError("preview_revision_conflict")
         for audit_key, audit in list(self._audits.items()):
             if audit_key[0] == scope and audit.preview_id == preview_id and audit.status is AuditStatus.ACTIVE and (
                 audit.revision != revision or audit.plan_digest != plan_digest
@@ -1252,7 +1352,9 @@ class InMemoryPreviewStore:
 
     def get_preview(self, workspace_identity: str, preview_id: str) -> dict[str, object]:
         try:
-            return deepcopy(self._previews[(workspace_identity, preview_id)])
+            result = deepcopy(self._previews[(workspace_identity, preview_id)])
+            self._validate_loaded_trust(result)
+            return result
         except KeyError as exc:
             raise ValueError("preview_not_found") from exc
 
@@ -1262,9 +1364,19 @@ class InMemoryPreviewStore:
         if revision is None:
             return self.get_preview(workspace_identity, preview_id)
         try:
-            return deepcopy(self._preview_history[(workspace_identity, preview_id, revision)])
+            result = deepcopy(self._preview_history[(workspace_identity, preview_id, revision)])
+            self._validate_loaded_trust(result)
+            return result
         except KeyError as exc:
             raise ValueError("preview_not_found") from exc
+
+    def _validate_loaded_trust(self, preview: Mapping[str, Any]) -> None:
+        canonical = preview.get("canonical_payload")
+        if isinstance(canonical, Mapping) and canonical.get("preview_level") == PreviewLevel.REPOSITORY_AWARE.value:
+            if self.trust_context is None:
+                raise ValueError("driver_trust_context_required")
+            evidence = [record.to_dict() for record in self._evidence.values() if record.preview_id == canonical.get("preview_id") and record.revision == canonical.get("revision")]
+            _reload_promotion(self, canonical, evidence)
 
     def get_evidence_records(self, workspace_identity: str, evidence_ids: list[str]) -> list[dict[str, object]]:
         if workspace_identity != (self.workspace_identity or workspace_identity):
@@ -1345,7 +1457,8 @@ class InMemoryPreviewStore:
                 audit.workspace_identity,
                 [str(value) for value in canonical_payload.get("evidence_ids", [])],
             )
-            validate_current_commit_context(audit, preview, evidence, build_registry_v1(), self.workspace_identity or audit.workspace_identity)
+            promotion = _reload_promotion(self, canonical_payload, evidence)
+            validate_current_commit_context(audit, preview, evidence, build_registry_v1(), self.workspace_identity or audit.workspace_identity, promotion)
             existing = self.find_audit_by_payload(audit.workspace_identity, audit.preview_id, audit.revision, audit.audit_payload_digest)
             if existing is not None and existing.status is AuditStatus.ACTIVE:
                 return existing
@@ -1449,9 +1562,11 @@ class SQLitePreviewStore:
         context: RuntimeContext,
         ignore_checker: Callable[[Path], bool] | None = None,
         tracked_checker: Callable[[Path], bool] | None = None,
+        trust_context: Any = None,
     ):
         context.ensure_store_ready(ignore_checker=ignore_checker, tracked_checker=tracked_checker)
         self.context = context
+        self.trust_context = trust_context
         self.path = Path(context.state_path)
         self._initialize()
 
@@ -1460,6 +1575,33 @@ class SQLitePreviewStore:
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 5000")
         return connection
+
+    def _validate_promotion(self, promotion: RuntimePromotion, kwargs: Mapping[str, Any]) -> None:
+        if not isinstance(promotion, RuntimePromotion) or promotion._marker is not _PROMOTION_MARKER:
+            raise ValueError("repository_aware_promotion_required")
+        if kwargs.get("workspace_identity") != self.context.workspace_identity:
+            raise ValueError("workspace_identity_mismatch")
+        if kwargs.get("preview_id") != promotion.evidence_record.preview_id or kwargs.get("revision") != promotion.evidence_record.revision:
+            raise ValueError("repository_aware_promotion_required")
+        if kwargs.get("remote_snapshot_digest") != promotion.remote_snapshot_digest:
+            raise ValueError("remote_snapshot_digest_mismatch")
+        canonical = kwargs.get("canonical_payload")
+        if not isinstance(canonical, Mapping) or canonical.get("remote_authority") != promotion.trust_context.remote_authority:
+            raise ValueError("driver_trust_context_mismatch")
+
+    def save_preview_revision(self, *args: Any, **kwargs: Any) -> None:
+        if "promotion" in kwargs:
+            raise ValueError("repository_aware_promotion_required")
+        self._save_preview_revision_impl(*args, promotion=None, **kwargs)
+
+    def _bind_and_save_repository_aware_preview(self, promotion: RuntimePromotion, **kwargs: Any) -> None:
+        if self.trust_context is None:
+            raise ValueError("driver_trust_context_required")
+        if self.trust_context != promotion.trust_context:
+            raise ValueError("driver_trust_context_mismatch")
+        self._validate_promotion(promotion, kwargs)
+        promotion.consume()
+        self._save_preview_revision_impl(**kwargs, promotion=promotion)
 
     def _initialize(self) -> None:
         with closing(self._connect()) as connection:
@@ -1531,13 +1673,14 @@ class SQLitePreviewStore:
                 connection.execute("DROP TABLE item_lineage_legacy")
             connection.commit()
 
-    def save_preview_revision(self, request_id: str, preview_id: str, revision: int,
+    def _save_preview_revision_impl(self, request_id: str, preview_id: str, revision: int,
                               plan_digest: str, remote_snapshot_digest: str | None,
                               operation_set_digest: str, repository_identity: str | None,
                               items: list[dict[str, object]], workspace_identity: str | None = None,
                               canonical_payload: dict[str, object] | None = None,
                               preview_level: str | None = None,
-                              evidence_records: list[dict[str, object]] | None = None) -> None:
+                               evidence_records: list[dict[str, object]] | None = None,
+                               promotion: RuntimePromotion | None = None) -> None:
         import json
         if workspace_identity is not None and workspace_identity != self.context.workspace_identity:
             raise ValueError("workspace_identity_mismatch")
@@ -1548,7 +1691,7 @@ class SQLitePreviewStore:
         normalized_canonical = _validate_preview_payload(canonical_payload, request_id, preview_id, revision,
                                   plan_digest, operation_set_digest,
                                   remote_snapshot_digest, repository_identity, evidence_records,
-                                  self.context.workspace_identity)
+                                    self.context.workspace_identity, promotion)
         if normalized_canonical.get("preview_level") != _runtime_preview_level(normalized_canonical).value:
             raise ValueError("preview_level_runtime_owned")
         if normalized_canonical.get("items") != items:
@@ -1573,13 +1716,13 @@ class SQLitePreviewStore:
                     if existing[0] == encoded:
                         connection.commit()
                         return
-                    raise ValueError("preview_revision_write_failed")
+                    raise ValueError("preview_revision_conflict")
                 latest = connection.execute(
                     "SELECT MAX(revision) FROM records WHERE workspace_identity=? AND record_type='preview' AND record_id=?",
                     (self.context.workspace_identity, preview_id),
                 ).fetchone()[0]
                 if latest is not None and revision <= latest:
-                    raise ValueError("preview_revision_write_failed")
+                    raise ValueError("preview_revision_conflict")
                 for item in items:
                     connection.execute(
                         "INSERT INTO item_lineage(workspace_identity, preview_id, revision, client_ref, item_id, tombstone) VALUES (?, ?, ?, ?, ?, 0)",
@@ -1654,6 +1797,12 @@ class SQLitePreviewStore:
             raise ValueError("preview_not_found")
         result = json.loads(row[1])
         result["revision"] = row[0]
+        canonical = result.get("canonical_payload")
+        if isinstance(canonical, Mapping) and canonical.get("preview_level") == PreviewLevel.REPOSITORY_AWARE.value:
+            if self.trust_context is None:
+                raise ValueError("driver_trust_context_required")
+            evidence = self.get_evidence_records(workspace_identity, list(canonical.get("evidence_ids", [])))
+            _reload_promotion(self, canonical, evidence)
         return result
 
     def get_evidence_records(self, workspace_identity: str, evidence_ids: list[str]) -> list[dict[str, object]]:
@@ -1747,9 +1896,10 @@ class SQLitePreviewStore:
                     if evidence_row is None:
                         raise ValueError("evidence_not_found")
                     evidence.append(json.loads(evidence_row[0]))
+                promotion = _reload_promotion(self, canonical, evidence)
                 from delivery_system.auditor import validate_current_commit_context
                 from delivery_system.rules import build_registry_v1
-                validate_current_commit_context(audit, preview_payload, evidence, build_registry_v1(), self.context.workspace_identity)
+                validate_current_commit_context(audit, preview_payload, evidence, build_registry_v1(), self.context.workspace_identity, promotion)
                 current_rows = connection.execute(
                     "SELECT audit_id, payload FROM audit_history WHERE workspace_identity=? ORDER BY audit_id, event_no",
                     (audit.workspace_identity,),
@@ -1945,12 +2095,21 @@ class SQLitePreviewStore:
 class RuntimePlanner:
     """Shared Runtime planning boundary consumed by the MCP adapter."""
 
-    def __init__(self, context: RuntimeContext, store: Any, driver: Any = None):
+    def __init__(self, context: RuntimeContext, store: Any, driver: Any = None, trust_context: Any = None):
         self.context = context
         self.store = store
-        if driver is not None:
-            raise TypeError("no production Driver is implemented")
-        self.driver = None
+        self.driver = driver
+        self.trust_context = trust_context
+        if driver is not None and not hasattr(driver, "read_repository"):
+            raise TypeError("untrusted_driver_adapter")
+        if driver is not None and self.trust_context is None:
+            raise ValueError("driver_trust_context_required")
+        if driver is None and trust_context is not None:
+            raise ValueError("driver_trust_context_mismatch")
+        if driver is not None and getattr(store, "trust_context", None) not in {None, self.trust_context}:
+            raise ValueError("driver_trust_context_mismatch")
+        if driver is not None and getattr(store, "trust_context", None) is None:
+            raise ValueError("driver_trust_context_required")
 
     @staticmethod
     def _id(prefix: str) -> str:
@@ -1960,6 +2119,23 @@ class RuntimePlanner:
     @staticmethod
     def _sourced(value: Mapping[str, Any]) -> dict[str, Any]:
         return SourcedValue(value["value"], DeclaredSource(value["declared_source"])).to_dict()
+
+    def _state_fingerprint(self, canonical: Mapping[str, Any], evidence_records: Sequence[Mapping[str, Any]]) -> tuple[Any, ...]:
+        driver = [record for record in evidence_records if record.get("source_kind") == "driver"]
+        remote_digest = digest(driver[0]["payload"]) if len(driver) == 1 else None
+        fallback = next((item.get("failure_fingerprint") for item in canonical.get("planner_observations", []) if item.get("kind") == "driver_preflight_failure"), None)
+        return (canonical.get("plan_digest"), canonical.get("operation_set_digest"), remote_digest, fallback)
+
+    def _return_existing_candidate(self, preview: Mapping[str, Any]) -> dict[str, Any]:
+        canonical = dict(preview["canonical_payload"])
+        evidence = self.store.get_evidence_records(self.context.workspace_identity, list(canonical.get("evidence_ids", [])))
+        audit_digest = compute_audit_context_digest(
+            self.context.workspace_identity, canonical["preview_id"], canonical["revision"],
+            canonical["sealed_preview_digest"], evidence,
+        )
+        result = dict(canonical)
+        result.update({"remote_snapshot": None, "findings": [], "stale": False, "write_eligible": False, "audit_context_digest": audit_digest})
+        return result
 
     def preview(self, plan: Mapping[str, Any], previous_preview_id: str | None = None) -> dict[str, Any]:
         work_items = list(plan.get("work_items", ()))
@@ -1996,6 +2172,35 @@ class RuntimePlanner:
             ]
         }
         operation_set_digest = digest(operation_semantics)
+        repository_claim = plan.get("repository_claim")
+        repository_name = None
+        if isinstance(repository_claim, Mapping):
+            owner, name = repository_claim.get("owner"), repository_claim.get("name")
+            if isinstance(owner, str) and isinstance(name, str) and owner.strip() and name.strip():
+                repository_name = f"{owner.strip()}/{name.strip()}"
+        validated_facts = None
+        preflight_failures: tuple[Any, ...] = ()
+        promotion = None
+        query_scope = {
+            "api_origin": getattr(self.trust_context, "origin", "offline://driver"),
+            "api_version": "2026-03-10",
+            "issue_state": "all", "pull_request_filter": "pull_request_field_excluded",
+            "relationships": ["sub_issues", "parent", "blocked_by", "blocking"],
+            "pagination_protocol": "link-header", "budget_profile": "github-rest-offline-v1",
+        }
+        if repository_name is not None and self.driver is not None:
+            from delivery_system.drivers.preflight import validate_driver_facts
+            validated_facts, preflight_failures = validate_driver_facts(
+                self.driver, repository_name, query_scope, self.trust_context.trusted_driver_identity,
+            )
+        current_remote_content_digest = validated_facts.remote_content_digest if validated_facts is not None else None
+        current_failure_codes = tuple(sorted({failure.code for failure in preflight_failures}))
+        current_failure_fingerprint = digest({
+            "domain": "delivery-system:driver-preflight-failure:v1",
+            "repository": repository_name,
+            "query_scope": query_scope,
+            "failure_codes": list(current_failure_codes),
+        }) if current_failure_codes else None
         request_id = self._id("request")
         preview_id = self._id("preview")
         revision = 1
@@ -2010,6 +2215,17 @@ class RuntimePlanner:
                 _preview_binding_value(prior, "plan_digest") == plan_digest
                 and _preview_binding_value(prior, "operation_set_digest") == operation_set_digest
             ) else prior_revision + 1
+            prior_remote = None
+            prior_observations = prior.get("canonical_payload", {}).get("planner_observations", [])
+            prior_fallback = next((observation.get("failure_fingerprint") for observation in prior_observations if observation.get("kind") == "driver_preflight_failure"), None)
+            prior_evidence_ids = list(prior.get("canonical_payload", {}).get("evidence_ids", []))
+            if prior_evidence_ids:
+                prior_evidence = self.store.get_evidence_records(self.context.workspace_identity, prior_evidence_ids)
+                driver_evidence = [record for record in prior_evidence if record.get("source_kind") == "driver"]
+                if len(driver_evidence) == 1:
+                    prior_remote = digest(driver_evidence[0].get("payload"))
+            if _preview_binding_value(prior, "plan_digest") == plan_digest and _preview_binding_value(prior, "operation_set_digest") == operation_set_digest and (prior_remote != current_remote_content_digest or prior_fallback != current_failure_fingerprint):
+                revision = prior_revision + 1
         prior_items = {
             item["client_ref"]: item for item in (
                 prior.get("canonical_payload", {}).get("items", ())
@@ -2019,7 +2235,7 @@ class RuntimePlanner:
         sealed_items = []
         for item in work_items:
             previous_ref = item.get("previous_client_ref")
-            if previous_preview_id is not None and revision == prior_revision and item["client_ref"] in prior_items:
+            if previous_preview_id is not None and item["client_ref"] in prior_items:
                 item_id = prior_items[item["client_ref"]]["item_id"]
             elif previous_ref is not None:
                 item_id = self.store.resolve_item_id(
@@ -2029,8 +2245,29 @@ class RuntimePlanner:
             else:
                 item_id = self._id("item")
             sealed_items.append({"client_ref": item["client_ref"], "previous_client_ref": previous_ref, "item_id": item_id})
-        blockers = ["driver_unavailable"] if plan.get("repository_claim") is not None else []
+        blockers = []
         preview_level = PreviewLevel.CONCEPTUAL
+        repository_identity = None
+        remote_authority = None
+        remote_snapshot = None
+        remote_snapshot_digest = None
+        if repository_name is not None:
+            if validated_facts is not None:
+                from delivery_system.drivers.preflight import bind_validated_facts
+                from delivery_system.drivers.contract import RuntimeEvidenceBinding
+                bound = bind_validated_facts(
+                    validated_facts, RuntimeEvidenceBinding(self.context.workspace_identity, preview_id, revision), self.trust_context,
+                )
+                promotion = bound.promotion
+                repository_identity = validated_facts.response.canonical_repository
+                remote_authority = self.trust_context.remote_authority
+                remote_snapshot = bound.snapshot.to_dict()
+                remote_snapshot_digest = bound.remote_snapshot_digest
+                preview_level = PreviewLevel.REPOSITORY_AWARE
+            else:
+                blockers = list(current_failure_codes)
+                if self.driver is None and not blockers:
+                    blockers = ["driver_unavailable"]
         canonical = {
             "workspace_identity": self.context.workspace_identity,
             "request_id": request_id,
@@ -2042,12 +2279,15 @@ class RuntimePlanner:
             "operation_intents": operation_intents,
             "plan_digest": plan_digest,
             "operation_set_digest": operation_set_digest,
-            "repository_identity": None,
-            "remote_authority": None,
-            "remote_snapshot": None,
-            "remote_snapshot_digest": None,
+            "repository_identity": repository_identity,
+            "remote_authority": remote_authority,
+            "remote_snapshot": remote_snapshot,
+            "remote_snapshot_digest": remote_snapshot_digest,
             "blockers": blockers,
-            "planner_observations": [],
+            "planner_observations": ([{
+                "kind": "driver_preflight_failure", "failure_codes": list(current_failure_codes),
+                "failure_fingerprint": current_failure_fingerprint,
+            }] if current_failure_codes else []),
             "items": sealed_items,
         }
         canonical["sealed_preview_digest"] = digest({
@@ -2067,18 +2307,38 @@ class RuntimePlanner:
                     None, "runtime-planner", None, None, "evidence-v1",
                 ))
         canonical["evidence_ids"] = [record.evidence_id for record in evidence]
+        if promotion is not None:
+            evidence.append(promotion.evidence_record)
+            canonical["evidence_ids"] = [record.evidence_id for record in evidence]
         canonical["sealed_preview_digest"] = digest({
             key: value for key, value in canonical.items()
             if key != "sealed_preview_digest"
         })
         sealed_preview = SealedPreview.from_dict(canonical)
         canonical = sealed_preview.to_dict()
-        self.store.save_preview_revision(
-            request_id, preview_id, revision, plan_digest, None, operation_set_digest, None,
-            sealed_items, workspace_identity=self.context.workspace_identity,
-            canonical_payload=canonical,
-            evidence_records=[record.to_dict() for record in evidence],
-        )
+        save_args = dict(request_id=request_id, preview_id=preview_id, revision=revision,
+            plan_digest=plan_digest, remote_snapshot_digest=remote_snapshot_digest,
+            operation_set_digest=operation_set_digest, repository_identity=repository_identity,
+            items=sealed_items, workspace_identity=self.context.workspace_identity,
+            canonical_payload=canonical, evidence_records=[record.to_dict() for record in evidence])
+        try:
+            if promotion is not None:
+                if not hasattr(self.store, "_bind_and_save_repository_aware_preview"):
+                    raise ValueError("repository_aware_promotion_required")
+                self.store._bind_and_save_repository_aware_preview(promotion, **save_args)
+            else:
+                self.store.save_preview_revision(**save_args)
+        except ValueError as exc:
+            if str(exc) != "preview_revision_conflict":
+                raise
+            winner = self.store.get_preview(self.context.workspace_identity, preview_id)
+            winner_canonical = winner.get("canonical_payload")
+            if not isinstance(winner_canonical, Mapping):
+                raise
+            winner_evidence = self.store.get_evidence_records(self.context.workspace_identity, list(winner_canonical.get("evidence_ids", [])))
+            if self._state_fingerprint(canonical, [record.to_dict() for record in evidence]) != self._state_fingerprint(winner_canonical, winner_evidence):
+                raise
+            return self._return_existing_candidate(winner)
         canonical["audit_context_digest"] = compute_audit_context_digest(
             self.context.workspace_identity, preview_id, revision,
             canonical["sealed_preview_digest"], [record.to_dict() for record in evidence],
@@ -2097,9 +2357,12 @@ class RuntimePlanner:
 class AuditContextService:
     """Runtime-owned validation and construction of the Auditor input context."""
 
-    def __init__(self, context: RuntimeContext, store: PreviewStore):
+    def __init__(self, context: RuntimeContext, store: PreviewStore, trust_context: Any = None):
         self.context = context
         self.store = store
+        self.trust_context = trust_context if trust_context is not None else getattr(store, "trust_context", None)
+        if trust_context is not None and getattr(store, "trust_context", None) != trust_context:
+            raise ValueError("driver_trust_context_mismatch")
 
     def get(self, preview_id: str, revision: int) -> dict[str, Any]:
         latest = self.store.get_preview(self.context.workspace_identity, preview_id)
@@ -2112,12 +2375,15 @@ class AuditContextService:
             raise ValueError("sealed_preview_unavailable")
         evidence_ids = [str(value) for value in canonical.get("evidence_ids", [])]
         evidence = self.store.get_evidence_records(self.context.workspace_identity, evidence_ids)
+        promotion = _reload_promotion(self.store, canonical, evidence)
+        if promotion is not None and self.trust_context != promotion.trust_context:
+            raise ValueError("driver_trust_context_mismatch")
         try:
             _validate_preview_payload(
                 canonical, str(preview["request_id"]), preview_id, revision,
                 str(_preview_binding_value(preview, "plan_digest")), str(_preview_binding_value(preview, "operation_set_digest")),
                 _preview_binding_value(preview, "remote_snapshot_digest"), _preview_binding_value(preview, "repository_identity"), evidence,
-                self.context.workspace_identity,
+                self.context.workspace_identity, promotion,
             )
         except ValueError as exc:
             if str(exc) in {"plan_digest_mismatch", "operation_set_digest_mismatch", "remote_snapshot_digest_mismatch", "sealed_preview_digest_mismatch", "preview_identity_mismatch"}:
