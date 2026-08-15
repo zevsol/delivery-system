@@ -1,4 +1,6 @@
 import json
+import sqlite3
+from contextlib import closing
 from dataclasses import FrozenInstanceError
 import os
 import subprocess
@@ -6,7 +8,9 @@ import tempfile
 import unittest
 from typing import Any, cast
 from pathlib import Path
+from unittest.mock import patch
 
+from delivery_system import sqlite_schema
 from delivery_system.runtime import (
     ApprovalRecord,
     AuditRecord,
@@ -460,6 +464,46 @@ class Revision22RuntimeTests(unittest.TestCase):
         self.assertFalse(TOOL_ANNOTATIONS.read_only_hint)
         self.assertFalse(TOOL_ANNOTATIONS.destructive_hint)
         self.assertFalse(TOOL_ANNOTATIONS.open_world_hint)
+
+    def test_sqlite_preview_store_preserves_schema_owner_error_boundary(self):
+        cases = {
+            "attestation_persistence_schema_version_unsupported": "store_corrupt",
+            "attestation_persistence_schema_metadata_corrupt": "store_corrupt",
+            "attestation_persistence_schema_shape_mismatch": "store_corrupt",
+            "attestation_persistence_workspace_mismatch": "store_corrupt",
+            "attestation_persistence_migration_failed": "store_initialization_failed",
+            "attestation_persistence_sqlite_busy": "store_initialization_failed",
+            "attestation_persistence_sqlite_operational": "store_initialization_failed",
+            "attestation_persistence_schema_owner_failed": "store_initialization_failed",
+        }
+        for owner_code, runtime_code in cases.items():
+            with self.subTest(owner_code=owner_code):
+                with tempfile.TemporaryDirectory() as directory:
+                    context = RuntimeContext.from_workspace_root(directory)
+                    with patch.object(sqlite_schema, "ensure_schema_v4", side_effect=sqlite_schema.SchemaOwnerError(owner_code)):
+                        with self.assertRaises(StorePreflightError) as raised:
+                            SQLitePreviewStore(context, ignore_checker=lambda _: True, tracked_checker=lambda _: False)
+                    self.assertEqual(raised.exception.code, runtime_code)
+                    self.assertNotIn("sqlite3", str(raised.exception).lower())
+
+    def test_sqlite_preview_store_v3_to_v4_preserves_existing_business_row(self):
+        with tempfile.TemporaryDirectory() as directory:
+            context = RuntimeContext.from_workspace_root(directory)
+            state_path = Path(context.state_path)
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            with closing(sqlite3.connect(state_path)) as connection:
+                sqlite_schema._create_v3(connection, context.workspace_identity)
+                connection.execute(
+                    "INSERT INTO records VALUES (?, 'Preview', 'preserved', 1, ?)",
+                    (context.workspace_identity, '{"preserved":true}'),
+                )
+                connection.commit()
+            store = SQLitePreviewStore(context, ignore_checker=lambda _: True, tracked_checker=lambda _: False)
+            with closing(sqlite3.connect(state_path)) as connection:
+                self.assertEqual(connection.execute("SELECT schema_version FROM store_meta").fetchone()[0], 4)
+                self.assertEqual(connection.execute("SELECT payload FROM records WHERE record_id='preserved'").fetchone()[0], '{"preserved":true}')
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM attestation_artifacts").fetchone()[0], 0)
+            del store
 
 
 if __name__ == "__main__":

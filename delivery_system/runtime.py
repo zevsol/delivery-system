@@ -15,6 +15,8 @@ from typing import Any, Callable, Generic, Mapping, Protocol, Sequence, TypeVar
 from copy import deepcopy
 from datetime import datetime, timezone
 
+from delivery_system import sqlite_schema
+
 def canonical_payload(value: Mapping[str, Any]) -> str:
     from delivery_system.protocol import canonical_payload as _canonical_payload
     return _canonical_payload(value)
@@ -1555,7 +1557,7 @@ class InMemoryPreviewStore:
 class SQLitePreviewStore:
     """Transactional local store for Preview, Audit, Approval, and lineage records."""
 
-    SCHEMA_VERSION = 3
+    SCHEMA_VERSION = 4
 
     def __init__(
         self,
@@ -1571,10 +1573,10 @@ class SQLitePreviewStore:
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=5, isolation_level=None)
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA busy_timeout = 5000")
-        return connection
+        try:
+            return sqlite_schema._open_connection(self.path)
+        except sqlite_schema.SchemaOwnerError as exc:
+            raise StorePreflightError("store_initialization_failed") from exc
 
     def _validate_promotion(self, promotion: RuntimePromotion, kwargs: Mapping[str, Any]) -> None:
         if not isinstance(promotion, RuntimePromotion) or promotion._marker is not _PROMOTION_MARKER:
@@ -1604,74 +1606,21 @@ class SQLitePreviewStore:
         self._save_preview_revision_impl(**kwargs, promotion=promotion)
 
     def _initialize(self) -> None:
-        with closing(self._connect()) as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            meta_row = connection.execute("SELECT schema_version FROM store_meta LIMIT 1").fetchone() if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='store_meta'").fetchone() else None
-            needs_migration = meta_row is not None and meta_row[0] < self.SCHEMA_VERSION
-            item_columns = {row[1] for row in connection.execute("PRAGMA table_info(item_lineage)")}
-            item_sql = connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='item_lineage'").fetchone()
-            if needs_migration and item_columns and "revision" not in item_columns and item_sql and not connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='item_lineage_legacy'").fetchone():
-                connection.execute("ALTER TABLE item_lineage RENAME TO item_lineage_legacy")
-            record_columns = {row[1] for row in connection.execute("PRAGMA table_info(records)")}
-            record_sql = connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='records'").fetchone()
-            if needs_migration and record_columns and record_sql and "record_id, revision)" not in record_sql:
-                connection.execute("ALTER TABLE records RENAME TO records_legacy")
-            connection.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS store_meta (
-                    schema_version INTEGER NOT NULL,
-                    workspace_identity TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS item_lineage (
-                    workspace_identity TEXT NOT NULL,
-                    preview_id TEXT NOT NULL,
-                    revision INTEGER NOT NULL,
-                    client_ref TEXT NOT NULL,
-                    item_id TEXT NOT NULL,
-                    tombstone INTEGER NOT NULL DEFAULT 0,
-                    PRIMARY KEY (workspace_identity, preview_id, revision, client_ref)
-                );
-                CREATE TABLE IF NOT EXISTS records (
-                    workspace_identity TEXT NOT NULL,
-                    record_type TEXT NOT NULL,
-                    record_id TEXT NOT NULL,
-                    revision INTEGER,
-                    payload TEXT NOT NULL,
-                    PRIMARY KEY (workspace_identity, record_type, record_id, revision)
-                );
-                CREATE TABLE IF NOT EXISTS audit_history (
-                    workspace_identity TEXT NOT NULL,
-                    audit_id TEXT NOT NULL,
-                    event_no INTEGER NOT NULL,
-                    payload TEXT NOT NULL,
-                    reason TEXT NOT NULL,
-                    occurred_at TEXT NOT NULL,
-                    PRIMARY KEY (workspace_identity, audit_id, event_no)
-                );
-                """
-            )
-            row = connection.execute("SELECT schema_version, workspace_identity FROM store_meta").fetchone()
-            if row is None:
-                connection.execute(
-                    "INSERT INTO store_meta(schema_version, workspace_identity) VALUES (?, ?)",
-                    (self.SCHEMA_VERSION, self.context.workspace_identity),
+        try:
+            with closing(self._connect()) as connection:
+                sqlite_schema.ensure_schema_v4(
+                    connection,
+                    expected_workspace_identity=self.context.workspace_identity,
                 )
-            elif row[1] != self.context.workspace_identity:
-                connection.rollback()
-                raise StorePreflightError("store_corrupt")
-            elif row[0] != self.SCHEMA_VERSION:
-                connection.execute("UPDATE store_meta SET schema_version=?", (self.SCHEMA_VERSION,))
-            if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='records_legacy'").fetchone():
-                connection.execute(
-                    "INSERT INTO records(workspace_identity, record_type, record_id, revision, payload) SELECT workspace_identity, record_type, record_id, COALESCE(revision, 1), payload FROM records_legacy"
-                )
-                connection.execute("DROP TABLE records_legacy")
-            if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='item_lineage_legacy'").fetchone():
-                connection.execute(
-                    "INSERT INTO item_lineage(workspace_identity, preview_id, revision, client_ref, item_id, tombstone) SELECT workspace_identity, preview_id, 1, client_ref, item_id, tombstone FROM item_lineage_legacy"
-                )
-                connection.execute("DROP TABLE item_lineage_legacy")
-            connection.commit()
+        except sqlite_schema.SchemaOwnerError as exc:
+            if exc.code in {
+                "attestation_persistence_schema_version_unsupported",
+                "attestation_persistence_schema_metadata_corrupt",
+                "attestation_persistence_schema_shape_mismatch",
+                "attestation_persistence_workspace_mismatch",
+            }:
+                raise StorePreflightError("store_corrupt") from exc
+            raise StorePreflightError("store_initialization_failed") from exc
 
     def _save_preview_revision_impl(self, request_id: str, preview_id: str, revision: int,
                               plan_digest: str, remote_snapshot_digest: str | None,
