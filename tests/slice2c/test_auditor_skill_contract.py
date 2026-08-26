@@ -46,7 +46,7 @@ class AuditorSkillContractTests(unittest.TestCase):
             check=False,
         )
         if "ModuleNotFoundError: No module named 'yaml'" in result.stdout + result.stderr:
-            self.skipTest("official Validator unavailable: PyYAML is not installed")
+            self.fail("official Validator dependency contract violated: PyYAML is not installed")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue(OPENAI_PATH.is_file())
 

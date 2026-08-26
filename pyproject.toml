@@ -11,6 +11,11 @@ dependencies = [
   "mcp==2.0.0",
 ]
 
+[dependency-groups]
+test = [
+  "PyYAML==6.0.3",
+]
+
 [project.scripts]
 delivery-system-mcp = "mcp_server.server:main"
 
