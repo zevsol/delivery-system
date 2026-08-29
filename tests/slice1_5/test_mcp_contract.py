@@ -2,6 +2,7 @@ import asyncio
 import os
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 import unittest
 
@@ -112,9 +113,18 @@ class McpSdkContractTests(unittest.TestCase):
     def test_stdio_transport_uses_runtime_context_argument(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(__file__).parents[2].resolve()
+            workspace = Path(directory).resolve()
+            (workspace / ".gitignore").write_text(".delivery-system/\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "init", "--quiet"],
+                cwd=workspace,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
             params = StdioServerParameters(
                 command=os.fspath(Path(sys.executable)),
-                args=["-m", "mcp_server.server", "--workspace-root", str(root)],
+                args=["-m", "mcp_server.server", "--workspace-root", str(workspace)],
                 cwd=root,
                 env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
             )
@@ -126,6 +136,9 @@ class McpSdkContractTests(unittest.TestCase):
             result = self.run_async(exercise())
             self.assertFalse(result.is_error)
             self.assertTrue(result.structured_content["workspace_identity"].startswith("ws_v1_"))
+            state_path = workspace / ".delivery-system" / "state.sqlite3"
+            self.assertTrue(state_path.is_file())
+            self.assertNotEqual(state_path.parent.parent, root / ".delivery-system")
 
 
 if __name__ == "__main__":

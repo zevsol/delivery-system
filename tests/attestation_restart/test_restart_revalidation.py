@@ -43,6 +43,7 @@ from tests.fakes.attestation_persistence_store_contract import (
     artifact_for,
     reference_for,
 )
+from tests.attestation_persistence_store.test_sqlite_store import _v2_aggregate_fixture
 
 
 NOW = datetime(2026, 8, 14, 12, tzinfo=timezone.utc)
@@ -57,6 +58,7 @@ SERVICE_CODES = (
     "attestation_restart_revocation_unavailable",
     "attestation_restart_revocation_invalid",
     "attestation_restart_clock_invalid",
+    "attestation_restart_fresh_challenge_required",
 )
 
 
@@ -233,7 +235,6 @@ class RestartTestCase(unittest.TestCase):
         self.assertIs(type(raised.exception), RestartRevalidationError)
         self.assertEqual(raised.exception.code, "attestation_restart_context_invalid")
         self.assertEqual(str(raised.exception), "attestation_restart_context_invalid")
-
 
 class ApiAndGoldenTests(RestartTestCase):
     def test_error_contract_has_seven_codes_and_no_message_input(self) -> None:
@@ -979,6 +980,22 @@ class AggregateValidationMatrixTests(RestartTestCase):
 
 
 class BackendParityTests(RestartTestCase):
+    def test_persisted_v2_requires_fresh_runtime_challenge(self) -> None:
+        artifact, reference = _v2_aggregate_fixture()
+        store = InMemoryAttestationPersistenceStore()
+        store.persist_artifact(artifact, reference)
+        service = RestartRevalidationService(
+            store=store, revocation_reader=Reader(),
+            attempt_boundary=RevalidationAttemptBoundary(ScriptedEntropy([b"2" * 16])),
+            clock=CountingClock(NOW),
+        )
+        result = service.revalidate(
+            workspace_identity=artifact.workspace_identity, artifact_id=artifact.artifact_id,
+            reference=reference, request=self.make_request(),
+        )
+        self.assertEqual(result.outcome, "Failed")
+        self.assertEqual(result.failure_code, "attestation_restart_fresh_challenge_required")
+        self.assertIsNone(result.result_digest)
     def test_sqlite_and_inmemory_success_projection_parity(self) -> None:
         memory = self.make_service()
         memory_result = memory[0].revalidate(workspace_identity=memory[1].workspace_identity,

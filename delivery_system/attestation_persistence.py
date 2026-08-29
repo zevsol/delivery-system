@@ -20,6 +20,9 @@ import weakref
 
 from delivery_system.attestation import (
     ATTESTATION_DOMAIN,
+    ATTESTATION_V2_DOMAIN,
+    ATTESTATION_VERSION_V1,
+    ATTESTATION_VERSION_V2,
     CredentialCapabilityAttestationClaims,
     SUPPORTED_SIGNATURE_ALGORITHMS,
 )
@@ -29,6 +32,7 @@ from delivery_system.protocol import canonical_payload, digest
 
 ARTIFACT_CONTRACT_VERSION = "offline-attestation-artifact-v1"
 REFERENCE_CONTRACT_VERSION = "attestation-binding-reference-v1"
+REFERENCE_V2_CONTRACT_VERSION = "attestation-binding-reference-v2"
 ATTEMPT_CONTRACT_VERSION = "revalidation-attempt-v1"
 EVENT_IDENTITY_VERSION = "1"
 EVENT_PAYLOAD_VERSION = "1"
@@ -144,7 +148,7 @@ def _sha_id(domain: str, payload: Mapping[str, Any], prefix: str) -> str:
 
 
 def _claims_fields(value: Any) -> dict[str, Any]:
-    fields = (
+    v1_fields = (
         "attestation_version", "attestation_id", "issuer_id", "key_id",
         "signature_algorithm", "credential_class", "credential_instance_id",
         "github_subject_identity", "repository_identity", "granted_capabilities",
@@ -152,17 +156,20 @@ def _claims_fields(value: Any) -> dict[str, Any]:
         "operation_set_digest", "remote_snapshot_digest", "evidence_digest",
         "issued_at", "expires_at", "nonce", "source_verification_digest",
     )
+    v2_fields = v1_fields + ("challenge_digest", "credential_principal_identity")
     external_capabilities = False
     if type(value) is dict:
         external_capabilities = True
         outer = _keys(value, frozenset({"domain", "claims"}))
         if type(outer["domain"]) is not str:
             _error("attestation_persistence_type_invalid")
-        if outer["domain"] != ATTESTATION_DOMAIN:
+        fields = v2_fields if outer["domain"] == ATTESTATION_V2_DOMAIN else v1_fields
+        if outer["domain"] not in {ATTESTATION_DOMAIN, ATTESTATION_V2_DOMAIN}:
             _error("attestation_persistence_payload_invalid")
         nested = _keys(outer["claims"], frozenset(fields))
         raw = {field: nested[field] for field in fields}
     elif type(value) is CredentialCapabilityAttestationClaims:
+        fields = v2_fields if value.attestation_version == ATTESTATION_VERSION_V2 else v1_fields
         try:
             raw = {field: getattr(value, field) for field in fields}
         except Exception:
@@ -193,7 +200,7 @@ def _claims_fields(value: Any) -> dict[str, Any]:
             raw[field] = _timestamp(raw[field])
         else:
             raw[field] = _text(raw[field], field)
-    if raw["attestation_version"] != "1" or raw["signature_algorithm"] not in SUPPORTED_SIGNATURE_ALGORITHMS:
+    if raw["attestation_version"] not in {ATTESTATION_VERSION_V1, ATTESTATION_VERSION_V2} or raw["signature_algorithm"] not in SUPPORTED_SIGNATURE_ALGORITHMS:
         _error("attestation_persistence_payload_invalid")
     try:
         claims = CredentialCapabilityAttestationClaims(**raw)
@@ -206,13 +213,7 @@ def _claims_fields(value: Any) -> dict[str, Any]:
 
 def _claims_payload(value: Any) -> dict[str, Any]:
     raw = _claims_fields(value)
-    return {
-        "domain": "delivery-system:credential-capability-attestation:v1",
-        "claims": {
-            **raw,
-            "granted_capabilities": list(raw["granted_capabilities"]),
-        },
-    }
+    return CredentialCapabilityAttestationClaims(**raw).to_payload()
 
 
 def _claims_object(value: Any) -> CredentialCapabilityAttestationClaims:
@@ -387,9 +388,11 @@ class AttestationBindingReference:
     evidence_digest: str
     original_verified_at: str
     binding_reference_digest: str
+    credential_principal_identity: str = ""
+    challenge_digest: str = ""
 
     def __post_init__(self) -> None:
-        if type(self.reference_contract_version) is not str or self.reference_contract_version != REFERENCE_CONTRACT_VERSION:
+        if type(self.reference_contract_version) is not str or self.reference_contract_version not in {REFERENCE_CONTRACT_VERSION, REFERENCE_V2_CONTRACT_VERSION}:
             _error("attestation_persistence_payload_invalid")
         text_fields = (
             "workspace_identity", "artifact_id", "binding_id", "repository_identity",
@@ -397,6 +400,7 @@ class AttestationBindingReference:
             "audit_id", "evidence_id",
         )
         normalized = {field: _text(getattr(self, field), field) for field in text_fields}
+        normalized["reference_contract_version"] = self.reference_contract_version
         normalized["artifact_id"] = _prefixed_id(self.artifact_id, _ARTIFACT_RE)
         normalized["binding_id"] = _binding_id(self.binding_id)
         for field in ("artifact_digest", "remote_authority", "plan_digest", "sealed_preview_digest", "operation_set_digest",
@@ -407,6 +411,14 @@ class AttestationBindingReference:
         normalized["evidence_id"] = _text(self.evidence_id, "evidence_id")
         normalized["revision"] = _integer(self.revision)
         normalized["original_verified_at"] = _timestamp(self.original_verified_at)
+        if self.reference_contract_version == REFERENCE_V2_CONTRACT_VERSION:
+            normalized["credential_principal_identity"] = _text(self.credential_principal_identity, "credential_principal_identity")
+            normalized["challenge_digest"] = _digest_value(self.challenge_digest)
+        elif self.credential_principal_identity or self.challenge_digest:
+            _error("attestation_persistence_payload_invalid")
+        else:
+            normalized["credential_principal_identity"] = ""
+            normalized["challenge_digest"] = ""
         content = self._content_payload_for(normalized)
         expected_digest = digest(content)
         binding_reference_digest = _exact_derived(self.binding_reference_digest, _DIGEST_RE)
@@ -415,7 +427,7 @@ class AttestationBindingReference:
             _error("attestation_persistence_payload_invalid")
         expected_id = _sha_id(
             REFERENCE_ID_DOMAIN,
-            {"reference_version": "1", "workspace_identity": normalized["workspace_identity"],
+            {"reference_version": "2" if normalized["reference_contract_version"] == REFERENCE_V2_CONTRACT_VERSION else "1", "workspace_identity": normalized["workspace_identity"],
              "artifact_id": normalized["artifact_id"], "binding_id": normalized["binding_id"]},
             "binding-reference-",
         )
@@ -428,17 +440,20 @@ class AttestationBindingReference:
 
     @staticmethod
     def _content_payload_for(values: Mapping[str, Any]) -> dict[str, Any]:
+        fields = (
+            "workspace_identity", "artifact_id", "artifact_digest", "binding_id",
+            "repository_identity", "github_subject_identity", "driver_identity",
+            "remote_authority", "preview_id", "revision", "plan_digest",
+            "sealed_preview_digest", "operation_set_digest", "remote_snapshot_digest",
+            "audit_id", "audit_digest", "evidence_id", "evidence_digest",
+            "original_verified_at",
+        )
+        if values["reference_contract_version"] == REFERENCE_V2_CONTRACT_VERSION:
+            fields = fields + ("credential_principal_identity", "challenge_digest")
         return {
             "domain": REFERENCE_CONTENT_DOMAIN,
-            "reference_contract_version": REFERENCE_CONTRACT_VERSION,
-            **{field: values[field] for field in (
-                "workspace_identity", "artifact_id", "artifact_digest", "binding_id",
-                "repository_identity", "github_subject_identity", "driver_identity",
-                "remote_authority", "preview_id", "revision", "plan_digest",
-                "sealed_preview_digest", "operation_set_digest", "remote_snapshot_digest",
-                "audit_id", "audit_digest", "evidence_id", "evidence_digest",
-                "original_verified_at",
-            )},
+            "reference_contract_version": values["reference_contract_version"],
+            **{field: values[field] for field in fields},
         }
 
     def content_payload(self) -> dict[str, Any]:
@@ -455,7 +470,12 @@ class AttestationBindingReference:
             except Exception:
                 _error("attestation_persistence_payload_invalid")
         elif type(value) is dict:
-            raw = _keys(value, frozenset(cls.__dataclass_fields__))
+            legacy_fields = frozenset(cls.__dataclass_fields__) - {"credential_principal_identity", "challenge_digest"}
+            if frozenset(value) == legacy_fields:
+                raw = dict(value)
+                raw.update({"credential_principal_identity": "", "challenge_digest": ""})
+            else:
+                raw = _keys(value, frozenset(cls.__dataclass_fields__))
         else:
             _error("attestation_persistence_type_invalid")
         try:
@@ -476,9 +496,14 @@ def _reference_projection(value: Any, *, content: bool = False) -> dict[str, Any
         "audit_id", "audit_digest", "evidence_id", "evidence_digest",
         "original_verified_at",
     )
+    if normalized.reference_contract_version == REFERENCE_V2_CONTRACT_VERSION:
+        fields = fields + ("credential_principal_identity", "challenge_digest")
     if content:
         return normalized._content_payload_for({field: getattr(normalized, field) for field in fields})
-    return {field: getattr(normalized, field) for field in normalized.__dataclass_fields__}
+    payload = {field: getattr(normalized, field) for field in normalized.__dataclass_fields__ if field not in {"credential_principal_identity", "challenge_digest"}}
+    if normalized.reference_contract_version == REFERENCE_V2_CONTRACT_VERSION:
+        payload.update({"credential_principal_identity": normalized.credential_principal_identity, "challenge_digest": normalized.challenge_digest})
+    return payload
 
 
 def validate_artifact_aggregate(artifact: Any, reference: Any) -> tuple[PersistedAttestationArtifact, AttestationBindingReference]:
@@ -498,6 +523,11 @@ def validate_artifact_aggregate(artifact: Any, reference: Any) -> tuple[Persiste
         or normalized_reference.remote_snapshot_digest != normalized_artifact.claims_payload.remote_snapshot_digest
         or normalized_reference.evidence_digest != normalized_artifact.claims_payload.evidence_digest
         or normalized_reference.original_verified_at != normalized_artifact.original_verified_at
+        or (normalized_artifact.claims_payload.attestation_version == ATTESTATION_VERSION_V2 and (
+            normalized_reference.reference_contract_version != REFERENCE_V2_CONTRACT_VERSION
+            or normalized_reference.credential_principal_identity != normalized_artifact.claims_payload.credential_principal_identity
+            or normalized_reference.challenge_digest != normalized_artifact.claims_payload.challenge_digest
+        ))
     ):
         _error("attestation_persistence_payload_invalid")
     return normalized_artifact, normalized_reference

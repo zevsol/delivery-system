@@ -53,9 +53,9 @@ class RuntimeCredentialCapabilityBinding:
     """Runtime-owned ephemeral result; construction is service-internal."""
 
     __slots__ = (
-        "binding_id", "workspace_identity", "attestation_id", "claims_digest",
+        "binding_id", "workspace_identity", "attestation_version", "attestation_id", "claims_digest",
         "credential_instance_id", "issuer_id", "key_id", "algorithm", "credential_class",
-        "repository_identity", "github_subject_identity", "required_capabilities",
+        "credential_principal_identity", "challenge_digest", "repository_identity", "github_subject_identity", "required_capabilities",
         "granted_capabilities", "driver_identity", "remote_authority", "preview_id", "revision",
         "plan_digest", "sealed_preview_digest", "operation_set_digest", "remote_snapshot_digest",
         "evidence_id", "evidence_digest", "audit_id", "audit_digest", "source_verification_digest",
@@ -204,6 +204,12 @@ class RuntimeAttestationOrchestrationService:
                     raise ValueError("attestation_binding_integrity_failed")
                 type_tag = "str:utc"
             else:
+                if name in {"challenge_digest", "credential_principal_identity"} and fields.get("attestation_version") == "1":
+                    if value != "":
+                        raise ValueError("attestation_binding_integrity_failed")
+                    type_tag = "legacy-empty"
+                    snapshot.append((name, type_tag, value))
+                    continue
                 if type(value) is not str or not value:
                     raise ValueError("attestation_binding_integrity_failed")
                 if name in digest_fields and not re.fullmatch(r"sha256:[0-9a-f]{64}", value):
@@ -382,10 +388,13 @@ class RuntimeAttestationOrchestrationService:
                       verified_at: datetime) -> RuntimeCredentialCapabilityBinding:
         values: dict[str, Any] = {
             "workspace_identity": self.__context.workspace_identity,
+            "attestation_version": claims.attestation_version,
             "attestation_id": claims.attestation_id, "claims_digest": claims.claims_digest(),
             "credential_instance_id": claims.credential_instance_id, "issuer_id": claims.issuer_id,
             "key_id": claims.key_id, "algorithm": claims.signature_algorithm,
             "credential_class": claims.credential_class, "repository_identity": claims.repository_identity,
+            "credential_principal_identity": claims.credential_principal_identity,
+            "challenge_digest": claims.challenge_digest,
             "github_subject_identity": claims.github_subject_identity,
             "required_capabilities": request.required_capabilities,
             "granted_capabilities": claims.granted_capabilities, "driver_identity": claims.driver_identity,

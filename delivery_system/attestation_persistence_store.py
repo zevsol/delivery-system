@@ -657,7 +657,7 @@ class SQLiteAttestationPersistenceStore:
                 "claims_digest": row[6], "artifact_digest": row[7],
                 "original_verified_at": row[8], "created_at": row[9],
             }
-            if type(claims) is not dict or SQLiteAttestationPersistenceStore._canonical(payload) != row[30]:
+            if type(claims) is not dict or SQLiteAttestationPersistenceStore._canonical(payload) != row[32]:
                 _store_error("attestation_persistence_projection_corrupt")
             claim_values = claims.get("claims")
             if type(claim_values) is not dict:
@@ -673,6 +673,8 @@ class SQLiteAttestationPersistenceStore:
                 "issued_at": row[26], "expires_at": row[27], "nonce": row[28],
                 "source_verification_digest": row[29],
             }
+            if row[10] == "2":
+                expected.update({"challenge_digest": row[30], "credential_principal_identity": row[31]})
             for key, value in expected.items():
                 if claim_values.get(key) != value:
                     _store_error("attestation_persistence_projection_corrupt")
@@ -692,10 +694,12 @@ class SQLiteAttestationPersistenceStore:
                 "remote_snapshot_digest", "audit_id", "audit_digest", "evidence_id", "evidence_digest",
                 "original_verified_at", "reference_contract_version", "binding_reference_digest",
             ))}
-            parsed = json.loads(row[22])
-            if type(parsed) is not dict or SQLiteAttestationPersistenceStore._canonical(parsed) != row[22]:
+            parsed = json.loads(row[24])
+            if type(parsed) is not dict or SQLiteAttestationPersistenceStore._canonical(parsed) != row[24]:
                 _store_error("attestation_persistence_projection_corrupt")
-            if SQLiteAttestationPersistenceStore._canonical(payload) != row[22]:
+            if row[20] == "attestation-binding-reference-v2":
+                payload.update({"credential_principal_identity": row[22], "challenge_digest": row[23]})
+            if SQLiteAttestationPersistenceStore._canonical(payload) != row[24]:
                 _store_error("attestation_persistence_projection_corrupt")
             return AttestationBindingReference.from_untrusted(payload)
         except StoreContractError:
@@ -784,13 +788,13 @@ class SQLiteAttestationPersistenceStore:
                 else:
                     artifact_payload = candidate.artifact.to_payload()
                     claims = artifact_payload["claims_payload"]["claims"]
-                    connection.execute("INSERT INTO attestation_artifacts VALUES (" + ",".join("?" for _ in range(31)) + ")", (
+                    connection.execute("INSERT INTO attestation_artifacts VALUES (" + ",".join("?" for _ in range(33)) + ")", (
                         candidate.artifact.workspace_identity, candidate.artifact.artifact_id, candidate.artifact.artifact_contract_version, candidate.artifact.attestation_id,
                         self._canonical(artifact_payload["claims_payload"]), candidate.artifact.detached_proof, candidate.artifact.claims_digest, candidate.artifact.artifact_digest, candidate.artifact.original_verified_at, candidate.artifact.created_at,
-                        claims["attestation_version"], claims["issuer_id"], claims["key_id"], claims["signature_algorithm"], claims["credential_class"], claims["credential_instance_id"], claims["github_subject_identity"], claims["repository_identity"], self._canonical(claims["granted_capabilities"]), claims["driver_identity"], claims["remote_authority"], claims["preview_id"], claims["revision"], claims["operation_set_digest"], claims["remote_snapshot_digest"], claims["evidence_digest"], claims["issued_at"], claims["expires_at"], claims["nonce"], claims["source_verification_digest"], self._canonical(artifact_payload)))
+                        claims["attestation_version"], claims["issuer_id"], claims["key_id"], claims["signature_algorithm"], claims["credential_class"], claims["credential_instance_id"], claims["github_subject_identity"], claims["repository_identity"], self._canonical(claims["granted_capabilities"]), claims["driver_identity"], claims["remote_authority"], claims["preview_id"], claims["revision"], claims["operation_set_digest"], claims["remote_snapshot_digest"], claims["evidence_digest"], claims["issued_at"], claims["expires_at"], claims["nonce"], claims["source_verification_digest"], claims.get("challenge_digest"), claims.get("credential_principal_identity"), self._canonical(artifact_payload)))
                     reference_payload = candidate.binding_reference.to_payload()
-                    connection.execute("INSERT INTO attestation_binding_references VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", tuple(reference_payload[key] for key in (
-                        "workspace_identity", "reference_id", "artifact_id", "artifact_digest", "binding_id", "repository_identity", "github_subject_identity", "driver_identity", "remote_authority", "preview_id", "revision", "plan_digest", "sealed_preview_digest", "operation_set_digest", "remote_snapshot_digest", "audit_id", "audit_digest", "evidence_id", "evidence_digest", "original_verified_at", "reference_contract_version", "binding_reference_digest")) + (self._canonical(reference_payload),))
+                    connection.execute("INSERT INTO attestation_binding_references VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", tuple(reference_payload.get(key) for key in (
+                        "workspace_identity", "reference_id", "artifact_id", "artifact_digest", "binding_id", "repository_identity", "github_subject_identity", "driver_identity", "remote_authority", "preview_id", "revision", "plan_digest", "sealed_preview_digest", "operation_set_digest", "remote_snapshot_digest", "audit_id", "audit_digest", "evidence_id", "evidence_digest", "original_verified_at", "reference_contract_version", "binding_reference_digest", "credential_principal_identity", "challenge_digest")) + (self._canonical(reference_payload),))
                     result = self._aggregate_locked(connection, self._workspace_identity, candidate.artifact.artifact_id)
                     if result is None:
                         _store_error("attestation_artifact_aggregate_corrupt")

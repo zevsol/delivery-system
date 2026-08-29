@@ -12,6 +12,9 @@ import unicodedata
 from typing import Any, Literal
 
 from delivery_system.attestation import (
+    ATTESTATION_V2_DOMAIN,
+    ATTESTATION_VERSION_V1,
+    ATTESTATION_VERSION_V2,
     AttestationContractError,
     CredentialCapabilityAttestationClaims,
     CredentialCapabilityRequest,
@@ -42,6 +45,7 @@ _SERVICE_CODES = frozenset({
     "attestation_restart_revocation_unavailable",
     "attestation_restart_revocation_invalid",
     "attestation_restart_clock_invalid",
+    "attestation_restart_fresh_challenge_required",
 })
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _ARTIFACT_ID_RE = re.compile(r"^artifact-[0-9a-f]{64}$")
@@ -54,6 +58,7 @@ _TIMESTAMP_RE = re.compile(
 _CONTEXT_DOMAIN = "delivery-system:attestation-revalidation-context:v1"
 _PAYLOAD_VERSION = "1"
 _CLAIMS_DOMAIN = "delivery-system:credential-capability-attestation:v1"
+_CLAIMS_V2_DOMAIN = ATTESTATION_V2_DOMAIN
 _ARTIFACT_CONTRACT_VERSION = "offline-attestation-artifact-v1"
 _REFERENCE_CONTRACT_VERSION = "attestation-binding-reference-v1"
 _ARTIFACT_CONTENT_DOMAIN = "delivery-system:attestation-artifact-content:v1"
@@ -66,6 +71,7 @@ _CLAIMS_FIELDS = frozenset({
     "operation_set_digest", "remote_snapshot_digest", "evidence_digest",
     "issued_at", "expires_at", "nonce", "source_verification_digest",
 })
+_CLAIMS_V2_FIELDS = _CLAIMS_FIELDS | {"challenge_digest", "credential_principal_identity"}
 _ARTIFACT_FIELDS = frozenset({
     "artifact_contract_version", "artifact_id", "workspace_identity",
     "attestation_id", "claims_payload", "detached_proof", "claims_digest",
@@ -107,6 +113,7 @@ class RestartRevalidationError(Exception):
             "attestation_restart_revocation_unavailable",
             "attestation_restart_revocation_invalid",
             "attestation_restart_clock_invalid",
+            "attestation_restart_fresh_challenge_required",
         ],
     ) -> None:
         if type(code) is not str or code not in self._SUPPORTED_CODES:
@@ -196,12 +203,15 @@ def _json_compatible(value: Any) -> bool:
 def _claims_shape_is_valid(claims: Any) -> bool:
     if type(claims) is not CredentialCapabilityAttestationClaims:
         return False
-    if not _has_fields(claims, _CLAIMS_FIELDS):
+    fields = _CLAIMS_V2_FIELDS if claims.attestation_version == ATTESTATION_VERSION_V2 else _CLAIMS_FIELDS
+    if claims.attestation_version not in {ATTESTATION_VERSION_V1, ATTESTATION_VERSION_V2} or not _has_fields(
+        claims, frozenset(CredentialCapabilityAttestationClaims.__dataclass_fields__)
+    ):
         return False
-    for field in _CLAIMS_FIELDS - {"granted_capabilities", "revision"}:
+    for field in fields - {"granted_capabilities", "revision"}:
         if not _valid_text(getattr(claims, field)):
             return False
-    if claims.attestation_version != "1" or not _valid_id(claims.attestation_id, re.compile(r"^attestation-[0-9a-f]{64}$")):
+    if not _valid_id(claims.attestation_id, re.compile(r"^attestation-[0-9a-f]{64}$")):
         return False
     if type(claims.revision) is not int or claims.revision < 1:
         return False
@@ -259,13 +269,20 @@ def _artifact_shape_is_valid(artifact: Any) -> bool:
 def _reference_shape_is_valid(reference: Any) -> bool:
     if type(reference) is not AttestationBindingReference or not _has_fields(reference, _REFERENCE_FIELDS):
         return False
-    if reference.reference_contract_version != _REFERENCE_CONTRACT_VERSION:
+    if reference.reference_contract_version not in {_REFERENCE_CONTRACT_VERSION, "attestation-binding-reference-v2"}:
         return False
     if not _valid_id(reference.reference_id, _REFERENCE_ID_RE) or not _valid_id(reference.binding_id, _BINDING_ID_RE):
         return False
-    for field in _REFERENCE_FIELDS - {"revision", "reference_contract_version", "reference_id", "binding_id", "artifact_digest", "remote_authority", "plan_digest", "sealed_preview_digest", "operation_set_digest", "remote_snapshot_digest", "audit_digest", "evidence_digest", "binding_reference_digest", "original_verified_at"}:
+    optional = {"credential_principal_identity", "challenge_digest"}
+    required_text = _REFERENCE_FIELDS if reference.reference_contract_version == "attestation-binding-reference-v2" else _REFERENCE_FIELDS - optional
+    for field in required_text - {"revision", "reference_contract_version", "reference_id", "binding_id", "artifact_digest", "remote_authority", "plan_digest", "sealed_preview_digest", "operation_set_digest", "remote_snapshot_digest", "audit_digest", "evidence_digest", "binding_reference_digest", "original_verified_at"}:
         if not _valid_text(getattr(reference, field)):
             return False
+    if reference.reference_contract_version == _REFERENCE_CONTRACT_VERSION:
+        if reference.credential_principal_identity or reference.challenge_digest:
+            return False
+    elif not _valid_digest(reference.challenge_digest):
+        return False
     if type(reference.revision) is not int or reference.revision < 1:
         return False
     for field in (
@@ -292,13 +309,15 @@ def _reference_shape_is_valid(reference: Any) -> bool:
             )
         },
     }
+    if reference.reference_contract_version == "attestation-binding-reference-v2":
+        content.update({"credential_principal_identity": reference.credential_principal_identity, "challenge_digest": reference.challenge_digest})
     return reference.binding_reference_digest == digest(content)
 
 
 def _request_shape_is_valid(request: Any) -> bool:
     if type(request) is not CredentialCapabilityRequest:
         return False
-    expected = frozenset(CredentialCapabilityRequest.__slots__) - {"__boundary_provenance", "__weakref__"}
+    expected = frozenset(CredentialCapabilityRequest.__slots__) - {"__challenge_value", "__boundary_provenance", "__weakref__"}
     if not all(hasattr(request, field) for field in expected):
         return False
     if not all(_valid_text(getattr(request, field)) for field in (
@@ -344,7 +363,9 @@ def _payload_keysets_are_valid(artifact: Any, reference: Any) -> bool:
     }
     return (
         frozenset(claims_payload) == frozenset({"domain", "claims"})
-        and frozenset(claims_payload["claims"]) == _CLAIMS_FIELDS
+        and frozenset(claims_payload["claims"]) == (
+            _CLAIMS_V2_FIELDS if artifact.claims_payload.attestation_version == ATTESTATION_VERSION_V2 else _CLAIMS_FIELDS
+        )
         and frozenset(artifact_payload) == _CONTEXT_ARTIFACT_FIELDS
         and frozenset(context_payload) == _CONTEXT_ROOT_FIELDS
         and _json_compatible(context_payload)
@@ -497,6 +518,15 @@ class RestartRevalidationService:
             now = self._read_clock()
             artifact, persisted_reference = validated_aggregate
             claims = artifact.claims_payload
+            if claims.attestation_version == ATTESTATION_VERSION_V2:
+                recorded = self._append_outcome(
+                    attempt, artifact, persisted_reference, context_digest, now,
+                    outcome="Failed", failure_code="attestation_revalidation_verifier_unavailable", result_digest=None,
+                )
+                return RestartRevalidationResult(
+                    outcome="Failed", failure_code="attestation_restart_fresh_challenge_required",
+                    result_digest=None, event=recorded.event,
+                )
             if now >= self._timestamp_value(claims.expires_at):
                 return self._append_outcome(
                     attempt, artifact, persisted_reference, context_digest, now,
@@ -538,7 +568,7 @@ class RestartRevalidationService:
                 claims.credential_instance_id,
                 claims.issuer_id,
                 claims.key_id,
-                "1",
+                claims.attestation_version,
             )
         except Exception:
             raise _service_error("attestation_restart_revocation_unavailable")

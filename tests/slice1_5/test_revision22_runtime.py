@@ -500,7 +500,7 @@ class Revision22RuntimeTests(unittest.TestCase):
                 connection.commit()
             store = SQLitePreviewStore(context, ignore_checker=lambda _: True, tracked_checker=lambda _: False)
             with closing(sqlite3.connect(state_path)) as connection:
-                self.assertEqual(connection.execute("SELECT schema_version FROM store_meta").fetchone()[0], 4)
+                self.assertEqual(connection.execute("SELECT schema_version FROM store_meta").fetchone()[0], 5)
                 self.assertEqual(connection.execute("SELECT payload FROM records WHERE record_id='preserved'").fetchone()[0], '{"preserved":true}')
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM attestation_artifacts").fetchone()[0], 0)
             del store

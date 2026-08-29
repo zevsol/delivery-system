@@ -3,21 +3,26 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timezone
+import hashlib
 import tempfile
+import threading
 import unittest
 
-from delivery_system.attestation import AttestationRuntimeBoundary
+from delivery_system.attestation import AttestationRuntimeBoundary, IssuerTrustDecision
 from delivery_system.attestation_runtime import (
     RuntimeAttestationOrchestrationService,
     RuntimeCredentialCapabilityBinding,
     _subject_from_payload,
 )
 from delivery_system.auditor import RuleEvaluationDraft, RuntimeAuditor
+from delivery_system.attestation_persistence import AttestationBindingReference
+from delivery_system.attestation_persistence_store import SQLiteAttestationPersistenceStore
 from delivery_system.drivers.contract import DriverReadResponse, DriverTrustContext
-from delivery_system.protocol import digest
+from delivery_system.protocol import canonical_payload, digest
 from delivery_system.rules import SemanticOutcome, build_registry_v1
 from delivery_system.runtime import AuditResult, InMemoryPreviewStore, RuntimeContext, RuntimePlanner
 from tests.attestation_contract.test_attestation_contract import FakeCapabilityPolicy, FakeIssuer
+from tests.fakes.attestation_persistence_store_contract import artifact_for
 from tests.fakes.attestation_provider import FakeCapabilityResolver, FakeCredentialCapabilityProvider
 
 
@@ -114,6 +119,235 @@ class OrchestrationTests(unittest.TestCase):
         self.assertTrue(self.service.accepts_binding(binding))
         self.assertIs(self.service.lookup_binding(binding.binding_id), binding)
         self.assertFalse(self.preview["write_eligible"])
+
+    def test_v2_provider_challenge_and_principal_reach_binding(self):
+        self.fake_issuer.evaluate = lambda issuer_id, key_id, signature_algorithm, attestation_version, credential_class: (
+            IssuerTrustDecision(False, "attestation_issuer_untrusted")
+            if issuer_id != "host-issuer" or key_id != "key-1"
+            else IssuerTrustDecision(True)
+        )
+        self.provider = FakeCredentialCapabilityProvider(attestation_version="2")
+        self.service = RuntimeAttestationOrchestrationService(
+            self.context, self.store, TRUST,
+            AttestationRuntimeBoundary(self.fake_issuer, self.fake_issuer, self.fake_issuer, FakeCapabilityPolicy()),
+            self.provider, self.resolver, clock=lambda: NOW,
+        )
+        result = self.run_service()
+        self.assertTrue(result.success)
+        assert result.binding is not None
+        self.assertEqual(result.binding.attestation_version, "2")
+        self.assertEqual(result.binding.credential_principal_identity, "fake-app-installation-1")
+        self.assertTrue(result.binding.challenge_digest.startswith("sha256:"))
+        self.assertFalse(self.preview["write_eligible"])
+
+    def test_v2_challenge_replay_expiry_and_concurrent_consumption(self):
+        self.fake_issuer.evaluate = lambda issuer_id, key_id, signature_algorithm, attestation_version, credential_class: IssuerTrustDecision(True)
+        clock = [0.0]
+        class SynchronizedBoundary(AttestationRuntimeBoundary):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.consume_barrier = threading.Barrier(2)
+
+            def consume_challenge(self, request):
+                self.consume_barrier.wait(timeout=5)
+                return super().consume_challenge(request)
+
+        boundary = SynchronizedBoundary(self.fake_issuer, self.fake_issuer, self.fake_issuer, FakeCapabilityPolicy(), monotonic_clock=lambda: clock[0])
+        request = boundary.create_request(
+            repository_identity="owner/repo", github_subject_identity="node-1", required_capabilities=("issues:write",),
+            driver_identity=TRUST.trusted_driver_identity, remote_authority="sha256:" + "a" * 64,
+            preview_id="preview-1", revision=1, operation_set_digest="sha256:" + "b" * 64,
+            remote_snapshot_digest="sha256:" + "c" * 64, evidence_digest="sha256:" + "d" * 64,
+        )
+        provider = FakeCredentialCapabilityProvider(attestation_version="2")
+        envelope = provider.attest(request)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(lambda _: boundary.verify(envelope, request, NOW), (1, 2)))
+        self.assertEqual(sorted(result.success for result in results), [False, True])
+        self.assertEqual(sum(result.success for result in results), 1)
+
+        before_boundary = AttestationRuntimeBoundary(self.fake_issuer, self.fake_issuer, self.fake_issuer, FakeCapabilityPolicy(), monotonic_clock=lambda: clock[0])
+        before_request = before_boundary.create_request(
+            repository_identity="owner/repo", github_subject_identity="node-1", required_capabilities=("issues:write",),
+            driver_identity=TRUST.trusted_driver_identity, remote_authority="sha256:" + "a" * 64,
+            preview_id="preview-1", revision=1, operation_set_digest="sha256:" + "b" * 64,
+            remote_snapshot_digest="sha256:" + "c" * 64, evidence_digest="sha256:" + "d" * 64,
+        )
+        clock[0] = 299.999
+        before = before_boundary.verify(provider.attest(before_request), before_request, NOW)
+        self.assertTrue(before.success)
+
+        clock[0] = 0.0
+        expired_boundary = AttestationRuntimeBoundary(self.fake_issuer, self.fake_issuer, self.fake_issuer, FakeCapabilityPolicy(), monotonic_clock=lambda: clock[0])
+        expired_request = expired_boundary.create_request(
+            repository_identity="owner/repo", github_subject_identity="node-1", required_capabilities=("issues:write",),
+            driver_identity=TRUST.trusted_driver_identity, remote_authority="sha256:" + "a" * 64,
+            preview_id="preview-1", revision=1, operation_set_digest="sha256:" + "b" * 64,
+            remote_snapshot_digest="sha256:" + "c" * 64, evidence_digest="sha256:" + "d" * 64,
+        )
+        expired_envelope = provider.attest(expired_request)
+        clock[0] = 300.0
+        expired = expired_boundary.verify(expired_envelope, expired_request, NOW)
+        self.assertFalse(expired.success)
+        self.assertEqual(expired.failures[0].code, "attestation_challenge_expired")
+
+        clock[0] = 0.0
+        after_boundary = AttestationRuntimeBoundary(self.fake_issuer, self.fake_issuer, self.fake_issuer, FakeCapabilityPolicy(), monotonic_clock=lambda: clock[0])
+        after_request = after_boundary.create_request(
+            repository_identity="owner/repo", github_subject_identity="node-1", required_capabilities=("issues:write",),
+            driver_identity=TRUST.trusted_driver_identity, remote_authority="sha256:" + "a" * 64,
+            preview_id="preview-1", revision=1, operation_set_digest="sha256:" + "b" * 64,
+            remote_snapshot_digest="sha256:" + "c" * 64, evidence_digest="sha256:" + "d" * 64,
+        )
+        clock[0] = 301.0
+        after = after_boundary.verify(provider.attest(after_request), after_request, NOW)
+        self.assertFalse(after.success)
+        self.assertEqual(after.failures[0].code, "attestation_challenge_expired")
+
+    def test_v2_rejects_provider_substituted_challenge(self):
+        self.fake_issuer.evaluate = lambda *args: IssuerTrustDecision(True)
+        self.provider = FakeCredentialCapabilityProvider(attestation_version="2")
+        self.provider.challenge_digest_override = "sha256:" + "0" * 64
+        self.service = RuntimeAttestationOrchestrationService(
+            self.context, self.store, TRUST,
+            AttestationRuntimeBoundary(self.fake_issuer, self.fake_issuer, self.fake_issuer, FakeCapabilityPolicy()),
+            self.provider, self.resolver, clock=lambda: NOW,
+        )
+        substituted = self.run_service()
+        self.assertFalse(substituted.success)
+        self.assertEqual(substituted.failures[0].code, "attestation_challenge_mismatch")
+
+    def test_v2_runtime_restart_requires_fresh_challenge_and_reacquires(self):
+        issuer = self.fake_issuer
+        issuer.evaluate = lambda *args: IssuerTrustDecision(True)
+        values = dict(
+            repository_identity="owner/repo", github_subject_identity="node-1", required_capabilities=("issues:write",),
+            driver_identity=TRUST.trusted_driver_identity, remote_authority="sha256:" + "a" * 64,
+            preview_id="preview-1", revision=1, operation_set_digest="sha256:" + "b" * 64,
+            remote_snapshot_digest="sha256:" + "c" * 64, evidence_digest="sha256:" + "d" * 64,
+        )
+        runtime_a = AttestationRuntimeBoundary(issuer, issuer, issuer, FakeCapabilityPolicy())
+        request_a = runtime_a.create_request(**values)
+        provider = FakeCredentialCapabilityProvider(attestation_version="2")
+        envelope_a = provider.attest(request_a)
+        self.assertTrue(runtime_a.verify(envelope_a, request_a, NOW).success)
+
+        runtime_b = AttestationRuntimeBoundary(issuer, issuer, issuer, FakeCapabilityPolicy())
+        stale = runtime_b.verify(envelope_a, request_a, NOW)
+        self.assertFalse(stale.success)
+        request_b = runtime_b.create_request(**values)
+        envelope_b = provider.attest(request_b)
+        fresh = runtime_b.verify(envelope_b, request_b, NOW)
+        self.assertTrue(fresh.success)
+        self.assertNotEqual(request_a.challenge_digest, request_b.challenge_digest)
+
+    def test_v2_persisted_lifecycle_requires_fresh_runtime_and_provider_exchange(self):
+        self.fake_issuer.evaluate = lambda *args: IssuerTrustDecision(True)
+        provider = FakeCredentialCapabilityProvider(attestation_version="2")
+        boundary_a = AttestationRuntimeBoundary(
+            self.fake_issuer, self.fake_issuer, self.fake_issuer, FakeCapabilityPolicy()
+        )
+        service_a = RuntimeAttestationOrchestrationService(
+            self.context, self.store, TRUST, boundary_a, provider, self.resolver, clock=lambda: NOW
+        )
+
+        result_a = service_a.orchestrate(self.preview["preview_id"], self.preview["revision"])
+        self.assertTrue(result_a.success)
+        assert result_a.binding is not None
+        binding_a = result_a.binding
+        request_a = provider.last_request
+        self.assertIsNotNone(request_a)
+        assert request_a is not None
+        challenge_a = request_a.challenge_digest
+
+        # Persist the exact envelope returned by the exchange that Runtime A
+        # verified; persistence is deliberately exercised as a separate store.
+        envelope_a = provider.last_attestation
+        self.assertIsNotNone(envelope_a)
+        artifact = artifact_for(envelope_a.claims, workspace=self.context.workspace_identity)
+        reference_values = {
+            "reference_contract_version": "attestation-binding-reference-v2",
+            "reference_id": "",
+            "workspace_identity": artifact.workspace_identity,
+            "artifact_id": artifact.artifact_id,
+            "artifact_digest": artifact.artifact_digest,
+            "binding_id": binding_a.binding_id,
+            "repository_identity": binding_a.repository_identity,
+            "github_subject_identity": binding_a.github_subject_identity,
+            "driver_identity": binding_a.driver_identity,
+            "remote_authority": binding_a.remote_authority,
+            "preview_id": binding_a.preview_id,
+            "revision": binding_a.revision,
+            "plan_digest": binding_a.plan_digest,
+            "sealed_preview_digest": binding_a.sealed_preview_digest,
+            "operation_set_digest": binding_a.operation_set_digest,
+            "remote_snapshot_digest": binding_a.remote_snapshot_digest,
+            "audit_id": binding_a.audit_id,
+            "audit_digest": binding_a.audit_digest,
+            "evidence_id": binding_a.evidence_id,
+            "evidence_digest": binding_a.evidence_digest,
+            "original_verified_at": artifact.original_verified_at,
+            "binding_reference_digest": "",
+            "credential_principal_identity": binding_a.credential_principal_identity,
+            "challenge_digest": binding_a.challenge_digest,
+        }
+        reference_values["binding_reference_digest"] = digest(
+            AttestationBindingReference._content_payload_for(reference_values)
+        )
+        reference_values["reference_id"] = "binding-reference-" + hashlib.sha256(
+            canonical_payload({
+                "domain": "delivery-system:attestation-binding-reference-identity:v1",
+                "payload": {
+                    "reference_version": "2",
+                    "workspace_identity": artifact.workspace_identity,
+                    "artifact_id": artifact.artifact_id,
+                    "binding_id": binding_a.binding_id,
+                },
+            }).encode("utf-8")
+        ).hexdigest()
+        reference = AttestationBindingReference(**reference_values)
+
+        path = self.directory.name + "\\persisted-v2.sqlite3"
+        persisted = SQLiteAttestationPersistenceStore(path, workspace_identity=self.context.workspace_identity)
+        try:
+            persisted.persist_artifact(artifact, reference)
+            self.assertTrue(service_a.accepts_binding(binding_a))
+            del service_a, boundary_a
+
+            aggregate = persisted.get_artifact_aggregate(self.context.workspace_identity, artifact.artifact_id)
+            self.assertIsNotNone(aggregate)
+            assert aggregate is not None
+            self.assertEqual(aggregate.artifact.artifact_digest, artifact.artifact_digest)
+            self.assertEqual(aggregate.artifact.claims_payload.challenge_digest, challenge_a)
+            self.assertEqual(aggregate.binding_reference.challenge_digest, challenge_a)
+
+            boundary_b = AttestationRuntimeBoundary(
+                self.fake_issuer, self.fake_issuer, self.fake_issuer, FakeCapabilityPolicy()
+            )
+            service_b = RuntimeAttestationOrchestrationService(
+                self.context, self.store, TRUST, boundary_b, provider, self.resolver, clock=lambda: NOW
+            )
+            self.assertIsNone(service_b.lookup_binding(binding_a.binding_id))
+            self.assertFalse(service_b.accepts_binding(binding_a))
+            stale = boundary_b.verify(envelope_a, request_a, NOW)
+            self.assertFalse(stale.success)
+            self.assertEqual(stale.failures[0].code, "attestation_request_unavailable")
+
+            result_b = service_b.orchestrate(self.preview["preview_id"], self.preview["revision"])
+            self.assertTrue(result_b.success)
+            assert result_b.binding is not None
+            binding_b = result_b.binding
+            request_b = provider.last_request
+            self.assertIsNotNone(request_b)
+            assert request_b is not None
+            self.assertNotEqual(challenge_a, request_b.challenge_digest)
+            self.assertEqual(binding_b.challenge_digest, request_b.challenge_digest)
+            self.assertNotEqual(binding_a.binding_id, binding_b.binding_id)
+            self.assertIsNone(service_b.lookup_binding(binding_a.binding_id))
+            self.assertTrue(service_b.accepts_binding(binding_b))
+            self.assertNotEqual(binding_a.attestation_id, binding_b.attestation_id)
+        finally:
+            persisted.close()
 
     def test_request_fields_are_runtime_derived_and_not_caller_inputs(self):
         result = self.run_service()

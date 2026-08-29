@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sqlite3
+import hashlib
+import json
 from contextlib import closing
 import multiprocessing as mp
 from pathlib import Path
@@ -15,11 +17,41 @@ from delivery_system.attestation_persistence_store import (
     SQLiteAttestationPersistenceStore,
     StoreContractError,
 )
+from delivery_system.attestation_persistence import AttestationBindingReference, REFERENCE_V2_CONTRACT_VERSION
+from delivery_system.protocol import canonical_payload, digest
+
+
+def sqlite_schema_json(value):
+    return canonical_payload(value)
 from tests.fakes.attestation_persistence_store_contract import (
     artifact_for,
     event_for,
+    make_claims,
     reference_for,
 )
+
+
+def _v2_aggregate_fixture():
+    claims = make_claims(
+        attestation_version="2", challenge_digest="sha256:" + "f" * 64,
+        credential_principal_identity="app-installation-1",
+    )
+    artifact = artifact_for(claims)
+    legacy = reference_for(artifact)
+    values = {field: getattr(legacy, field) for field in legacy.__dataclass_fields__}
+    values.update({
+        "reference_contract_version": REFERENCE_V2_CONTRACT_VERSION,
+        "reference_id": "", "binding_reference_digest": "",
+        "credential_principal_identity": claims.credential_principal_identity,
+        "challenge_digest": claims.challenge_digest,
+    })
+    values["binding_reference_digest"] = digest(AttestationBindingReference._content_payload_for(values))
+    values["reference_id"] = "binding-reference-" + hashlib.sha256(canonical_payload({
+        "domain": "delivery-system:attestation-binding-reference-identity:v1",
+        "payload": {"reference_version": "2", "workspace_identity": values["workspace_identity"],
+                    "artifact_id": values["artifact_id"], "binding_id": values["binding_id"]},
+    }).encode("utf-8")).hexdigest()
+    return artifact, AttestationBindingReference(**values)
 
 
 class _ConnectionProxy:
@@ -109,6 +141,47 @@ def _create_v4_variant(path: Path, transform=None) -> None:
         connection.commit()
 
 
+def _create_real_v4_fixture(path: Path):
+    """Create the literal pre-V2 schema from integration HEAD's Version 4 DDL."""
+    _create_v3(path)
+    ddl = r"""
+CREATE TABLE attestation_artifacts (
+ workspace_identity TEXT NOT NULL CHECK (length(workspace_identity) > 0), artifact_id TEXT NOT NULL CHECK (length(artifact_id) > 0), artifact_contract_version TEXT NOT NULL CHECK (artifact_contract_version = 'offline-attestation-artifact-v1'), attestation_id TEXT NOT NULL CHECK (length(attestation_id) > 0), claims_payload_json TEXT NOT NULL CHECK (length(claims_payload_json) > 0), detached_proof TEXT NOT NULL CHECK (length(detached_proof) > 0), claims_digest TEXT NOT NULL CHECK (length(claims_digest) = 71 AND substr(claims_digest, 1, 7) = 'sha256:' AND substr(claims_digest, 8) NOT GLOB '*[^0-9a-f]*'), artifact_digest TEXT NOT NULL CHECK (length(artifact_digest) = 71 AND substr(artifact_digest, 1, 7) = 'sha256:' AND substr(artifact_digest, 8) NOT GLOB '*[^0-9a-f]*'), original_verified_at TEXT NOT NULL CHECK (length(original_verified_at) > 0), created_at TEXT NOT NULL CHECK (length(created_at) > 0), claims_attestation_version TEXT NOT NULL CHECK (claims_attestation_version = '1'), claims_issuer_id TEXT NOT NULL CHECK (length(claims_issuer_id) > 0), claims_key_id TEXT NOT NULL CHECK (length(claims_key_id) > 0), claims_signature_algorithm TEXT NOT NULL CHECK (length(claims_signature_algorithm) > 0), claims_credential_class TEXT NOT NULL CHECK (length(claims_credential_class) > 0), claims_credential_instance_id TEXT NOT NULL CHECK (length(claims_credential_instance_id) > 0), claims_github_subject_identity TEXT NOT NULL CHECK (length(claims_github_subject_identity) > 0), claims_repository_identity TEXT NOT NULL CHECK (length(claims_repository_identity) > 0), claims_granted_capabilities_json TEXT NOT NULL CHECK (length(claims_granted_capabilities_json) > 0), claims_driver_identity TEXT NOT NULL CHECK (length(claims_driver_identity) > 0), claims_remote_authority TEXT NOT NULL CHECK (length(claims_remote_authority) = 71 AND substr(claims_remote_authority, 1, 7) = 'sha256:' AND substr(claims_remote_authority, 8) NOT GLOB '*[^0-9a-f]*'), claims_preview_id TEXT NOT NULL CHECK (length(claims_preview_id) > 0), claims_revision INTEGER NOT NULL CHECK (claims_revision > 0), claims_operation_set_digest TEXT NOT NULL CHECK (length(claims_operation_set_digest) = 71 AND substr(claims_operation_set_digest, 1, 7) = 'sha256:' AND substr(claims_operation_set_digest, 8) NOT GLOB '*[^0-9a-f]*'), claims_remote_snapshot_digest TEXT NOT NULL CHECK (length(claims_remote_snapshot_digest) = 71 AND substr(claims_remote_snapshot_digest, 1, 7) = 'sha256:' AND substr(claims_remote_snapshot_digest, 8) NOT GLOB '*[^0-9a-f]*'), claims_evidence_digest TEXT NOT NULL CHECK (length(claims_evidence_digest) = 71 AND substr(claims_evidence_digest, 1, 7) = 'sha256:' AND substr(claims_evidence_digest, 8) NOT GLOB '*[^0-9a-f]*'), claims_issued_at TEXT NOT NULL CHECK (length(claims_issued_at) > 0), claims_expires_at TEXT NOT NULL CHECK (length(claims_expires_at) > 0), claims_nonce TEXT NOT NULL CHECK (length(claims_nonce) > 0), claims_source_verification_digest TEXT NOT NULL CHECK (length(claims_source_verification_digest) = 71 AND substr(claims_source_verification_digest, 1, 7) = 'sha256:' AND substr(claims_source_verification_digest, 8) NOT GLOB '*[^0-9a-f]*'), canonical_json TEXT NOT NULL CHECK (length(canonical_json) > 0), PRIMARY KEY (workspace_identity, artifact_id), UNIQUE (workspace_identity, attestation_id)
+);
+CREATE TABLE attestation_binding_references (
+ workspace_identity TEXT NOT NULL CHECK (length(workspace_identity) > 0), reference_id TEXT NOT NULL CHECK (length(reference_id) > 0), artifact_id TEXT NOT NULL CHECK (length(artifact_id) > 0), artifact_digest TEXT NOT NULL CHECK (length(artifact_digest) = 71 AND substr(artifact_digest, 1, 7) = 'sha256:' AND substr(artifact_digest, 8) NOT GLOB '*[^0-9a-f]*'), binding_id TEXT NOT NULL CHECK (length(binding_id) > 0), repository_identity TEXT NOT NULL CHECK (length(repository_identity) > 0), github_subject_identity TEXT NOT NULL CHECK (length(github_subject_identity) > 0), driver_identity TEXT NOT NULL CHECK (length(driver_identity) > 0), remote_authority TEXT NOT NULL CHECK (length(remote_authority) = 71 AND substr(remote_authority, 1, 7) = 'sha256:' AND substr(remote_authority, 8) NOT GLOB '*[^0-9a-f]*'), preview_id TEXT NOT NULL CHECK (length(preview_id) > 0), revision INTEGER NOT NULL CHECK (revision > 0), plan_digest TEXT NOT NULL CHECK (length(plan_digest) = 71 AND substr(plan_digest, 1, 7) = 'sha256:' AND substr(plan_digest, 8) NOT GLOB '*[^0-9a-f]*'), sealed_preview_digest TEXT NOT NULL CHECK (length(sealed_preview_digest) = 71 AND substr(sealed_preview_digest, 1, 7) = 'sha256:' AND substr(sealed_preview_digest, 8) NOT GLOB '*[^0-9a-f]*'), operation_set_digest TEXT NOT NULL CHECK (length(operation_set_digest) = 71 AND substr(operation_set_digest, 1, 7) = 'sha256:' AND substr(operation_set_digest, 8) NOT GLOB '*[^0-9a-f]*'), remote_snapshot_digest TEXT NOT NULL CHECK (length(remote_snapshot_digest) = 71 AND substr(remote_snapshot_digest, 1, 7) = 'sha256:' AND substr(remote_snapshot_digest, 8) NOT GLOB '*[^0-9a-f]*'), audit_id TEXT NOT NULL CHECK (length(audit_id) > 0), audit_digest TEXT NOT NULL CHECK (length(audit_digest) = 71 AND substr(audit_digest, 1, 7) = 'sha256:' AND substr(audit_digest, 8) NOT GLOB '*[^0-9a-f]*'), evidence_id TEXT NOT NULL CHECK (length(evidence_id) > 0), evidence_digest TEXT NOT NULL CHECK (length(evidence_digest) = 71 AND substr(evidence_digest, 1, 7) = 'sha256:' AND substr(evidence_digest, 8) NOT GLOB '*[^0-9a-f]*'), original_verified_at TEXT NOT NULL CHECK (length(original_verified_at) > 0), reference_contract_version TEXT NOT NULL CHECK (reference_contract_version = 'attestation-binding-reference-v1'), binding_reference_digest TEXT NOT NULL CHECK (length(binding_reference_digest) = 71 AND substr(binding_reference_digest, 1, 7) = 'sha256:' AND substr(binding_reference_digest, 8) NOT GLOB '*[^0-9a-f]*'), canonical_json TEXT NOT NULL CHECK (length(canonical_json) > 0), PRIMARY KEY (workspace_identity, artifact_id), UNIQUE (workspace_identity, reference_id), UNIQUE (workspace_identity, binding_id), UNIQUE (workspace_identity, artifact_id, binding_reference_digest), FOREIGN KEY (workspace_identity, artifact_id) REFERENCES attestation_artifacts(workspace_identity, artifact_id) ON DELETE RESTRICT ON UPDATE RESTRICT
+);
+CREATE TABLE attestation_revalidation_events (
+ workspace_identity TEXT NOT NULL CHECK (length(workspace_identity) > 0), event_id TEXT NOT NULL CHECK (length(event_id) > 0), event_identity_version TEXT NOT NULL CHECK (event_identity_version = '1'), event_payload_version TEXT NOT NULL CHECK (event_payload_version = '1'), artifact_id TEXT NOT NULL CHECK (length(artifact_id) > 0), artifact_digest TEXT NOT NULL CHECK (length(artifact_digest) = 71 AND substr(artifact_digest, 1, 7) = 'sha256:' AND substr(artifact_digest, 8) NOT GLOB '*[^0-9a-f]*'), revalidation_attempt_id TEXT NOT NULL CHECK (length(revalidation_attempt_id) > 0), revalidation_context_digest TEXT NOT NULL CHECK (length(revalidation_context_digest) = 71 AND substr(revalidation_context_digest, 1, 7) = 'sha256:' AND substr(revalidation_context_digest, 8) NOT GLOB '*[^0-9a-f]*'), binding_reference_digest TEXT NOT NULL CHECK (length(binding_reference_digest) = 71 AND substr(binding_reference_digest, 1, 7) = 'sha256:' AND substr(binding_reference_digest, 8) NOT GLOB '*[^0-9a-f]*'), outcome TEXT NOT NULL CHECK (outcome IN ('Successful', 'Failed')), revalidated_at TEXT NOT NULL CHECK (length(revalidated_at) > 0), failure_code TEXT CHECK (failure_code IS NULL OR length(failure_code) > 0), result_digest TEXT CHECK (result_digest IS NULL OR (length(result_digest) = 71 AND substr(result_digest, 1, 7) = 'sha256:' AND substr(result_digest, 8) NOT GLOB '*[^0-9a-f]*')), event_payload_digest TEXT NOT NULL CHECK (length(event_payload_digest) = 71 AND substr(event_payload_digest, 1, 7) = 'sha256:' AND substr(event_payload_digest, 8) NOT GLOB '*[^0-9a-f]*'), event_sequence INTEGER NOT NULL CHECK (event_sequence > 0), canonical_json TEXT NOT NULL CHECK (length(canonical_json) > 0), PRIMARY KEY (workspace_identity, event_id), UNIQUE (workspace_identity, artifact_id, event_sequence), FOREIGN KEY (workspace_identity, artifact_id) REFERENCES attestation_artifacts(workspace_identity, artifact_id) ON DELETE RESTRICT ON UPDATE RESTRICT, FOREIGN KEY (workspace_identity, artifact_id, binding_reference_digest) REFERENCES attestation_binding_references(workspace_identity, artifact_id, binding_reference_digest) ON DELETE RESTRICT ON UPDATE RESTRICT, CHECK ((outcome = 'Successful' AND failure_code IS NULL AND result_digest IS NOT NULL) OR (outcome = 'Failed' AND failure_code IS NOT NULL AND result_digest IS NULL))
+);
+CREATE INDEX idx_attestation_artifacts_workspace_preview_revision ON attestation_artifacts(workspace_identity, claims_preview_id, claims_revision);
+CREATE INDEX idx_attestation_artifacts_workspace_digest ON attestation_artifacts(workspace_identity, artifact_digest);
+CREATE INDEX idx_attestation_references_workspace_binding ON attestation_binding_references(workspace_identity, binding_id);
+CREATE INDEX idx_attestation_events_workspace_artifact_sequence ON attestation_revalidation_events(workspace_identity, artifact_id, event_sequence);
+"""
+    artifact = artifact_for()
+    reference = reference_for(artifact)
+    event = event_for(artifact, reference)
+    with closing(sqlite3.connect(path)) as connection:
+        connection.executescript(ddl)
+        claims = artifact.claims_payload.to_payload()["claims"]
+        connection.execute("UPDATE store_meta SET schema_version = 4")
+        connection.execute("INSERT INTO attestation_artifacts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+            artifact.workspace_identity, artifact.artifact_id, artifact.artifact_contract_version, artifact.attestation_id,
+            sqlite_schema_json(artifact.claims_payload.to_payload()), artifact.detached_proof, artifact.claims_digest, artifact.artifact_digest,
+            artifact.original_verified_at, artifact.created_at, claims["attestation_version"], claims["issuer_id"], claims["key_id"], claims["signature_algorithm"],
+            claims["credential_class"], claims["credential_instance_id"], claims["github_subject_identity"], claims["repository_identity"],
+            sqlite_schema_json(claims["granted_capabilities"]), claims["driver_identity"], claims["remote_authority"], claims["preview_id"], claims["revision"],
+            claims["operation_set_digest"], claims["remote_snapshot_digest"], claims["evidence_digest"], claims["issued_at"], claims["expires_at"], claims["nonce"],
+            claims["source_verification_digest"], sqlite_schema_json(artifact.to_payload()),
+        ))
+        reference_payload = reference.to_payload()
+        connection.execute("INSERT INTO attestation_binding_references VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", tuple(reference_payload[key] for key in (
+            "workspace_identity", "reference_id", "artifact_id", "artifact_digest", "binding_id", "repository_identity", "github_subject_identity", "driver_identity", "remote_authority", "preview_id", "revision", "plan_digest", "sealed_preview_digest", "operation_set_digest", "remote_snapshot_digest", "audit_id", "audit_digest", "evidence_id", "evidence_digest", "original_verified_at", "reference_contract_version", "binding_reference_digest")) + (sqlite_schema_json(reference_payload),))
+        connection.commit()
+    return artifact, reference
+
+
 def _quote_v4_identifiers(ddl: str) -> str:
     names = set(sqlite_schema._V4_TABLES)
     names.update(
@@ -156,7 +229,7 @@ class SQLiteAttestationPersistenceStoreTests(unittest.TestCase):
     def test_fresh_v4_and_reopen(self) -> None:
         with closing(sqlite3.connect(self.path)) as connection:
             self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 0)
-            self.assertEqual(connection.execute("SELECT schema_version, workspace_identity FROM store_meta").fetchone(), (4, "workspace-1"))
+            self.assertEqual(connection.execute("SELECT schema_version, workspace_identity FROM store_meta").fetchone(), (5, "workspace-1"))
         aggregate = self.store.persist_artifact(self.artifact, self.reference)
         self.assertEqual(aggregate.artifact.artifact_id, self.artifact.artifact_id)
         self.store.close()
@@ -168,6 +241,121 @@ class SQLiteAttestationPersistenceStoreTests(unittest.TestCase):
             )
         finally:
             reopened.close()
+
+    def test_v2_round_trip_and_typed_projection_mismatch_fail_closed(self) -> None:
+        with self.assertRaisesRegex(ValueError, "^challenge_digest_invalid$"):
+            make_claims(attestation_version="2", challenge_digest="")
+        with self.assertRaisesRegex(ValueError, "^credential_principal_identity_invalid$"):
+            make_claims(attestation_version="2", challenge_digest="sha256:" + "f" * 64, credential_principal_identity="")
+        artifact, reference = _v2_aggregate_fixture()
+        aggregate = self.store.persist_artifact(artifact, reference)
+        self.assertEqual(aggregate.artifact.claims_payload.attestation_version, "2")
+        self.assertEqual(aggregate.artifact.claims_payload.challenge_digest, "sha256:" + "f" * 64)
+        self.assertEqual(aggregate.binding_reference.credential_principal_identity, "app-installation-1")
+        self.store.close()
+        reopened = SQLiteAttestationPersistenceStore(self.path, workspace_identity="workspace-1")
+        self.store = reopened
+        loaded = reopened.get_artifact_aggregate("workspace-1", artifact.artifact_id)
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        expected_claims = {
+            "attestation_version": "2", "issuer_id": "issuer-1", "key_id": "key-1",
+            "signature_algorithm": "ed25519", "credential_class": "github-app-installation-token",
+            "credential_instance_id": "credential-instance-1", "github_subject_identity": "subject-node-1",
+            "repository_identity": "owner/repository", "granted_capabilities": ["issues:read", "issues:write"],
+            "driver_identity": "github-rest-driver-v1", "remote_authority": "sha256:" + "a" * 64,
+            "preview_id": "preview-1", "revision": 1, "operation_set_digest": "sha256:" + "b" * 64,
+            "remote_snapshot_digest": "sha256:" + "c" * 64, "evidence_digest": "sha256:" + "d" * 64,
+            "issued_at": "2026-08-14T11:00:00Z", "expires_at": "2026-08-14T13:00:00Z",
+            "nonce": "nonce-1", "source_verification_digest": "sha256:" + "e" * 64,
+            "challenge_digest": "sha256:" + "f" * 64, "credential_principal_identity": "app-installation-1",
+        }
+        self.assertEqual({key: loaded.artifact.claims_payload.to_payload()["claims"][key] for key in expected_claims}, expected_claims)
+        expected_identity_claims = dict(expected_claims)
+        expected_claims_digest = "sha256:" + hashlib.sha256(canonical_payload({
+            "domain": "delivery-system:credential-capability-attestation:v2",
+            "claims": expected_identity_claims,
+        }).encode("utf-8")).hexdigest()
+        expected_attestation_id = "attestation-" + hashlib.sha256(canonical_payload({
+            "domain": "delivery-system:credential-capability-attestation:v2",
+            "claims": expected_identity_claims,
+        }).encode("utf-8")).hexdigest()
+        self.assertEqual(loaded.artifact.claims_digest, expected_claims_digest)
+        self.assertEqual(loaded.artifact.claims_payload.attestation_id, expected_attestation_id)
+        self.assertEqual(loaded.artifact.claims_payload.to_payload(), artifact.claims_payload.to_payload())
+        self.assertEqual(loaded.artifact.artifact_digest, artifact.artifact_digest)
+        self.assertEqual(loaded.binding_reference.reference_id, reference.reference_id)
+        self.assertEqual(loaded.binding_reference.binding_reference_digest, reference.binding_reference_digest)
+        self.assertEqual(loaded.artifact.claims_payload.claims_digest(), artifact.claims_payload.claims_digest())
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute("UPDATE attestation_artifacts SET claims_challenge_digest = ?", ("sha256:" + "0" * 64,))
+            connection.commit()
+        with self.assertRaises(StoreContractError) as raised:
+            reopened.get_artifact_aggregate("workspace-1", artifact.artifact_id)
+        self.assertEqual(raised.exception.code, "attestation_artifact_aggregate_corrupt")
+
+    def test_v2_typed_projection_corruption_matrix_fails_closed(self) -> None:
+        columns = {
+            "claims_challenge_digest": "'sha256:" + "0" * 64 + "'",
+            "claims_credential_principal_identity": "'principal-other'",
+            "claims_repository_identity": "'other/repository'",
+            "claims_github_subject_identity": "'subject-other'",
+            "claims_driver_identity": "'driver-other'",
+            "claims_remote_authority": "'sha256:" + "0" * 64 + "'",
+            "claims_granted_capabilities_json": "'[\"issues:read\"]'",
+        }
+        for column, value in columns.items():
+            with self.subTest(column=column), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "projection.sqlite3"
+                store = SQLiteAttestationPersistenceStore(path, workspace_identity="workspace-1")
+                artifact, reference = _v2_aggregate_fixture()
+                store.persist_artifact(artifact, reference)
+                store.close()
+                with closing(sqlite3.connect(path)) as connection:
+                    connection.execute(f"UPDATE attestation_artifacts SET {column} = {value}")
+                    connection.commit()
+                reopened = SQLiteAttestationPersistenceStore(path, workspace_identity="workspace-1")
+                try:
+                    with self.assertRaises(StoreContractError) as raised:
+                        reopened.get_artifact_aggregate("workspace-1", artifact.artifact_id)
+                    self.assertEqual(raised.exception.code, "attestation_artifact_aggregate_corrupt")
+                finally:
+                    reopened.close()
+
+    def test_real_v4_fixture_migrates_to_canonical_v5_and_preserves_row(self) -> None:
+        self.store.close()
+        legacy_path = Path(self.directory.name) / "legacy-v4.sqlite3"
+        artifact, reference = _create_real_v4_fixture(legacy_path)
+        migrated = SQLiteAttestationPersistenceStore(legacy_path, workspace_identity="workspace-1")
+        self.store = migrated
+        loaded = migrated.get_artifact_aggregate("workspace-1", artifact.artifact_id)
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        self.assertEqual(loaded.artifact.claims_payload.to_payload(), artifact.claims_payload.to_payload())
+        self.assertEqual(loaded.artifact.claims_digest, artifact.claims_digest)
+        self.assertEqual(loaded.binding_reference.to_payload(), reference.to_payload())
+        with closing(sqlite3.connect(legacy_path)) as connection:
+            self.assertEqual(connection.execute("SELECT schema_version FROM store_meta").fetchone()[0], 5)
+            self.assertTrue(sqlite_schema._v4_fingerprint(connection))
+
+    def test_real_v4_migration_failure_rolls_back_without_partial_rebuild(self) -> None:
+        self.store.close()
+        legacy_path = Path(self.directory.name) / "legacy-v4-rollback.sqlite3"
+        artifact, _reference = _create_real_v4_fixture(legacy_path)
+        def fail_after_rebuild(_connection):
+            raise sqlite_schema.SchemaOwnerError("attestation_persistence_migration_failed")
+
+        with patch.object(sqlite_schema, "_v4_fingerprint", side_effect=fail_after_rebuild):
+            with self.assertRaises(StoreContractError) as raised:
+                SQLiteAttestationPersistenceStore(legacy_path, workspace_identity="workspace-1")
+        self.assertEqual(raised.exception.code, "attestation_persistence_migration_failed")
+        with closing(sqlite3.connect(legacy_path)) as connection:
+            self.assertEqual(connection.execute("SELECT schema_version FROM store_meta").fetchone()[0], 4)
+            self.assertEqual(len(sqlite_schema._table_xinfo(connection, "attestation_artifacts")), 31)
+            self.assertIsNotNone(connection.execute("SELECT artifact_id FROM attestation_artifacts WHERE artifact_id = ?", (artifact.artifact_id,)).fetchone())
+            self.assertIsNone(connection.execute("SELECT name FROM sqlite_master WHERE name LIKE '%_v4'").fetchone())
+            self.assertNotIn("claims_challenge_digest", {row[1] for row in connection.execute("PRAGMA table_info(attestation_artifacts)")})
+            self.assertIsNotNone(connection.execute("SELECT name FROM sqlite_master WHERE name = 'idx_attestation_artifacts_workspace_digest'").fetchone())
 
     def test_aggregate_and_event_round_trip_replay_and_sequence(self) -> None:
         self.store.persist_artifact(self.artifact, self.reference)
@@ -353,7 +541,7 @@ class SQLiteAttestationPersistenceStoreTests(unittest.TestCase):
             store = SQLiteAttestationPersistenceStore(path, workspace_identity="workspace-1")
             store.close()
             with closing(sqlite3.connect(path)) as connection:
-                self.assertEqual(connection.execute("SELECT schema_version FROM store_meta").fetchone()[0], 4)
+                self.assertEqual(connection.execute("SELECT schema_version FROM store_meta").fetchone()[0], 5)
 
     def test_quoted_column_v3_is_accepted_and_migrated(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -362,7 +550,7 @@ class SQLiteAttestationPersistenceStoreTests(unittest.TestCase):
             store = SQLiteAttestationPersistenceStore(path, workspace_identity="workspace-1")
             store.close()
             with closing(sqlite3.connect(path)) as connection:
-                self.assertEqual(connection.execute("SELECT schema_version FROM store_meta").fetchone()[0], 4)
+                self.assertEqual(connection.execute("SELECT schema_version FROM store_meta").fetchone()[0], 5)
 
     def test_v3_whitespace_and_keyword_case_are_accepted(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -869,7 +1057,7 @@ class SQLiteAttestationPersistenceStoreTests(unittest.TestCase):
             self.assertFalse(any(thread.is_alive() for thread in threads))
             self.assertEqual(sorted(results), ["opened", "opened"])
             with closing(sqlite3.connect(path)) as connection:
-                self.assertEqual(connection.execute("SELECT schema_version FROM store_meta").fetchone()[0], 4)
+                self.assertEqual(connection.execute("SELECT schema_version FROM store_meta").fetchone()[0], 5)
 
     def test_typed_event_and_sequence_corruption_fail_closed(self) -> None:
         self.store.persist_artifact(self.artifact, self.reference)

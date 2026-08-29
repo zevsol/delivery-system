@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 _V3_TABLES = ("store_meta", "item_lineage", "records", "audit_history")
 _V4_TABLES = _V3_TABLES + (
     "attestation_artifacts",
@@ -423,10 +423,10 @@ def _v3_fingerprint(connection: sqlite3.Connection) -> bool:
 
 _V4_DDL = r"""
 CREATE TABLE attestation_artifacts (
-    workspace_identity TEXT NOT NULL CHECK (length(workspace_identity) > 0), artifact_id TEXT NOT NULL CHECK (length(artifact_id) > 0), artifact_contract_version TEXT NOT NULL CHECK (artifact_contract_version = 'offline-attestation-artifact-v1'), attestation_id TEXT NOT NULL CHECK (length(attestation_id) > 0), claims_payload_json TEXT NOT NULL CHECK (length(claims_payload_json) > 0), detached_proof TEXT NOT NULL CHECK (length(detached_proof) > 0), claims_digest TEXT NOT NULL CHECK (length(claims_digest) = 71 AND substr(claims_digest, 1, 7) = 'sha256:' AND substr(claims_digest, 8) NOT GLOB '*[^0-9a-f]*'), artifact_digest TEXT NOT NULL CHECK (length(artifact_digest) = 71 AND substr(artifact_digest, 1, 7) = 'sha256:' AND substr(artifact_digest, 8) NOT GLOB '*[^0-9a-f]*'), original_verified_at TEXT NOT NULL CHECK (length(original_verified_at) > 0), created_at TEXT NOT NULL CHECK (length(created_at) > 0), claims_attestation_version TEXT NOT NULL CHECK (claims_attestation_version = '1'), claims_issuer_id TEXT NOT NULL CHECK (length(claims_issuer_id) > 0), claims_key_id TEXT NOT NULL CHECK (length(claims_key_id) > 0), claims_signature_algorithm TEXT NOT NULL CHECK (length(claims_signature_algorithm) > 0), claims_credential_class TEXT NOT NULL CHECK (length(claims_credential_class) > 0), claims_credential_instance_id TEXT NOT NULL CHECK (length(claims_credential_instance_id) > 0), claims_github_subject_identity TEXT NOT NULL CHECK (length(claims_github_subject_identity) > 0), claims_repository_identity TEXT NOT NULL CHECK (length(claims_repository_identity) > 0), claims_granted_capabilities_json TEXT NOT NULL CHECK (length(claims_granted_capabilities_json) > 0), claims_driver_identity TEXT NOT NULL CHECK (length(claims_driver_identity) > 0), claims_remote_authority TEXT NOT NULL CHECK (length(claims_remote_authority) = 71 AND substr(claims_remote_authority, 1, 7) = 'sha256:' AND substr(claims_remote_authority, 8) NOT GLOB '*[^0-9a-f]*'), claims_preview_id TEXT NOT NULL CHECK (length(claims_preview_id) > 0), claims_revision INTEGER NOT NULL CHECK (claims_revision > 0), claims_operation_set_digest TEXT NOT NULL CHECK (length(claims_operation_set_digest) = 71 AND substr(claims_operation_set_digest, 1, 7) = 'sha256:' AND substr(claims_operation_set_digest, 8) NOT GLOB '*[^0-9a-f]*'), claims_remote_snapshot_digest TEXT NOT NULL CHECK (length(claims_remote_snapshot_digest) = 71 AND substr(claims_remote_snapshot_digest, 1, 7) = 'sha256:' AND substr(claims_remote_snapshot_digest, 8) NOT GLOB '*[^0-9a-f]*'), claims_evidence_digest TEXT NOT NULL CHECK (length(claims_evidence_digest) = 71 AND substr(claims_evidence_digest, 1, 7) = 'sha256:' AND substr(claims_evidence_digest, 8) NOT GLOB '*[^0-9a-f]*'), claims_issued_at TEXT NOT NULL CHECK (length(claims_issued_at) > 0), claims_expires_at TEXT NOT NULL CHECK (length(claims_expires_at) > 0), claims_nonce TEXT NOT NULL CHECK (length(claims_nonce) > 0), claims_source_verification_digest TEXT NOT NULL CHECK (length(claims_source_verification_digest) = 71 AND substr(claims_source_verification_digest, 1, 7) = 'sha256:' AND substr(claims_source_verification_digest, 8) NOT GLOB '*[^0-9a-f]*'), canonical_json TEXT NOT NULL CHECK (length(canonical_json) > 0), PRIMARY KEY (workspace_identity, artifact_id), UNIQUE (workspace_identity, attestation_id)
+    workspace_identity TEXT NOT NULL CHECK (length(workspace_identity) > 0), artifact_id TEXT NOT NULL CHECK (length(artifact_id) > 0), artifact_contract_version TEXT NOT NULL CHECK (artifact_contract_version = 'offline-attestation-artifact-v1'), attestation_id TEXT NOT NULL CHECK (length(attestation_id) > 0), claims_payload_json TEXT NOT NULL CHECK (length(claims_payload_json) > 0), detached_proof TEXT NOT NULL CHECK (length(detached_proof) > 0), claims_digest TEXT NOT NULL CHECK (length(claims_digest) = 71 AND substr(claims_digest, 1, 7) = 'sha256:' AND substr(claims_digest, 8) NOT GLOB '*[^0-9a-f]*'), artifact_digest TEXT NOT NULL CHECK (length(artifact_digest) = 71 AND substr(artifact_digest, 1, 7) = 'sha256:' AND substr(artifact_digest, 8) NOT GLOB '*[^0-9a-f]*'), original_verified_at TEXT NOT NULL CHECK (length(original_verified_at) > 0), created_at TEXT NOT NULL CHECK (length(created_at) > 0), claims_attestation_version TEXT NOT NULL CHECK (claims_attestation_version IN ('1', '2')), claims_issuer_id TEXT NOT NULL CHECK (length(claims_issuer_id) > 0), claims_key_id TEXT NOT NULL CHECK (length(claims_key_id) > 0), claims_signature_algorithm TEXT NOT NULL CHECK (length(claims_signature_algorithm) > 0), claims_credential_class TEXT NOT NULL CHECK (length(claims_credential_class) > 0), claims_credential_instance_id TEXT NOT NULL CHECK (length(claims_credential_instance_id) > 0), claims_github_subject_identity TEXT NOT NULL CHECK (length(claims_github_subject_identity) > 0), claims_repository_identity TEXT NOT NULL CHECK (length(claims_repository_identity) > 0), claims_granted_capabilities_json TEXT NOT NULL CHECK (length(claims_granted_capabilities_json) > 0), claims_driver_identity TEXT NOT NULL CHECK (length(claims_driver_identity) > 0), claims_remote_authority TEXT NOT NULL CHECK (length(claims_remote_authority) = 71 AND substr(claims_remote_authority, 1, 7) = 'sha256:' AND substr(claims_remote_authority, 8) NOT GLOB '*[^0-9a-f]*'), claims_preview_id TEXT NOT NULL CHECK (length(claims_preview_id) > 0), claims_revision INTEGER NOT NULL CHECK (claims_revision > 0), claims_operation_set_digest TEXT NOT NULL CHECK (length(claims_operation_set_digest) = 71 AND substr(claims_operation_set_digest, 1, 7) = 'sha256:' AND substr(claims_operation_set_digest, 8) NOT GLOB '*[^0-9a-f]*'), claims_remote_snapshot_digest TEXT NOT NULL CHECK (length(claims_remote_snapshot_digest) = 71 AND substr(claims_remote_snapshot_digest, 1, 7) = 'sha256:' AND substr(claims_remote_snapshot_digest, 8) NOT GLOB '*[^0-9a-f]*'), claims_evidence_digest TEXT NOT NULL CHECK (length(claims_evidence_digest) = 71 AND substr(claims_evidence_digest, 1, 7) = 'sha256:' AND substr(claims_evidence_digest, 8) NOT GLOB '*[^0-9a-f]*'), claims_issued_at TEXT NOT NULL CHECK (length(claims_issued_at) > 0), claims_expires_at TEXT NOT NULL CHECK (length(claims_expires_at) > 0), claims_nonce TEXT NOT NULL CHECK (length(claims_nonce) > 0), claims_source_verification_digest TEXT NOT NULL CHECK (length(claims_source_verification_digest) = 71 AND substr(claims_source_verification_digest, 1, 7) = 'sha256:' AND substr(claims_source_verification_digest, 8) NOT GLOB '*[^0-9a-f]*'), claims_challenge_digest TEXT, claims_credential_principal_identity TEXT, canonical_json TEXT NOT NULL CHECK (length(canonical_json) > 0), CHECK ((claims_attestation_version = '1' AND claims_challenge_digest IS NULL AND claims_credential_principal_identity IS NULL) OR (claims_attestation_version = '2' AND claims_challenge_digest IS NOT NULL AND claims_credential_principal_identity IS NOT NULL)), PRIMARY KEY (workspace_identity, artifact_id), UNIQUE (workspace_identity, attestation_id)
 );
 CREATE TABLE attestation_binding_references (
-    workspace_identity TEXT NOT NULL CHECK (length(workspace_identity) > 0), reference_id TEXT NOT NULL CHECK (length(reference_id) > 0), artifact_id TEXT NOT NULL CHECK (length(artifact_id) > 0), artifact_digest TEXT NOT NULL CHECK (length(artifact_digest) = 71 AND substr(artifact_digest, 1, 7) = 'sha256:' AND substr(artifact_digest, 8) NOT GLOB '*[^0-9a-f]*'), binding_id TEXT NOT NULL CHECK (length(binding_id) > 0), repository_identity TEXT NOT NULL CHECK (length(repository_identity) > 0), github_subject_identity TEXT NOT NULL CHECK (length(github_subject_identity) > 0), driver_identity TEXT NOT NULL CHECK (length(driver_identity) > 0), remote_authority TEXT NOT NULL CHECK (length(remote_authority) = 71 AND substr(remote_authority, 1, 7) = 'sha256:' AND substr(remote_authority, 8) NOT GLOB '*[^0-9a-f]*'), preview_id TEXT NOT NULL CHECK (length(preview_id) > 0), revision INTEGER NOT NULL CHECK (revision > 0), plan_digest TEXT NOT NULL CHECK (length(plan_digest) = 71 AND substr(plan_digest, 1, 7) = 'sha256:' AND substr(plan_digest, 8) NOT GLOB '*[^0-9a-f]*'), sealed_preview_digest TEXT NOT NULL CHECK (length(sealed_preview_digest) = 71 AND substr(sealed_preview_digest, 1, 7) = 'sha256:' AND substr(sealed_preview_digest, 8) NOT GLOB '*[^0-9a-f]*'), operation_set_digest TEXT NOT NULL CHECK (length(operation_set_digest) = 71 AND substr(operation_set_digest, 1, 7) = 'sha256:' AND substr(operation_set_digest, 8) NOT GLOB '*[^0-9a-f]*'), remote_snapshot_digest TEXT NOT NULL CHECK (length(remote_snapshot_digest) = 71 AND substr(remote_snapshot_digest, 1, 7) = 'sha256:' AND substr(remote_snapshot_digest, 8) NOT GLOB '*[^0-9a-f]*'), audit_id TEXT NOT NULL CHECK (length(audit_id) > 0), audit_digest TEXT NOT NULL CHECK (length(audit_digest) = 71 AND substr(audit_digest, 1, 7) = 'sha256:' AND substr(audit_digest, 8) NOT GLOB '*[^0-9a-f]*'), evidence_id TEXT NOT NULL CHECK (length(evidence_id) > 0), evidence_digest TEXT NOT NULL CHECK (length(evidence_digest) = 71 AND substr(evidence_digest, 1, 7) = 'sha256:' AND substr(evidence_digest, 8) NOT GLOB '*[^0-9a-f]*'), original_verified_at TEXT NOT NULL CHECK (length(original_verified_at) > 0), reference_contract_version TEXT NOT NULL CHECK (reference_contract_version = 'attestation-binding-reference-v1'), binding_reference_digest TEXT NOT NULL CHECK (length(binding_reference_digest) = 71 AND substr(binding_reference_digest, 1, 7) = 'sha256:' AND substr(binding_reference_digest, 8) NOT GLOB '*[^0-9a-f]*'), canonical_json TEXT NOT NULL CHECK (length(canonical_json) > 0), PRIMARY KEY (workspace_identity, artifact_id), UNIQUE (workspace_identity, reference_id), UNIQUE (workspace_identity, binding_id), UNIQUE (workspace_identity, artifact_id, binding_reference_digest), FOREIGN KEY (workspace_identity, artifact_id) REFERENCES attestation_artifacts(workspace_identity, artifact_id) ON DELETE RESTRICT ON UPDATE RESTRICT
+    workspace_identity TEXT NOT NULL CHECK (length(workspace_identity) > 0), reference_id TEXT NOT NULL CHECK (length(reference_id) > 0), artifact_id TEXT NOT NULL CHECK (length(artifact_id) > 0), artifact_digest TEXT NOT NULL CHECK (length(artifact_digest) = 71 AND substr(artifact_digest, 1, 7) = 'sha256:' AND substr(artifact_digest, 8) NOT GLOB '*[^0-9a-f]*'), binding_id TEXT NOT NULL CHECK (length(binding_id) > 0), repository_identity TEXT NOT NULL CHECK (length(repository_identity) > 0), github_subject_identity TEXT NOT NULL CHECK (length(github_subject_identity) > 0), driver_identity TEXT NOT NULL CHECK (length(driver_identity) > 0), remote_authority TEXT NOT NULL CHECK (length(remote_authority) = 71 AND substr(remote_authority, 1, 7) = 'sha256:' AND substr(remote_authority, 8) NOT GLOB '*[^0-9a-f]*'), preview_id TEXT NOT NULL CHECK (length(preview_id) > 0), revision INTEGER NOT NULL CHECK (revision > 0), plan_digest TEXT NOT NULL CHECK (length(plan_digest) = 71 AND substr(plan_digest, 1, 7) = 'sha256:' AND substr(plan_digest, 8) NOT GLOB '*[^0-9a-f]*'), sealed_preview_digest TEXT NOT NULL CHECK (length(sealed_preview_digest) = 71 AND substr(sealed_preview_digest, 1, 7) = 'sha256:' AND substr(sealed_preview_digest, 8) NOT GLOB '*[^0-9a-f]*'), operation_set_digest TEXT NOT NULL CHECK (length(operation_set_digest) = 71 AND substr(operation_set_digest, 1, 7) = 'sha256:' AND substr(operation_set_digest, 8) NOT GLOB '*[^0-9a-f]*'), remote_snapshot_digest TEXT NOT NULL CHECK (length(remote_snapshot_digest) = 71 AND substr(remote_snapshot_digest, 1, 7) = 'sha256:' AND substr(remote_snapshot_digest, 8) NOT GLOB '*[^0-9a-f]*'), audit_id TEXT NOT NULL CHECK (length(audit_id) > 0), audit_digest TEXT NOT NULL CHECK (length(audit_digest) = 71 AND substr(audit_digest, 1, 7) = 'sha256:' AND substr(audit_digest, 8) NOT GLOB '*[^0-9a-f]*'), evidence_id TEXT NOT NULL CHECK (length(evidence_id) > 0), evidence_digest TEXT NOT NULL CHECK (length(evidence_digest) = 71 AND substr(evidence_digest, 1, 7) = 'sha256:' AND substr(evidence_digest, 8) NOT GLOB '*[^0-9a-f]*'), original_verified_at TEXT NOT NULL CHECK (length(original_verified_at) > 0), reference_contract_version TEXT NOT NULL CHECK (reference_contract_version IN ('attestation-binding-reference-v1', 'attestation-binding-reference-v2')), binding_reference_digest TEXT NOT NULL CHECK (length(binding_reference_digest) = 71 AND substr(binding_reference_digest, 1, 7) = 'sha256:' AND substr(binding_reference_digest, 8) NOT GLOB '*[^0-9a-f]*'), credential_principal_identity TEXT, challenge_digest TEXT, canonical_json TEXT NOT NULL CHECK (length(canonical_json) > 0), CHECK ((reference_contract_version = 'attestation-binding-reference-v1' AND credential_principal_identity IS NULL AND challenge_digest IS NULL) OR (reference_contract_version = 'attestation-binding-reference-v2' AND credential_principal_identity IS NOT NULL AND challenge_digest IS NOT NULL)), PRIMARY KEY (workspace_identity, artifact_id), UNIQUE (workspace_identity, reference_id), UNIQUE (workspace_identity, binding_id), UNIQUE (workspace_identity, artifact_id, binding_reference_digest), FOREIGN KEY (workspace_identity, artifact_id) REFERENCES attestation_artifacts(workspace_identity, artifact_id) ON DELETE RESTRICT ON UPDATE RESTRICT
 );
 CREATE TABLE attestation_revalidation_events (
     workspace_identity TEXT NOT NULL CHECK (length(workspace_identity) > 0), event_id TEXT NOT NULL CHECK (length(event_id) > 0), event_identity_version TEXT NOT NULL CHECK (event_identity_version = '1'), event_payload_version TEXT NOT NULL CHECK (event_payload_version = '1'), artifact_id TEXT NOT NULL CHECK (length(artifact_id) > 0), artifact_digest TEXT NOT NULL CHECK (length(artifact_digest) = 71 AND substr(artifact_digest, 1, 7) = 'sha256:' AND substr(artifact_digest, 8) NOT GLOB '*[^0-9a-f]*'), revalidation_attempt_id TEXT NOT NULL CHECK (length(revalidation_attempt_id) > 0), revalidation_context_digest TEXT NOT NULL CHECK (length(revalidation_context_digest) = 71 AND substr(revalidation_context_digest, 1, 7) = 'sha256:' AND substr(revalidation_context_digest, 8) NOT GLOB '*[^0-9a-f]*'), binding_reference_digest TEXT NOT NULL CHECK (length(binding_reference_digest) = 71 AND substr(binding_reference_digest, 1, 7) = 'sha256:' AND substr(binding_reference_digest, 8) NOT GLOB '*[^0-9a-f]*'), outcome TEXT NOT NULL CHECK (outcome IN ('Successful', 'Failed')), revalidated_at TEXT NOT NULL CHECK (length(revalidated_at) > 0), failure_code TEXT CHECK (failure_code IS NULL OR length(failure_code) > 0), result_digest TEXT CHECK (result_digest IS NULL OR (length(result_digest) = 71 AND substr(result_digest, 1, 7) = 'sha256:' AND substr(result_digest, 8) NOT GLOB '*[^0-9a-f]*')), event_payload_digest TEXT NOT NULL CHECK (length(event_payload_digest) = 71 AND substr(event_payload_digest, 1, 7) = 'sha256:' AND substr(event_payload_digest, 8) NOT GLOB '*[^0-9a-f]*'), event_sequence INTEGER NOT NULL CHECK (event_sequence > 0), canonical_json TEXT NOT NULL CHECK (length(canonical_json) > 0), PRIMARY KEY (workspace_identity, event_id), UNIQUE (workspace_identity, artifact_id, event_sequence), FOREIGN KEY (workspace_identity, artifact_id) REFERENCES attestation_artifacts(workspace_identity, artifact_id) ON DELETE RESTRICT ON UPDATE RESTRICT, FOREIGN KEY (workspace_identity, artifact_id, binding_reference_digest) REFERENCES attestation_binding_references(workspace_identity, artifact_id, binding_reference_digest) ON DELETE RESTRICT ON UPDATE RESTRICT, CHECK ((outcome = 'Successful' AND failure_code IS NULL AND result_digest IS NOT NULL) OR (outcome = 'Failed' AND failure_code IS NOT NULL AND result_digest IS NULL))
@@ -439,9 +439,9 @@ CREATE INDEX idx_attestation_events_workspace_artifact_sequence ON attestation_r
 
 _V4_LAYOUT = {
     "attestation_artifacts": [(name, "INTEGER" if name == "claims_revision" else "TEXT", 1, pk) for name, pk in (
-        ("workspace_identity", 1), ("artifact_id", 2), ("artifact_contract_version", 0), ("attestation_id", 0), ("claims_payload_json", 0), ("detached_proof", 0), ("claims_digest", 0), ("artifact_digest", 0), ("original_verified_at", 0), ("created_at", 0), ("claims_attestation_version", 0), ("claims_issuer_id", 0), ("claims_key_id", 0), ("claims_signature_algorithm", 0), ("claims_credential_class", 0), ("claims_credential_instance_id", 0), ("claims_github_subject_identity", 0), ("claims_repository_identity", 0), ("claims_granted_capabilities_json", 0), ("claims_driver_identity", 0), ("claims_remote_authority", 0), ("claims_preview_id", 0), ("claims_revision", 0), ("claims_operation_set_digest", 0), ("claims_remote_snapshot_digest", 0), ("claims_evidence_digest", 0), ("claims_issued_at", 0), ("claims_expires_at", 0), ("claims_nonce", 0), ("claims_source_verification_digest", 0), ("canonical_json", 0))],
+        ("workspace_identity", 1), ("artifact_id", 2), ("artifact_contract_version", 0), ("attestation_id", 0), ("claims_payload_json", 0), ("detached_proof", 0), ("claims_digest", 0), ("artifact_digest", 0), ("original_verified_at", 0), ("created_at", 0), ("claims_attestation_version", 0), ("claims_issuer_id", 0), ("claims_key_id", 0), ("claims_signature_algorithm", 0), ("claims_credential_class", 0), ("claims_credential_instance_id", 0), ("claims_github_subject_identity", 0), ("claims_repository_identity", 0), ("claims_granted_capabilities_json", 0), ("claims_driver_identity", 0), ("claims_remote_authority", 0), ("claims_preview_id", 0), ("claims_revision", 0), ("claims_operation_set_digest", 0), ("claims_remote_snapshot_digest", 0), ("claims_evidence_digest", 0), ("claims_issued_at", 0), ("claims_expires_at", 0), ("claims_nonce", 0), ("claims_source_verification_digest", 0), ("claims_challenge_digest", 0), ("claims_credential_principal_identity", 0), ("canonical_json", 0))],
     "attestation_binding_references": [(name, "INTEGER" if name == "revision" else "TEXT", 1, pk) for name, pk in (
-        ("workspace_identity", 1), ("reference_id", 0), ("artifact_id", 2), ("artifact_digest", 0), ("binding_id", 0), ("repository_identity", 0), ("github_subject_identity", 0), ("driver_identity", 0), ("remote_authority", 0), ("preview_id", 0), ("revision", 0), ("plan_digest", 0), ("sealed_preview_digest", 0), ("operation_set_digest", 0), ("remote_snapshot_digest", 0), ("audit_id", 0), ("audit_digest", 0), ("evidence_id", 0), ("evidence_digest", 0), ("original_verified_at", 0), ("reference_contract_version", 0), ("binding_reference_digest", 0), ("canonical_json", 0))],
+        ("workspace_identity", 1), ("reference_id", 0), ("artifact_id", 2), ("artifact_digest", 0), ("binding_id", 0), ("repository_identity", 0), ("github_subject_identity", 0), ("driver_identity", 0), ("remote_authority", 0), ("preview_id", 0), ("revision", 0), ("plan_digest", 0), ("sealed_preview_digest", 0), ("operation_set_digest", 0), ("remote_snapshot_digest", 0), ("audit_id", 0), ("audit_digest", 0), ("evidence_id", 0), ("evidence_digest", 0), ("original_verified_at", 0), ("reference_contract_version", 0), ("binding_reference_digest", 0), ("credential_principal_identity", 0), ("challenge_digest", 0), ("canonical_json", 0))],
     "attestation_revalidation_events": [(name, "INTEGER" if name == "event_sequence" else "TEXT", 0 if name in {"failure_code", "result_digest"} else 1, pk) for name, pk in (
         ("workspace_identity", 1), ("event_id", 2), ("event_identity_version", 0), ("event_payload_version", 0), ("artifact_id", 0), ("artifact_digest", 0), ("revalidation_attempt_id", 0), ("revalidation_context_digest", 0), ("binding_reference_digest", 0), ("outcome", 0), ("revalidated_at", 0), ("failure_code", 0), ("result_digest", 0), ("event_payload_digest", 0), ("event_sequence", 0), ("canonical_json", 0))],
 }
@@ -470,7 +470,9 @@ def _v4_fingerprint(connection: sqlite3.Connection) -> bool:
             if table in _V3_COLUMNS:
                 match = (row[1], row[2].upper(), row[3], row[4], row[5]) == wanted
             else:
-                match = (row[1], row[2].upper(), row[3], row[4], row[5]) == (wanted[0], wanted[1].upper(), wanted[2], None, wanted[3])
+                expected_notnull = 0 if table == "attestation_artifacts" and wanted[0] in {"claims_challenge_digest", "claims_credential_principal_identity"} else wanted[2]
+                expected_notnull = 0 if table == "attestation_binding_references" and wanted[0] in {"challenge_digest", "credential_principal_identity"} else expected_notnull
+                match = (row[1], row[2].upper(), row[3], row[4], row[5]) == (wanted[0], wanted[1].upper(), expected_notnull, None, wanted[3])
             match = match and row[6] == 0
             if not match:
                 return False
@@ -493,6 +495,98 @@ def _v4_fingerprint(connection: sqlite3.Connection) -> bool:
         ("attestation_binding_references", "RESTRICT", "RESTRICT", "NONE", (("workspace_identity", "workspace_identity"), ("artifact_id", "artifact_id"), ("binding_reference_digest", "binding_reference_digest"))),
     )
     return binding_fks == expected_binding and event_fks == expected_event
+
+
+def _legacy_v4_fingerprint(connection: sqlite3.Connection) -> bool:
+    """Recognize the committed Version 4 layout before the V2 projection columns."""
+    try:
+        version = _safe_sql(connection, "SELECT schema_version FROM store_meta")
+        if len(version) != 1 or version[0][0] != 4:
+            return False
+        objects = _objects(connection)
+        expected_objects = {("table", name) for name in _V4_TABLES} | {
+            ("index", name) for name in {
+                "idx_attestation_artifacts_workspace_preview_revision",
+                "idx_attestation_artifacts_workspace_digest",
+                "idx_attestation_references_workspace_binding",
+                "idx_attestation_events_workspace_artifact_sequence",
+            }
+        }
+        if {(kind, name) for kind, name, _table, _sql in objects} != expected_objects:
+            return False
+        legacy_layout = {
+            table: tuple(
+                entry for entry in layout
+                if entry[0] not in {
+                    "claims_challenge_digest", "claims_credential_principal_identity",
+                    "credential_principal_identity", "challenge_digest",
+                }
+            )
+            for table, layout in _V4_LAYOUT.items()
+        }
+        for table in _V4_TABLES:
+            actual = _table_xinfo(connection, table)
+            expected = _V3_COLUMNS.get(table, legacy_layout.get(table, ()))
+            if len(actual) != len(expected):
+                return False
+            for row, wanted in zip(actual, expected):
+                if table in _V3_COLUMNS:
+                    match = (row[1], row[2].upper(), row[3], row[4], row[5]) == wanted
+                else:
+                    match = (row[1], row[2].upper(), row[3], row[4], row[5]) == (
+                        wanted[0], wanted[1].upper(), wanted[2], None, wanted[3]
+                    )
+                if not match or row[6] != 0:
+                    return False
+            explicit_names = {
+                "attestation_artifacts": ("idx_attestation_artifacts_workspace_preview_revision", "idx_attestation_artifacts_workspace_digest"),
+                "attestation_binding_references": ("idx_attestation_references_workspace_binding",),
+                "attestation_revalidation_events": ("idx_attestation_events_workspace_artifact_sequence",),
+            }.get(table, ())
+            if not _check_index_semantics(connection, table, explicit_names):
+                return False
+        binding_fks = _foreign_key_signature(connection, "attestation_binding_references")
+        event_fks = _foreign_key_signature(connection, "attestation_revalidation_events")
+        expected_binding = (("attestation_artifacts", "RESTRICT", "RESTRICT", "NONE", (("workspace_identity", "workspace_identity"), ("artifact_id", "artifact_id"))),)
+        expected_event = (
+            ("attestation_artifacts", "RESTRICT", "RESTRICT", "NONE", (("workspace_identity", "workspace_identity"), ("artifact_id", "artifact_id"))),
+            ("attestation_binding_references", "RESTRICT", "RESTRICT", "NONE", (("workspace_identity", "workspace_identity"), ("artifact_id", "artifact_id"), ("binding_reference_digest", "binding_reference_digest"))),
+        )
+        return binding_fks == expected_binding and event_fks == expected_event
+    except (IndexError, sqlite3.Error):
+        return False
+
+
+def _migrate_legacy_v4_projection(connection: sqlite3.Connection) -> None:
+    """Rebuild the two V4 projection tables against the canonical V5 DDL."""
+    indexes = (
+        "idx_attestation_artifacts_workspace_preview_revision",
+        "idx_attestation_artifacts_workspace_digest",
+        "idx_attestation_references_workspace_binding",
+        "idx_attestation_events_workspace_artifact_sequence",
+    )
+    for index in indexes:
+        connection.execute(f"DROP INDEX {index}")
+    connection.execute("ALTER TABLE attestation_artifacts RENAME TO attestation_artifacts_v4")
+    connection.execute("ALTER TABLE attestation_binding_references RENAME TO attestation_binding_references_v4")
+    connection.execute("ALTER TABLE attestation_revalidation_events RENAME TO attestation_revalidation_events_v4")
+    _execute_script(connection, _V4_DDL)
+    artifact_columns = _V4_LAYOUT["attestation_artifacts"]
+    reference_columns = _V4_LAYOUT["attestation_binding_references"]
+    connection.execute(
+        "INSERT INTO attestation_artifacts SELECT "
+        + ",".join(name for name, _type, _notnull, _pk in artifact_columns if name not in {"claims_challenge_digest", "claims_credential_principal_identity", "canonical_json"})
+        + ", NULL, NULL, canonical_json FROM attestation_artifacts_v4"
+    )
+    connection.execute(
+        "INSERT INTO attestation_binding_references SELECT "
+        + ",".join(name for name, _type, _notnull, _pk in reference_columns if name not in {"credential_principal_identity", "challenge_digest", "canonical_json"})
+        + ", NULL, NULL, canonical_json FROM attestation_binding_references_v4"
+    )
+    connection.execute("INSERT INTO attestation_revalidation_events SELECT * FROM attestation_revalidation_events_v4")
+    connection.execute("DROP TABLE attestation_revalidation_events_v4")
+    connection.execute("DROP TABLE attestation_binding_references_v4")
+    connection.execute("DROP TABLE attestation_artifacts_v4")
 
 
 def _metadata(connection: sqlite3.Connection) -> tuple[int, str]:
@@ -538,22 +632,28 @@ def _scan_v3_workspace(connection: sqlite3.Connection, expected: str) -> None:
 
 
 def ensure_schema_v4(connection: sqlite3.Connection, *, expected_workspace_identity: str) -> None:
-    """Classify, validate, and atomically prepare the single Version 4 schema."""
+    """Classify, validate, and atomically prepare the Version 5 schema."""
     expected = _workspace(expected_workspace_identity)
     try:
         connection.execute("BEGIN IMMEDIATE")
+        if _safe_sql(connection, "PRAGMA user_version")[0][0] != 0 or _safe_sql(connection, "PRAGMA application_id")[0][0] != 0:
+            raise SchemaOwnerError("attestation_persistence_schema_shape_mismatch")
         if _classify_empty(connection):
             _create_v3(connection, expected)
             _execute_script(connection, _V4_DDL)
-            connection.execute("UPDATE store_meta SET schema_version = 4")
+            connection.execute("UPDATE store_meta SET schema_version = 5")
             if not _v4_fingerprint(connection):
                 raise SchemaOwnerError("attestation_persistence_schema_shape_mismatch")
             connection.commit()
             return
         objects = _objects(connection)
+        if {(kind, name) for kind, name, _table, _sql in objects} == {("table", "store_meta")}:
+            _metadata(connection)
+        if not any(name == "store_meta" for _, name, _, _ in objects):
+            raise SchemaOwnerError("attestation_persistence_schema_shape_mismatch")
         if _v3_fingerprint(connection):
             version, _ = _metadata(connection)
-            if version > 4:
+            if version > 5:
                 raise SchemaOwnerError("attestation_persistence_schema_version_unsupported")
             if version != 3:
                 raise SchemaOwnerError("attestation_persistence_schema_metadata_corrupt")
@@ -561,17 +661,29 @@ def ensure_schema_v4(connection: sqlite3.Connection, *, expected_workspace_ident
             _execute_script(connection, _V4_DDL)
             if not _v4_fingerprint(connection):
                 raise SchemaOwnerError("attestation_persistence_migration_failed")
-            connection.execute("UPDATE store_meta SET schema_version = 4")
+            connection.execute("UPDATE store_meta SET schema_version = 5")
+            connection.commit()
+            return
+        if _legacy_v4_fingerprint(connection):
+            version, workspace = _metadata(connection)
+            if workspace != expected:
+                raise SchemaOwnerError("attestation_persistence_workspace_mismatch")
+            _migrate_legacy_v4_projection(connection)
+            if not _v4_fingerprint(connection):
+                raise SchemaOwnerError("attestation_persistence_migration_failed")
+            connection.execute("UPDATE store_meta SET schema_version = 5")
             connection.commit()
             return
         if _v4_fingerprint(connection):
             version, workspace = _metadata(connection)
-            if version > 4:
+            if version > 5:
                 raise SchemaOwnerError("attestation_persistence_schema_version_unsupported")
-            if version != 4:
+            if version not in {4, 5}:
                 raise SchemaOwnerError("attestation_persistence_schema_metadata_corrupt")
             if workspace != expected:
                 raise SchemaOwnerError("attestation_persistence_workspace_mismatch")
+            if version == 4:
+                connection.execute("UPDATE store_meta SET schema_version = 5")
             connection.commit()
             return
         if any(name == "store_meta" for _, name, _, _ in objects):

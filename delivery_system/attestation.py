@@ -12,8 +12,10 @@ from datetime import datetime, timezone
 import base64
 import hashlib
 import re
+import secrets
+import time
 import threading
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence
 import unicodedata
 import weakref
 from types import MappingProxyType
@@ -22,6 +24,10 @@ from delivery_system.protocol import canonical_payload, digest
 
 
 ATTESTATION_DOMAIN = "delivery-system:credential-capability-attestation:v1"
+ATTESTATION_V2_DOMAIN = "delivery-system:credential-capability-attestation:v2"
+ATTESTATION_VERSION_V1 = "1"
+ATTESTATION_VERSION_V2 = "2"
+CHALLENGE_DOMAIN = "delivery-system:runtime-attestation-challenge:v1"
 SUPPORTED_SIGNATURE_ALGORITHMS = frozenset({"ed25519"})
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,127}$")
@@ -30,14 +36,17 @@ _PROOF_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 REVOCATION_CONTRACT_VERSION = "1"
 ED25519_PROOF_SIZE = 64
 ED25519_PROOF_TEXT_LENGTH = 86
-_CLAIMS_FIELDS = (
+_V1_CLAIMS_FIELDS = (
     "attestation_version", "attestation_id", "issuer_id", "key_id", "signature_algorithm",
     "credential_class", "credential_instance_id", "github_subject_identity", "repository_identity",
     "granted_capabilities", "driver_identity", "remote_authority", "preview_id", "revision",
     "operation_set_digest", "remote_snapshot_digest", "evidence_digest", "issued_at", "expires_at",
     "nonce", "source_verification_digest",
 )
+_V2_CLAIMS_FIELDS = _V1_CLAIMS_FIELDS + ("challenge_digest", "credential_principal_identity")
+_CLAIMS_FIELDS = _V1_CLAIMS_FIELDS
 _CLAIMS_KEYSET = frozenset(_CLAIMS_FIELDS)
+_V2_CLAIMS_KEYSET = frozenset(_V2_CLAIMS_FIELDS)
 
 class AttestationContractError(ValueError):
     """Safe, stable contract error used for local construction failures."""
@@ -239,12 +248,17 @@ def _mapping(value: Any, field: str, keys: set[str]) -> Mapping[str, Any]:
 
 def _claims_projection(value: Any) -> Mapping[str, Any]:
     if isinstance(value, Mapping):
-        mapping = _mapping(value, "claims", set(_CLAIMS_KEYSET))
-        return {field: mapping[field] for field in _CLAIMS_FIELDS}
+        if "attestation_version" not in value:
+            raise AttestationContractError("attestation_invalid")
+        version = value["attestation_version"]
+        fields = _V2_CLAIMS_FIELDS if version == ATTESTATION_VERSION_V2 else _V1_CLAIMS_FIELDS
+        mapping = _mapping(value, "claims", set(fields))
+        return {field: mapping[field] for field in fields}
     if not isinstance(value, CredentialCapabilityAttestationClaims):
         raise AttestationContractError("attestation_invalid")
     try:
-        return {field: getattr(value, field) for field in _CLAIMS_FIELDS}
+        fields = _V2_CLAIMS_FIELDS if value.attestation_version == ATTESTATION_VERSION_V2 else _V1_CLAIMS_FIELDS
+        return {field: getattr(value, field) for field in fields}
     except Exception as exc:
         raise AttestationContractError("attestation_invalid") from exc
 
@@ -298,7 +312,7 @@ class CredentialCapabilityRequest:
     __slots__ = (
         "repository_identity", "github_subject_identity", "required_capabilities", "driver_identity",
         "remote_authority", "preview_id", "revision", "operation_set_digest", "remote_snapshot_digest",
-        "evidence_digest", "__boundary_provenance", "__weakref__",
+        "evidence_digest", "challenge_digest", "__challenge_value", "__boundary_provenance", "__weakref__",
     )
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -330,6 +344,10 @@ class CredentialCapabilityRequest:
     def _belongs_to(self, provenance: object) -> bool:
         return self.__boundary_provenance is provenance
 
+    @property
+    def challenge_value(self) -> str:
+        return object.__getattribute__(self, "_CredentialCapabilityRequest__challenge_value")
+
 
 @dataclass(frozen=True)
 class CredentialCapabilityAttestationClaims:
@@ -354,6 +372,8 @@ class CredentialCapabilityAttestationClaims:
     expires_at: str
     nonce: str
     source_verification_digest: str
+    challenge_digest: str = ""
+    credential_principal_identity: str = ""
 
     def __post_init__(self) -> None:
         for field in ("attestation_version", "issuer_id", "key_id", "signature_algorithm", "credential_class", "credential_instance_id", "preview_id", "nonce"):
@@ -374,6 +394,13 @@ class CredentialCapabilityAttestationClaims:
         object.__setattr__(self, "expires_at", expires)
         for field in ("remote_authority", "operation_set_digest", "remote_snapshot_digest", "evidence_digest", "source_verification_digest"):
             object.__setattr__(self, field, _digest(getattr(self, field), field))
+        if self.attestation_version == ATTESTATION_VERSION_V2:
+            object.__setattr__(self, "challenge_digest", _digest(self.challenge_digest, "challenge_digest"))
+            object.__setattr__(self, "credential_principal_identity", _safe_text(self.credential_principal_identity, "credential_principal_identity"))
+        elif self.attestation_version != ATTESTATION_VERSION_V1:
+            raise AttestationContractError("attestation_version_unsupported")
+        elif self.challenge_digest or self.credential_principal_identity:
+            raise AttestationContractError("attestation_v1_extension_forbidden")
         expected_id = self.derived_attestation_id()
         if self.attestation_id == "":
             object.__setattr__(self, "attestation_id", expected_id)
@@ -381,7 +408,7 @@ class CredentialCapabilityAttestationClaims:
             raise AttestationContractError("attestation_id_mismatch")
 
     def _identity_payload(self) -> dict[str, Any]:
-        return {
+        payload = {
             "attestation_version": self.attestation_version,
             "issuer_id": self.issuer_id,
             "key_id": self.key_id,
@@ -403,16 +430,25 @@ class CredentialCapabilityAttestationClaims:
             "nonce": self.nonce,
             "source_verification_digest": self.source_verification_digest,
         }
+        if self.attestation_version == ATTESTATION_VERSION_V2:
+            payload.update({
+                "challenge_digest": self.challenge_digest,
+                "credential_principal_identity": self.credential_principal_identity,
+            })
+        return payload
+
+    def _domain(self) -> str:
+        return ATTESTATION_V2_DOMAIN if self.attestation_version == ATTESTATION_VERSION_V2 else ATTESTATION_DOMAIN
 
     def derived_attestation_id(self) -> str:
-        material = canonical_payload({"domain": ATTESTATION_DOMAIN, "claims": self._identity_payload()}).encode("utf-8")
+        material = canonical_payload({"domain": self._domain(), "claims": self._identity_payload()}).encode("utf-8")
         return "attestation-" + hashlib.sha256(material).hexdigest()
 
     def claims_digest(self) -> str:
-        return digest({"domain": ATTESTATION_DOMAIN, "claims": self._identity_payload()})
+        return digest({"domain": self._domain(), "claims": self._identity_payload()})
 
     def to_payload(self) -> dict[str, Any]:
-        return {"domain": ATTESTATION_DOMAIN, "claims": {**self._identity_payload(), "attestation_id": self.attestation_id}}
+        return {"domain": self._domain(), "claims": {**self._identity_payload(), "attestation_id": self.attestation_id}}
 
     @classmethod
     def from_mapping(cls, value: Any) -> "CredentialCapabilityAttestationClaims":
@@ -502,6 +538,11 @@ def _request_mismatch(claims: CredentialCapabilityAttestationClaims, request: Ma
             return code
     if not set(request["required_capabilities"]).issubset(set(claims.granted_capabilities)):
         return "credential_capability_insufficient"
+    if claims.attestation_version == ATTESTATION_VERSION_V2:
+        if claims.challenge_digest != request["challenge_digest"]:
+            return "attestation_challenge_mismatch"
+        if not claims.credential_principal_identity:
+            return "attestation_credential_principal_missing"
     return None
 
 
@@ -536,29 +577,57 @@ class AttestationRuntimeBoundary:
         proof_verifier: CredentialCapabilityProofVerifier | None,
         revocation_reader: RevocationReader | None,
         capability_policy: CredentialCapabilityPolicy | None,
+        monotonic_clock: Callable[[], float] = time.monotonic,
     ) -> None:
+        if not callable(monotonic_clock):
+            raise TypeError("attestation_monotonic_clock_invalid")
         self.__issuer_policy = issuer_policy
         self.__proof_verifier = proof_verifier
         self.__revocation_reader = revocation_reader
         self.__capability_policy = capability_policy
+        self.__monotonic_clock = monotonic_clock
         self.__provenance = object()
         self.__lock = threading.RLock()
         self.__requests: weakref.WeakKeyDictionary[CredentialCapabilityRequest, Mapping[str, Any]] = weakref.WeakKeyDictionary()
+        self.__challenges: weakref.WeakKeyDictionary[CredentialCapabilityRequest, dict[str, Any]] = weakref.WeakKeyDictionary()
         self.__tickets: weakref.WeakKeyDictionary[VerifiedCredentialCapabilityAttestation, _TicketRecord] = weakref.WeakKeyDictionary()
 
     def create_request(self, **values: Any) -> CredentialCapabilityRequest:
         normalized = CredentialCapabilityRequest._normalized_values(values)
+        challenge_value = secrets.token_urlsafe(32)
+        challenge_context = {key: normalized[key] for key in sorted(normalized)}
+        normalized["challenge_digest"] = digest({
+            "domain": CHALLENGE_DOMAIN,
+            "challenge": challenge_value,
+            "context": challenge_context,
+        })
         capability_failure = _check_capabilities(self.__capability_policy, normalized["required_capabilities"])
         if capability_failure is not None:
             raise AttestationContractError(capability_failure)
         request = object.__new__(CredentialCapabilityRequest)
         for field, value in normalized.items():
             object.__setattr__(request, field, value)
+        object.__setattr__(request, "_CredentialCapabilityRequest__challenge_value", challenge_value)
         object.__setattr__(request, "_CredentialCapabilityRequest__boundary_provenance", self.__provenance)
         snapshot = MappingProxyType(dict(normalized))
         with self.__lock:
             self.__requests[request] = snapshot
+            self.__challenges[request] = {"value": challenge_value, "issued": self.__monotonic_clock(), "consumed": False}
         return request
+
+    def challenge_is_current(self, request: CredentialCapabilityRequest, *, max_age_seconds: float = 300.0) -> bool:
+        with self.__lock:
+            state = self.__challenges.get(request)
+            return state is not None and not state["consumed"] and self.__monotonic_clock() - state["issued"] < max_age_seconds
+
+    def consume_challenge(self, request: CredentialCapabilityRequest) -> None:
+        with self.__lock:
+            state = self.__challenges.get(request)
+            if state is None or state["consumed"]:
+                raise AttestationContractError("attestation_challenge_replayed")
+            if self.__monotonic_clock() - state["issued"] >= 300.0:
+                raise AttestationContractError("attestation_challenge_expired")
+            state["consumed"] = True
 
     def consume_ticket(self, ticket: VerifiedCredentialCapabilityAttestation) -> CredentialCapabilityAttestationClaims:
         if not isinstance(ticket, VerifiedCredentialCapabilityAttestation):
@@ -596,7 +665,7 @@ class AttestationRuntimeBoundary:
                 return _failure("attestation_missing")
             envelope = _parse_untrusted_signed_attestation(signed_attestation)
             claims = envelope.claims
-            if claims.attestation_version != "1":
+            if claims.attestation_version not in {ATTESTATION_VERSION_V1, ATTESTATION_VERSION_V2}:
                 return _failure("attestation_version_unsupported")
             if claims.signature_algorithm not in SUPPORTED_SIGNATURE_ALGORITHMS:
                 return _failure("attestation_algorithm_unsupported")
@@ -630,6 +699,13 @@ class AttestationRuntimeBoundary:
             mismatch = _request_mismatch(claims, request_snapshot)
             if mismatch is not None:
                 return _failure(mismatch)
+            if claims.attestation_version == ATTESTATION_VERSION_V2:
+                if not self.challenge_is_current(request):
+                    return _failure("attestation_challenge_expired")
+                try:
+                    self.consume_challenge(request)
+                except AttestationContractError as exc:
+                    return _failure(str(exc))
             _, issued = _utc_timestamp(claims.issued_at)
             _, expires = _utc_timestamp(claims.expires_at)
             if now < issued:
@@ -670,6 +746,8 @@ class AttestationRuntimeBoundary:
                 "required_capabilities_missing", "attestation_credential_class_unsupported",
                 "credential_capability_unknown", "attestation_capability_policy_unavailable",
                 "attestation_request_unavailable", "attestation_request_tampered",
+                "attestation_challenge_mismatch", "attestation_challenge_expired", "attestation_challenge_replayed",
+                "attestation_credential_principal_missing", "attestation_v1_extension_forbidden",
             }
             return _failure(code if code in allowed else "attestation_invalid")
         except (TypeError, KeyError, ValueError):
