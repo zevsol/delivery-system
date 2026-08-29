@@ -1,0 +1,15 @@
+interface:
+  display_name: "Audit GitHub Work Items"
+  short_description: "Independently audit a sealed Delivery System preview"
+  default_prompt: "Use $audit-github-work-items to independently audit a Delivery System Preview."
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "delivery_get_audit_context"
+      description: "Read the complete sealed preview and Runtime audit context; it does not write to GitHub"
+      transport: "stdio"
+    - type: "mcp"
+      value: "delivery_record_audit"
+      description: "Record the Runtime-validated audit in local PreviewStore state; it does not write to GitHub"
+      transport: "stdio"

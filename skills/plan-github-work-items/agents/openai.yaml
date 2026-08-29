@@ -1,0 +1,11 @@
+interface:
+  display_name: "Plan GitHub Work Items"
+  short_description: "Clarify and preview structured work items"
+  default_prompt: "Use $plan-github-work-items to create a planning preview without writing to GitHub."
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "delivery_plan_preview"
+      description: "Local Delivery System Planner MCP tool; it does not write to GitHub and may save local preview state"
+      transport: "stdio"
