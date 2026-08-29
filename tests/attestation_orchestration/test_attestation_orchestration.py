@@ -9,6 +9,7 @@ import threading
 import unittest
 
 from delivery_system.attestation import AttestationRuntimeBoundary, IssuerTrustDecision
+from delivery_system.attestation_github_app import GitHubAppCredentialCapabilityProvider
 from delivery_system.attestation_runtime import (
     RuntimeAttestationOrchestrationService,
     RuntimeCredentialCapabilityBinding,
@@ -24,6 +25,7 @@ from delivery_system.runtime import AuditResult, InMemoryPreviewStore, RuntimeCo
 from tests.attestation_contract.test_attestation_contract import FakeCapabilityPolicy, FakeIssuer
 from tests.fakes.attestation_persistence_store_contract import artifact_for
 from tests.fakes.attestation_provider import FakeCapabilityResolver, FakeCredentialCapabilityProvider
+from tests.attestation_github_app.test_provider import Signer, Source, raw_evidence
 
 
 TRUST = DriverTrustContext("fixture-driver", "offline://fixture", "fixture-v1")
@@ -118,6 +120,28 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual(binding.preview_id, self.preview["preview_id"])
         self.assertTrue(self.service.accepts_binding(binding))
         self.assertIs(self.service.lookup_binding(binding.binding_id), binding)
+        self.assertFalse(self.preview["write_eligible"])
+
+    def test_github_app_provider_is_accepted_by_existing_runtime_orchestration(self):
+        signer = Signer()
+        signer.key_id = "key-1"
+        self.fake_issuer.evaluate = lambda *args: IssuerTrustDecision(True)
+        provider = GitHubAppCredentialCapabilityProvider(
+            Source(raw_evidence()), signer, clock=lambda: NOW,
+            credential_instance_id_factory=lambda: "credential-instance-" + "a" * 32,
+            nonce_factory=lambda: "nonce-" + "a" * 32,
+        )
+        service = RuntimeAttestationOrchestrationService(
+            self.context, self.store, TRUST,
+            AttestationRuntimeBoundary(self.fake_issuer, self.fake_issuer, self.fake_issuer, FakeCapabilityPolicy()),
+            provider, self.resolver, clock=lambda: NOW,
+        )
+        result = service.orchestrate(self.preview["preview_id"], self.preview["revision"])
+        self.assertTrue(result.success)
+        assert result.binding is not None
+        self.assertEqual(result.binding.attestation_version, "2")
+        self.assertEqual(result.binding.github_subject_identity, "node-1")
+        self.assertEqual(result.binding.granted_capabilities, ("issues:write",))
         self.assertFalse(self.preview["write_eligible"])
 
     def test_v2_provider_challenge_and_principal_reach_binding(self):
