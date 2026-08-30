@@ -16,21 +16,7 @@ from copy import deepcopy
 from datetime import datetime, timezone
 
 from delivery_system import sqlite_schema
-
-def canonical_payload(value: Mapping[str, Any]) -> str:
-    from delivery_system.protocol import canonical_payload as _canonical_payload
-    return _canonical_payload(value)
-
-
-def digest(value: Mapping[str, Any]) -> str:
-    from delivery_system.protocol import digest as _digest
-    return _digest(value)
-
-
-def normalize(value: Any) -> Any:
-    from delivery_system.protocol import normalize as _normalize
-    return _normalize(value)
-
+from delivery_system.canonical import canonical_payload, digest, normalize
 
 class DeclaredSource(str, Enum):
     USER_ASSERTED = "user_asserted"
@@ -633,7 +619,6 @@ class AuditRecord:
         return replace(record, audit_digest=record._computed_digest())
 
     def _computed_digest(self) -> str:
-        from delivery_system.protocol import digest
         return digest({
             "audit_id": self.audit_id,
             "preview_id": self.preview_id,
