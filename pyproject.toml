@@ -9,6 +9,7 @@ description = "Corrective Runtime Prototype for deterministic delivery planning.
 requires-python = ">=3.10"
 dependencies = [
   "mcp==2.0.0",
+  "cryptography==50.0.0",
 ]
 
 [dependency-groups]
