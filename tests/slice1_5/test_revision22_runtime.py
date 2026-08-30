@@ -32,10 +32,17 @@ class Revision22RuntimeTests(unittest.TestCase):
             context = RuntimeContext.from_workspace_root(directory)
             self.assertTrue(Path(context.workspace_root).is_absolute())
             self.assertTrue(context.workspace_identity.startswith("ws_v1_"))
-            self.assertEqual(context.normalized_workspace_root, context.workspace_root)
+            self.assertEqual(
+                Path(context.normalized_workspace_root),
+                Path(context.workspace_root).resolve(strict=True),
+            )
             self.assertEqual(
                 context.state_path,
-                str(Path(context.workspace_root) / ".delivery-system" / "state.sqlite3"),
+                str(
+                    Path(context.normalized_workspace_root)
+                    / ".delivery-system"
+                    / "state.sqlite3"
+                ),
             )
 
     def test_relative_workspace_input_is_absolute(self):
