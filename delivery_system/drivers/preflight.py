@@ -7,8 +7,9 @@ from weakref import WeakKeyDictionary
 import threading
 from typing import Mapping, Sequence
 
+from delivery_system.evidence import EvidenceRecord
 from delivery_system.protocol import canonical_payload, digest
-from delivery_system.runtime import EvidenceRecord, TypedRemoteSnapshot
+from delivery_system.remote_snapshot import TypedRemoteSnapshot
 
 from .contract import (
     DriverReadResponse,
