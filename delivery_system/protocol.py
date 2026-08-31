@@ -115,7 +115,9 @@ class LegacyRemoteSnapshot:
         }
 
 
-# Runtime owns the formal models. The legacy shape remains only as a named
-# Slice 1 test/presentation adapter; the public RemoteSnapshot name is typed.
-from delivery_system.runtime import SealedPreview as Preview, TypedRemoteSnapshot
+# Formal preview and typed remote snapshot have independent low-level ownership.
+# Protocol provides compatibility aliases; the legacy shape remains only as a
+# named Slice 1 test/presentation adapter.
+from delivery_system.formal_preview import SealedPreview as Preview
+from delivery_system.remote_snapshot import TypedRemoteSnapshot
 RemoteSnapshot = TypedRemoteSnapshot
