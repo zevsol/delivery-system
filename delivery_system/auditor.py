@@ -50,7 +50,7 @@ def validate_current_commit_context(audit: AuditRecord, envelope: dict[str, Any]
                                     expected_workspace_identity: str,
                                     promotion: Any = None) -> None:
     """Single current-state validator used inside both Store commit boundaries."""
-    from delivery_system.runtime import _validate_preview_payload
+    from delivery_system.preview_validation import _validate_preview_payload
     if audit.status is not AuditStatus.ACTIVE:
         raise ValueError("audit_commit_boundary_required")
     if not isinstance(envelope, dict) or set(envelope) != {"request_id", "preview_id", "revision", "canonical_payload"}:
