@@ -11,8 +11,9 @@ from typing import Any, Mapping, cast
 
 from delivery_system.protocol import digest
 from delivery_system.rules import ResultClass, RuleCategory, RuleRegistry, SemanticOutcome
+from delivery_system.audit_state import AuditRecord, AuditResult, AuditStatus
 from delivery_system.runtime import (
-    AuditRecord, AuditResult, AuditStatus, AuditContextService,
+    AuditContextService,
     RuntimeContext, _preview_binding_value, compute_audit_context_digest,
 )
 
