@@ -253,7 +253,7 @@ def bind_validated_facts(
         [key for key, value in response.capabilities.items() if value is True],
         list(response.relationship_records), evidence_ids=[evidence.evidence_id],
     )
-    from delivery_system.runtime import RuntimePromotion
+    from delivery_system.runtime_authority import RuntimePromotion
     promotion = RuntimePromotion._create(trust_context, evidence, snapshot, facts.remote_content_digest, snapshot.digest())
     return RuntimeEvidenceBindingResult(binding, trust_context, evidence, snapshot, snapshot.digest(), promotion)
 
