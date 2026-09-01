@@ -7,6 +7,7 @@ import threading
 import json
 from copy import copy, deepcopy
 from dataclasses import replace
+from unittest.mock import patch
 from typing import Any, cast
 
 from delivery_system.auditor import (
@@ -28,6 +29,15 @@ from delivery_system.runtime import (
     RuntimeContext,
     RuntimePlanner,
     SQLitePreviewStore,
+)
+from delivery_system.store_reads import (
+    read_inmemory_evidence_records,
+    read_inmemory_preview_latest,
+    read_inmemory_preview_revision,
+    read_sqlite_evidence_records,
+    read_sqlite_latest_preview_revision,
+    read_sqlite_preview_latest,
+    read_sqlite_preview_revision,
 )
 from delivery_system.protocol import digest
 from delivery_system.rules import build_registry_v1
@@ -144,6 +154,126 @@ class AuditorContractTests(unittest.TestCase):
             audit, context["sealed_preview"], context["evidence_records"], auditor.store.audit_backend_scope,
         )
         return audit, authority
+
+    def test_raw_sqlite_latest_and_evidence_reads_preserve_query_contracts(self):
+        connection = sqlite3.connect(":memory:")
+        try:
+            connection.execute("CREATE TABLE records (workspace_identity TEXT, record_type TEXT, record_id TEXT, revision INTEGER, payload TEXT)")
+            connection.executemany(
+                "INSERT INTO records VALUES (?, ?, ?, ?, ?)",
+                [
+                    ("workspace", "preview", "preview", 1, '{"revision": 1, "value": "old"}'),
+                    ("workspace", "preview", "preview", 2, '{"revision": 2, "value": "new"}'),
+                    ("workspace", "evidence", "evidence-a", 1, '{"evidence_id": "evidence-a", "revision": 1}'),
+                    ("workspace", "evidence", "evidence-a", 2, '{"evidence_id": "evidence-a", "revision": 2}'),
+                    ("workspace", "evidence", "evidence-b", 1, '{"evidence_id": "evidence-b", "revision": 1}'),
+                ],
+            )
+            connection.commit()
+
+            class ReadOnlyProbe:
+                def __init__(self, wrapped):
+                    self.wrapped = wrapped
+                    self.lifecycle = []
+                    self.sql = []
+
+                def execute(self, sql, parameters=()):
+                    self.sql.append(sql)
+                    return self.wrapped.execute(sql, parameters)
+
+                def commit(self):
+                    self.lifecycle.append("commit")
+                    return self.wrapped.commit()
+
+                def rollback(self):
+                    self.lifecycle.append("rollback")
+                    return self.wrapped.rollback()
+
+                def close(self):
+                    self.lifecycle.append("close")
+                    return self.wrapped.close()
+
+            probe = ReadOnlyProbe(connection)
+            latest = read_sqlite_preview_latest(probe, "workspace", "preview")
+            self.assertEqual(latest["revision"], 2)
+            self.assertEqual(latest["value"], "new")
+            evidence = read_sqlite_evidence_records(probe, "workspace", ["evidence-b", "evidence-a"])
+            self.assertEqual([record["evidence_id"] for record in evidence], ["evidence-b", "evidence-a"])
+            self.assertEqual(len([sql for sql in probe.sql if sql.startswith("SELECT revision, payload")]), 1)
+            self.assertEqual(len([sql for sql in probe.sql if sql.startswith("SELECT payload")]), 2)
+            self.assertEqual(probe.lifecycle, [])
+        finally:
+            connection.close()
+
+    def test_sqlite_atomic_raw_reads_reuse_begin_immediate_connection(self):
+        import delivery_system.runtime as runtime_module
+
+        with tempfile.TemporaryDirectory() as directory:
+            context = RuntimeContext.from_workspace_root(directory)
+            store = SQLitePreviewStore(context, ignore_checker=lambda _: True, tracked_checker=lambda _: False)
+            preview = RuntimePlanner(context, store).preview(plan_payload())
+            auditor = RuntimeAuditor(context, store, self.registry)
+            audit, authority = self._audit_candidate(auditor, preview, "raw-read-connection", "same")
+            calls = []
+
+            def traced(name, function):
+                def invoke(connection, *args, **kwargs):
+                    calls.append((name, id(connection), connection.in_transaction))
+                    return function(connection, *args, **kwargs)
+                return invoke
+
+            with patch.object(
+                runtime_module,
+                "read_sqlite_latest_preview_revision",
+                side_effect=traced("latest", read_sqlite_latest_preview_revision),
+            ), patch.object(
+                runtime_module,
+                "read_sqlite_preview_revision",
+                side_effect=traced("preview", runtime_module.read_sqlite_preview_revision),
+            ), patch.object(
+                runtime_module,
+                "read_sqlite_evidence_records",
+                side_effect=traced("evidence", read_sqlite_evidence_records),
+            ):
+                store._apply_audit_commit_atomic(audit, authority)
+
+            self.assertTrue(calls)
+            self.assertEqual(calls[0][0], "latest")
+            self.assertEqual(calls[1][0], "preview")
+            self.assertTrue(all(name == "evidence" for name, _, _ in calls[2:]))
+            self.assertEqual(len({connection_id for _, connection_id, _ in calls}), 1)
+            self.assertTrue(all(in_transaction for _, _, in_transaction in calls))
+
+    def test_inmemory_atomic_raw_reads_run_under_existing_store_lock(self):
+        import delivery_system.runtime as runtime_module
+
+        audit, authority = self._audit_candidate(self.auditor, self.preview, "raw-read-lock", "same")
+        observed = []
+
+        def traced(name, function):
+            def invoke(*args, **kwargs):
+                observed.append(name)
+                self.assertTrue(self.store._lock._is_owned())
+                return function(*args, **kwargs)
+            return invoke
+
+        with patch.object(
+            runtime_module,
+            "read_inmemory_preview_revision",
+            side_effect=traced("preview", read_inmemory_preview_revision),
+        ), patch.object(
+            runtime_module,
+            "read_inmemory_preview_latest",
+            side_effect=traced("latest", read_inmemory_preview_latest),
+        ), patch.object(
+            runtime_module,
+            "read_inmemory_evidence_records",
+            side_effect=traced("evidence", read_inmemory_evidence_records),
+        ):
+            self.store._apply_audit_commit_atomic(audit, authority)
+
+        self.assertEqual(observed[:2], ["preview", "latest"])
+        self.assertTrue(all(name == "evidence" for name in observed[2:]))
 
     def test_registry_digest_binds_contract_and_context_exposes_rules(self):
         context = self._context()
@@ -452,6 +582,43 @@ class AuditorContractTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "^evidence_digest_mismatch$"):
                 store._apply_audit_commit_atomic(genuine, authority)
             self.assertEqual(store.get_audit(context.workspace_identity, genuine.audit_id).status, AuditStatus.ACTIVE)
+
+    def test_commit_rejects_tampered_sqlite_preview_envelope_revision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            context = RuntimeContext.from_workspace_root(directory)
+            store = SQLitePreviewStore(context, ignore_checker=lambda _: True, tracked_checker=lambda _: False)
+            preview = RuntimePlanner(context, store).preview(plan_payload())
+            auditor = RuntimeAuditor(context, store, self.registry)
+            ctx = auditor.get_context(preview["preview_id"], 1)
+            genuine = auditor.record_audit(preview["preview_id"], 1, ctx["audit_context_digest"], self._passed_evaluations(), [])
+            authority = _mint_audit_commit_authority(
+                genuine, ctx["sealed_preview"], ctx["evidence_records"], store.audit_backend_scope,
+            )
+            connection = sqlite3.connect(store.path)
+            try:
+                row = connection.execute(
+                    "SELECT payload FROM records WHERE record_type='preview' AND record_id=? AND revision=1",
+                    (preview["preview_id"],),
+                ).fetchone()
+                self.assertIsNotNone(row)
+                envelope = json.loads(row[0])
+                envelope["revision"] = 99
+                connection.execute(
+                    "UPDATE records SET payload=? WHERE record_type='preview' AND record_id=? AND revision=1",
+                    (json.dumps(envelope, sort_keys=True), preview["preview_id"]),
+                )
+                connection.commit()
+                before = connection.execute("SELECT COUNT(*) FROM audit_history").fetchone()[0]
+            finally:
+                connection.close()
+            with self.assertRaisesRegex(ValueError, "^preview_identity_mismatch$"):
+                store._apply_audit_commit_atomic(genuine, authority)
+            connection = sqlite3.connect(store.path)
+            try:
+                after = connection.execute("SELECT COUNT(*) FROM audit_history").fetchone()[0]
+            finally:
+                connection.close()
+            self.assertEqual(after, before)
 
     def test_commit_rejects_tampered_sqlite_canonical_without_staling(self):
         with tempfile.TemporaryDirectory() as directory:
