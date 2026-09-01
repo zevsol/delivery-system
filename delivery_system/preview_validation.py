@@ -9,6 +9,7 @@ from delivery_system.evidence import EvidenceRecord
 from delivery_system.formal_preview import PreviewLevel, SealedPreview
 from delivery_system.remote_snapshot import TypedRemoteSnapshot
 from delivery_system.runtime_authority import RuntimePromotion
+from delivery_system.write_operations import evaluate_write_operations, operation_set_digest_payload
 
 
 def _validate_preview_payload(canonical: Mapping[str, Any], request_id: str,
@@ -45,10 +46,7 @@ def _validate_preview_payload(canonical: Mapping[str, Any], request_id: str,
         raise ValueError("sealed_preview_incomplete")
     if digest(semantic) != plan_digest or canonical.get("plan_digest") != plan_digest:
         raise ValueError("plan_digest_mismatch")
-    operation_semantics = {"operation_intents": [
-        {key: value for key, value in operation.items() if key not in {"operation_id", "id"}}
-        for operation in operations
-    ]}
+    operation_semantics = operation_set_digest_payload(operations)
     if digest(operation_semantics) != operation_set_digest or canonical.get("operation_set_digest") != operation_set_digest:
         raise ValueError("operation_set_digest_mismatch")
     if canonical.get("remote_snapshot_digest") != remote_snapshot_digest:
@@ -111,6 +109,16 @@ def _runtime_preview_level(canonical: Mapping[str, Any]) -> PreviewLevel:
     if not isinstance(remote, Mapping) or canonical.get("remote_snapshot_digest") is None:
         return PreviewLevel.CONCEPTUAL
     if remote.get("query_complete") is True and remote.get("pagination_complete") is True:
+        try:
+            evaluation = evaluate_write_operations(
+                canonical.get("operation_intents", []),
+                canonical.get("items", []),
+                canonical.get("semantic_payload", {}),
+            )
+        except (TypeError, ValueError):
+            return PreviewLevel.REPOSITORY_AWARE
+        if evaluation.eligible and not canonical.get("blockers"):
+            return PreviewLevel.WRITE_ELIGIBLE
         return PreviewLevel.REPOSITORY_AWARE
     return PreviewLevel.CONCEPTUAL
 

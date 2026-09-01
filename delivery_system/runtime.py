@@ -29,6 +29,7 @@ from delivery_system.preview_validation import (
     _validate_preview_payload,
     validate_sealed_preview_invariants,
 )
+from delivery_system.write_operations import WriteOperationEvaluation, evaluate_write_operations, operation_set_digest_payload
 from delivery_system.remote_snapshot import (
     RemoteCapabilitySet,
     RemoteIssueRecord,
@@ -188,11 +189,57 @@ class PreviewStore(Protocol):
     def validate_approval_current(self, approval: ApprovalRecord) -> bool: ...
 def _preview_is_approval_eligible(preview: Mapping[str, Any]) -> bool:
     canonical = preview.get("canonical_payload")
+    if not isinstance(canonical, Mapping) or canonical.get("preview_level") != PreviewLevel.WRITE_ELIGIBLE.value:
+        return False
+    if (not isinstance(canonical.get("workspace_identity"), str) or
+            not isinstance(canonical.get("repository_identity"), str) or
+            not isinstance(canonical.get("remote_snapshot_digest"), str) or
+            canonical.get("blockers") != []):
+        return False
+    try:
+        evaluation = evaluate_write_operations(
+            canonical["operation_intents"], canonical["items"], canonical["semantic_payload"],
+        )
+        return (
+            evaluation.eligible
+            and canonical.get("operation_set_digest") == digest(operation_set_digest_payload(evaluation.operations))
+            and canonical.get("plan_digest") == digest(canonical["semantic_payload"])
+            and canonical.get("sealed_preview_digest") == digest({
+                key: value for key, value in canonical.items() if key != "sealed_preview_digest"
+            })
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _validate_approval_against_current_preview(
+    approval: ApprovalRecord,
+    audit: AuditRecord,
+    preview: Mapping[str, Any],
+    expected_workspace_identity: str,
+) -> bool:
+    """Validate the complete Approval -> Audit -> current Preview authority chain."""
+    canonical = preview.get("canonical_payload")
     if not isinstance(canonical, Mapping):
         return False
-    # OperationIntent is intentionally not an approved operation contract yet.
-    # Until that contract exists, no product preview may become WriteEligible.
-    return False
+    return (
+        approval.validate_against(audit)
+        and audit.verify_digest()
+        and audit.approval_eligible
+        and audit.status is AuditStatus.ACTIVE
+        and audit.result is AuditResult.PASSED
+        and audit.audit_scope == PreviewLevel.WRITE_ELIGIBLE.value
+        and audit.workspace_identity == expected_workspace_identity
+        and canonical.get("workspace_identity") == expected_workspace_identity
+        and audit.preview_id == canonical.get("preview_id")
+        and audit.revision == canonical.get("revision")
+        and audit.sealed_preview_digest == canonical.get("sealed_preview_digest")
+        and audit.plan_digest == canonical.get("plan_digest")
+        and audit.operation_set_digest == canonical.get("operation_set_digest")
+        and audit.remote_snapshot_digest == canonical.get("remote_snapshot_digest")
+        and approval.repository_identity == canonical.get("repository_identity")
+        and _preview_is_approval_eligible(preview)
+    )
 
 
 def _validate_formal_audit_boundary(audit: AuditRecord, canonical: Mapping[str, Any], expected_workspace_identity: str) -> None:
@@ -701,15 +748,8 @@ class InMemoryPreviewStore:
         if (not isinstance(preview_revision, int) or isinstance(preview_revision, bool) or
                 preview_revision != approval.revision):
             return False
-        if not _preview_is_approval_eligible(preview):
-            return False
-        return (
-            approval.validate_against(audit)
-            and approval.audit_result == AuditResult.PASSED
-            and approval.plan_digest == _preview_binding_value(preview, "plan_digest")
-            and approval.remote_snapshot_digest == _preview_binding_value(preview, "remote_snapshot_digest")
-            and approval.operation_set_digest == _preview_binding_value(preview, "operation_set_digest")
-            and approval.repository_identity == _preview_binding_value(preview, "repository_identity")
+        return _validate_approval_against_current_preview(
+            approval, audit, preview, scope
         )
 
 
@@ -1117,11 +1157,7 @@ class SQLitePreviewStore:
                 if audit_row is None:
                     raise ValueError("audit_not_found")
                 audit_data = json.loads(audit_row[0])
-                audit = AuditRecord(
-                    audit_data["audit_id"], audit_data["preview_id"], audit_data["revision"],
-                    audit_data["plan_digest"], audit_data["remote_snapshot_digest"], audit_data["audit_digest"],
-                    AuditResult(audit_data["result"]), audit_data["operation_set_digest"], AuditStatus(audit_data["status"]),
-                )
+                audit = AuditRecord.from_dict(audit_data)
                 if not audit.verify_digest() or audit.status is not AuditStatus.ACTIVE:
                     raise ValueError("approval_stale")
                 preview_row = connection.execute(
@@ -1131,15 +1167,8 @@ class SQLitePreviewStore:
                 if preview_row is None:
                     raise ValueError("preview_not_found")
                 preview = json.loads(preview_row[1])
-                if not (
-                    approval.validate_against(audit)
-                    and approval.preview_id == audit.preview_id
-                    and approval.revision == audit.revision
-                    and approval.plan_digest == _preview_binding_value(preview, "plan_digest")
-                    and approval.remote_snapshot_digest == _preview_binding_value(preview, "remote_snapshot_digest")
-                    and approval.operation_set_digest == _preview_binding_value(preview, "operation_set_digest")
-                    and approval.repository_identity == _preview_binding_value(preview, "repository_identity")
-                    and _preview_is_approval_eligible(preview)
+                if not _validate_approval_against_current_preview(
+                    approval, audit, preview, self.context.workspace_identity
                 ):
                     raise ValueError("approval_binding_mismatch")
                 latest = connection.execute(
@@ -1188,14 +1217,8 @@ class SQLitePreviewStore:
             if (not isinstance(preview_revision, int) or isinstance(preview_revision, bool) or
                     preview_revision != approval.revision):
                 return False
-            return (
-                approval.validate_against(audit)
-                and approval.audit_result == AuditResult.PASSED
-                and approval.plan_digest == _preview_binding_value(preview, "plan_digest")
-                and approval.remote_snapshot_digest == _preview_binding_value(preview, "remote_snapshot_digest")
-                and approval.operation_set_digest == _preview_binding_value(preview, "operation_set_digest")
-                and approval.repository_identity == _preview_binding_value(preview, "repository_identity")
-                and _preview_is_approval_eligible(preview)
+            return _validate_approval_against_current_preview(
+                approval, audit, preview, self.context.workspace_identity
             )
         except ValueError:
             return False
@@ -1243,7 +1266,13 @@ class RuntimePlanner:
             canonical["sealed_preview_digest"], evidence,
         )
         result = dict(canonical)
-        result.update({"remote_snapshot": None, "findings": [], "stale": False, "write_eligible": False, "audit_context_digest": audit_digest})
+        result.update({
+            "remote_snapshot": None,
+            "findings": [],
+            "stale": False,
+            "write_eligible": _preview_is_approval_eligible(preview),
+            "audit_context_digest": audit_digest,
+        })
         return result
 
     def preview(self, plan: Mapping[str, Any], previous_preview_id: str | None = None) -> dict[str, Any]:
@@ -1274,13 +1303,7 @@ class RuntimePlanner:
                 raise ValueError("invalid_input")
             operation_intents.append(dict(operation))
         plan_digest = digest(semantic)
-        operation_semantics = {
-            "operation_intents": [
-                {key: value for key, value in operation.items() if key not in {"operation_id", "id"}}
-                for operation in operation_intents
-            ]
-        }
-        operation_set_digest = digest(operation_semantics)
+        operation_set_digest = digest(operation_set_digest_payload(operation_intents))
         repository_claim = plan.get("repository_claim")
         repository_name = None
         if isinstance(repository_claim, Mapping):
@@ -1355,6 +1378,10 @@ class RuntimePlanner:
                 item_id = self._id("item")
             sealed_items.append({"client_ref": item["client_ref"], "previous_client_ref": previous_ref, "item_id": item_id})
         blockers = []
+        try:
+            operation_evaluation = evaluate_write_operations(operation_intents, sealed_items, semantic)
+        except (TypeError, ValueError):
+            operation_evaluation = WriteOperationEvaluation((), False, ("write_operation_contract_invalid",))
         preview_level = PreviewLevel.CONCEPTUAL
         repository_identity = None
         remote_authority = None
@@ -1372,11 +1399,14 @@ class RuntimePlanner:
                 remote_authority = self.trust_context.remote_authority
                 remote_snapshot = bound.snapshot.to_dict()
                 remote_snapshot_digest = bound.remote_snapshot_digest
-                preview_level = PreviewLevel.REPOSITORY_AWARE
+                preview_level = (PreviewLevel.WRITE_ELIGIBLE if operation_evaluation.eligible
+                                 else PreviewLevel.REPOSITORY_AWARE)
             else:
                 blockers = list(current_failure_codes)
                 if self.driver is None and not blockers:
                     blockers = ["driver_unavailable"]
+        if validated_facts is not None and not operation_evaluation.eligible:
+            blockers.extend(operation_evaluation.blockers)
         canonical = {
             "workspace_identity": self.context.workspace_identity,
             "request_id": request_id,
@@ -1457,7 +1487,7 @@ class RuntimePlanner:
             "remote_snapshot": None,
             "findings": [],
             "stale": False,
-            "write_eligible": False,
+            "write_eligible": canonical["preview_level"] == PreviewLevel.WRITE_ELIGIBLE.value,
             "audit_context_digest": canonical["audit_context_digest"],
         })
         return result
