@@ -4,8 +4,9 @@ import tempfile
 import unittest
 import sqlite3
 import threading
+import json
+from copy import copy, deepcopy
 from dataclasses import replace
-from copy import deepcopy
 from typing import Any, cast
 
 from delivery_system.auditor import (
@@ -15,6 +16,9 @@ from delivery_system.auditor import (
     ResultClass,
     SemanticOutcome,
     build_finding_id,
+)
+from delivery_system.audit_commit_authority import (
+    AuditCommitAuthority, _mint_audit_commit_authority,
 )
 from delivery_system.runtime import (
     AuditRecord,
@@ -122,7 +126,7 @@ class AuditorContractTests(unittest.TestCase):
             "findings": finding_payload,
             "result": AuditResult.PASSED.value,
         }
-        return AuditRecord.create(
+        audit = AuditRecord.create(
             audit_id, preview["preview_id"], preview["revision"],
             payload["plan_digest"], payload["remote_snapshot_digest"],
             payload["operation_set_digest"], AuditResult.PASSED,
@@ -136,6 +140,10 @@ class AuditorContractTests(unittest.TestCase):
             sealed_preview_digest=payload["sealed_preview_digest"],
             created_at="2026-08-11T00:00:00+00:00",
         )
+        authority = _mint_audit_commit_authority(
+            audit, context["sealed_preview"], context["evidence_records"], auditor.store.audit_backend_scope,
+        )
+        return audit, authority
 
     def test_registry_digest_binds_contract_and_context_exposes_rules(self):
         context = self._context()
@@ -261,7 +269,7 @@ class AuditorContractTests(unittest.TestCase):
                     canonical["items"], workspace_identity=context.workspace_identity,
                     canonical_payload=canonical, evidence_records=[],
                 )
-                with self.assertRaisesRegex(ValueError, "^audit_context_stale$"):
+                with self.assertRaisesRegex(ValueError, "^audit_commit_boundary_required$"):
                     store_a.commit_audit(candidate)
                 self.assertEqual(store_a.get_audit(context.workspace_identity, candidate.audit_id).status, AuditStatus.STALE)
                 self.assertEqual(store_a.list_active_audits(context.workspace_identity, preview["preview_id"], 1), [])
@@ -346,6 +354,67 @@ class AuditorContractTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "^audit_not_found$"):
                     store.get_audit(context.workspace_identity, fake.audit_id)
 
+    def test_post_mint_inner_audit_mutation_fails_closed(self):
+        context = self._context()
+        audit, authority = self._audit_candidate(self.auditor, self.preview, "mutated-inner", "same")
+        audit.rule_evaluations[0]["rationale"] = "mutated after authority mint"
+        with self.assertRaisesRegex(ValueError, "^audit_commit_boundary_required$"):
+            self.store._apply_audit_commit_atomic(audit, authority)
+        with self.assertRaisesRegex(ValueError, "^audit_not_found$"):
+            self.store.get_audit(self.context.workspace_identity, audit.audit_id)
+
+    def test_audit_authority_is_opaque_and_backend_scoped(self):
+        audit = self.auditor.record_audit(
+            self.preview["preview_id"], 1, self.auditor.get_context(self.preview["preview_id"], 1)["audit_context_digest"],
+            self._passed_evaluations(), [],
+        )
+        with self.assertRaisesRegex(TypeError, "^AuditCommitAuthority must be minted by the Auditor$"):
+            AuditCommitAuthority()
+        authority = _mint_audit_commit_authority(
+            audit, self.store.get_preview(self.context.workspace_identity, self.preview["preview_id"])["canonical_payload"],
+            self.store.get_evidence_records(self.context.workspace_identity, self.preview["evidence_ids"]),
+            self.store.audit_backend_scope,
+        )
+        with self.assertRaises(TypeError):
+            copy(authority)
+        with self.assertRaises(TypeError):
+            deepcopy(authority)
+        forged = object.__new__(AuditCommitAuthority)
+        with self.assertRaisesRegex(ValueError, "^audit_commit_boundary_required$"):
+            self.store._apply_audit_commit_atomic(self.auditor.store.get_audit(self.context.workspace_identity, authority.audit_id), forged)
+        with tempfile.TemporaryDirectory() as directory:
+            sqlite_context = RuntimeContext.from_workspace_root(directory)
+            sqlite_a = SQLitePreviewStore(sqlite_context, ignore_checker=lambda _: True, tracked_checker=lambda _: False)
+            sqlite_b = SQLitePreviewStore(sqlite_context, ignore_checker=lambda _: True, tracked_checker=lambda _: False)
+            self.assertEqual(sqlite_a.audit_backend_scope, sqlite_b.audit_backend_scope)
+        self.assertNotEqual(InMemoryPreviewStore("same").audit_backend_scope, InMemoryPreviewStore("same").audit_backend_scope)
+
+    def test_audit_authority_rejects_wrong_backend_scope(self):
+        audit, _ = self._audit_candidate(self.auditor, self.preview, "wrong-scope", "same")
+        other_store = InMemoryPreviewStore(self.context.workspace_identity)
+        self.assertNotEqual(self.store.audit_backend_scope, other_store.audit_backend_scope)
+        context = self._context()
+        authority = _mint_audit_commit_authority(
+            audit,
+            context["sealed_preview"],
+            context["evidence_records"],
+            other_store.audit_backend_scope,
+        )
+        with self.assertRaisesRegex(ValueError, "^audit_commit_boundary_required$"):
+            self.store._apply_audit_commit_atomic(audit, authority)
+        with self.assertRaisesRegex(ValueError, "^audit_not_found$"):
+            self.store.get_audit(self.context.workspace_identity, audit.audit_id)
+        self.assertEqual(self.store.list_active_audits(self.context.workspace_identity, self.preview["preview_id"], self.preview["revision"]), [])
+
+    def test_public_commit_audit_rejects_even_legitimate_auditor_record(self):
+        audit = self.auditor.record_audit(
+            self.preview["preview_id"], 1, self.auditor.get_context(self.preview["preview_id"], 1)["audit_context_digest"],
+            self._passed_evaluations(), [],
+        )
+        with self.assertRaisesRegex(ValueError, "^audit_commit_boundary_required$"):
+            self.store.commit_audit(audit)
+        self.assertEqual(self.store.get_audit(self.context.workspace_identity, audit.audit_id).status, AuditStatus.ACTIVE)
+
     def test_commit_rejects_tampered_sqlite_evidence_and_canonical(self):
         with tempfile.TemporaryDirectory() as directory:
             context = RuntimeContext.from_workspace_root(directory)
@@ -354,17 +423,35 @@ class AuditorContractTests(unittest.TestCase):
             auditor = RuntimeAuditor(context, store, self.registry)
             ctx = auditor.get_context(preview["preview_id"], 1)
             genuine = auditor.record_audit(preview["preview_id"], 1, ctx["audit_context_digest"], self._passed_evaluations(), [])
-            candidate = replace(genuine, audit_id="tampered-evidence")._with_digest()
+            authority = _mint_audit_commit_authority(
+                genuine, ctx["sealed_preview"], ctx["evidence_records"], store.audit_backend_scope,
+            )
             connection = sqlite3.connect(store.path)
             try:
                 evidence_id = preview["evidence_ids"][0]
-                connection.execute("UPDATE records SET payload=? WHERE record_type='evidence' AND record_id=?", ('{"tampered":true}', evidence_id))
+                row = connection.execute(
+                    "SELECT payload FROM records WHERE record_type='evidence' AND record_id=?",
+                    (evidence_id,),
+                ).fetchone()
+                self.assertIsNotNone(row)
+                original_record = json.loads(row[0])
+                original_evidence_id = original_record["evidence_id"]
+                original_evidence_digest = original_record["evidence_digest"]
+                mutated_record = deepcopy(original_record)
+                mutated_record["payload"] = {"tampered": True}
+                self.assertEqual(mutated_record["evidence_id"], original_evidence_id)
+                self.assertEqual(mutated_record["evidence_digest"], original_evidence_digest)
+                self.assertNotEqual(mutated_record["payload"], original_record["payload"])
+                connection.execute(
+                    "UPDATE records SET payload=? WHERE record_type='evidence' AND record_id=?",
+                    (json.dumps(mutated_record, sort_keys=True), evidence_id),
+                )
                 connection.commit()
             finally:
                 connection.close()
-            with self.assertRaises(ValueError):
-                store.commit_audit(candidate)
-            self.assertEqual(store.get_audit(context.workspace_identity, genuine.audit_id).audit_id, genuine.audit_id)
+            with self.assertRaisesRegex(ValueError, "^evidence_digest_mismatch$"):
+                store._apply_audit_commit_atomic(genuine, authority)
+            self.assertEqual(store.get_audit(context.workspace_identity, genuine.audit_id).status, AuditStatus.ACTIVE)
 
     def test_commit_rejects_tampered_sqlite_canonical_without_staling(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -374,7 +461,9 @@ class AuditorContractTests(unittest.TestCase):
             auditor = RuntimeAuditor(context, store, self.registry)
             ctx = auditor.get_context(preview["preview_id"], 1)
             genuine = auditor.record_audit(preview["preview_id"], 1, ctx["audit_context_digest"], self._passed_evaluations(), [])
-            candidate = replace(genuine, audit_id="tampered-canonical")._with_digest()
+            authority = _mint_audit_commit_authority(
+                genuine, ctx["sealed_preview"], ctx["evidence_records"], store.audit_backend_scope,
+            )
             connection = sqlite3.connect(store.path)
             try:
                 row = connection.execute("SELECT payload FROM records WHERE record_type='preview' AND record_id=? AND revision=1", (preview["preview_id"],)).fetchone()
@@ -385,7 +474,7 @@ class AuditorContractTests(unittest.TestCase):
             finally:
                 connection.close()
             with self.assertRaises(ValueError):
-                store.commit_audit(candidate)
+                store._apply_audit_commit_atomic(genuine, authority)
             self.assertEqual(store.get_audit(context.workspace_identity, genuine.audit_id).status, AuditStatus.ACTIVE)
 
     def test_commit_rejects_strict_audit_children_and_status(self):
@@ -457,8 +546,8 @@ class AuditorContractTests(unittest.TestCase):
             store_b = SQLitePreviewStore(context, ignore_checker=lambda _: True, tracked_checker=lambda _: False)
             preview = RuntimePlanner(context, store_a).preview(plan_payload())
             auditor = RuntimeAuditor(context, store_a, self.registry)
-            candidate_a = self._audit_candidate(auditor, preview, "audit-a", "first")
-            candidate_b = self._audit_candidate(auditor, preview, "audit-b", "second")
+            candidate_a, authority_a = self._audit_candidate(auditor, preview, "audit-a", "first")
+            candidate_b, authority_b = self._audit_candidate(auditor, preview, "audit-b", "second")
             acquired = threading.Event()
             release = threading.Event()
             attempting = threading.Event()
@@ -471,7 +560,7 @@ class AuditorContractTests(unittest.TestCase):
 
             def submit(store, candidate):
                 try:
-                    results.append(store.commit_audit(candidate))
+                    results.append(store._apply_audit_commit_atomic(candidate, authority_a if candidate.audit_id == "audit-a" else authority_b))
                 except Exception as exc:
                     results.append(exc)
 
@@ -501,7 +590,7 @@ class AuditorContractTests(unittest.TestCase):
             store_b = SQLitePreviewStore(context, ignore_checker=lambda _: True, tracked_checker=lambda _: False)
             preview = RuntimePlanner(context, store_a).preview(plan_payload())
             auditor = RuntimeAuditor(context, store_a, self.registry)
-            candidate = self._audit_candidate(auditor, preview, "audit-same", "same")
+            candidate, authority = self._audit_candidate(auditor, preview, "audit-same", "same")
             acquired = threading.Event()
             release = threading.Event()
             attempting = threading.Event()
@@ -514,7 +603,7 @@ class AuditorContractTests(unittest.TestCase):
 
             def submit(store):
                 try:
-                    results.append(store.commit_audit(candidate))
+                    results.append(store._apply_audit_commit_atomic(candidate, authority))
                 except Exception as exc:
                     results.append(exc)
 
@@ -541,8 +630,8 @@ class AuditorContractTests(unittest.TestCase):
             store = SQLitePreviewStore(context, ignore_checker=lambda _: True, tracked_checker=lambda _: False)
             preview = RuntimePlanner(context, store).preview(plan_payload())
             auditor = RuntimeAuditor(context, store, self.registry)
-            candidate = self._audit_candidate(auditor, preview, "audit-transition", "same")
-            store.commit_audit(candidate)
+            candidate, authority = self._audit_candidate(auditor, preview, "audit-transition", "same")
+            store._apply_audit_commit_atomic(candidate, authority)
             store_a = SQLitePreviewStore(context, ignore_checker=lambda _: True, tracked_checker=lambda _: False)
             store_b = SQLitePreviewStore(context, ignore_checker=lambda _: True, tracked_checker=lambda _: False)
             observed = threading.Barrier(2)
@@ -761,6 +850,10 @@ class AuditorContractTests(unittest.TestCase):
                 auditor = RuntimeAuditor(local_context, store, self.registry)
                 audit_context = auditor.get_context(preview["preview_id"], 1)
                 candidate = auditor.record_audit(preview["preview_id"], 1, audit_context["audit_context_digest"], self._passed_evaluations(), [])
+                canonical = store.get_preview_revision(local_context.workspace_identity, preview["preview_id"], 1)["canonical_payload"]
+                authority = _mint_audit_commit_authority(
+                    candidate, canonical, store.get_evidence_records(local_context.workspace_identity, preview["evidence_ids"]), store.audit_backend_scope,
+                )
                 original = cast(dict[str, Any], deepcopy(store.get_preview_revision(local_context.workspace_identity, preview["preview_id"], 1)["canonical_payload"]))
                 original["revision"] = 2
                 original["semantic_payload"] = {"changed": True}
@@ -775,7 +868,7 @@ class AuditorContractTests(unittest.TestCase):
                     if not commit_first:
                         save_done.wait()
                     try:
-                        store.commit_audit(candidate)
+                        store._apply_audit_commit_atomic(candidate, authority)
                         outcomes.append("commit-ok")
                     except ValueError as exc:
                         outcomes.append(str(exc))

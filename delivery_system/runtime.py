@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import sqlite3
 import threading
+import uuid
 from contextlib import closing
 import subprocess
 from typing import Any, Callable, Mapping, Protocol, Sequence
@@ -16,6 +17,9 @@ from datetime import datetime, timezone
 
 from delivery_system import sqlite_schema
 from delivery_system.audit_state import AuditRecord, ApprovalRecord, AuditResult, AuditStatus
+from delivery_system.audit_commit_authority import (
+    AuditCommitAuthority, _verify_authority_identity, _verify_candidate,
+)
 from delivery_system.canonical import canonical_payload, digest, normalize
 from delivery_system.evidence import DeclaredSource, EvidenceRecord, SourcedValue
 from delivery_system.formal_preview import PreviewLevel, SealedPreview
@@ -251,6 +255,57 @@ def _preview_binding_value(preview: Mapping[str, Any], key: str) -> Any:
     return preview.get(key)
 
 
+def _validate_current_audit_context(
+    audit: AuditRecord,
+    authority: AuditCommitAuthority,
+    preview: Mapping[str, Any],
+    evidence: list[dict[str, object]],
+    promotion: RuntimePromotion | None,
+    expected_workspace_identity: str,
+) -> Mapping[str, Any]:
+    authority = _verify_authority_identity(authority)
+    if not isinstance(preview, Mapping):
+        raise ValueError("sealed_preview_unavailable")
+    request_id = preview.get("request_id")
+    if (preview.get("preview_id") != audit.preview_id or
+            preview.get("revision") != audit.revision):
+        raise ValueError("preview_identity_mismatch")
+    canonical = preview.get("canonical_payload")
+    if not isinstance(canonical, Mapping):
+        raise ValueError("sealed_preview_unavailable")
+    if (canonical.get("preview_id") != audit.preview_id or
+            canonical.get("revision") != audit.revision or
+            canonical.get("workspace_identity") != expected_workspace_identity):
+        raise ValueError("preview_identity_mismatch")
+    normalized = _validate_preview_payload(
+        canonical,
+        request_id,
+        audit.preview_id,
+        audit.revision,
+        audit.plan_digest,
+        audit.operation_set_digest,
+        audit.remote_snapshot_digest,
+        canonical.get("repository_identity"),
+        evidence,
+        expected_workspace_identity,
+        promotion,
+    )
+    current_context_digest = compute_audit_context_digest(
+        expected_workspace_identity,
+        audit.preview_id,
+        audit.revision,
+        normalized["sealed_preview_digest"],
+        evidence,
+        audit.rule_registry_version,
+        audit.rule_registry_digest,
+        normalized.get("preview_level"),
+    )
+    if (current_context_digest != audit.audit_context_digest or
+            current_context_digest != getattr(authority, "audit_context_digest", None)):
+        raise ValueError("audit_context_stale")
+    return normalized
+
+
 def build_audit_context_payload(workspace_identity: str, preview_id: str, revision: int,
                                 sealed_preview_digest: str,
                                 evidence_records: Sequence[Mapping[str, Any]],
@@ -302,6 +357,7 @@ class InMemoryPreviewStore:
     def __init__(self, workspace_identity: str | None = None, trust_context: Any = None) -> None:
         self.workspace_identity = workspace_identity
         self.trust_context = trust_context
+        self.audit_backend_scope = "inmemory:" + uuid.uuid4().hex
         self._lock = threading.RLock()
         self._items: list[_ItemRecord] = []
         self._previews: dict[tuple[str, str], dict[str, object]] = {}
@@ -511,6 +567,10 @@ class InMemoryPreviewStore:
         self._audits[(scopes[0] if len(scopes) == 1 else "", audit.audit_id)] = audit
 
     def commit_audit(self, audit: AuditRecord) -> AuditRecord:
+        del audit
+        raise ValueError("audit_commit_boundary_required")
+
+    def _apply_audit_commit_atomic(self, audit: AuditRecord, authority: AuditCommitAuthority) -> AuditRecord:
         with self._lock:
             preview = self.get_preview_revision(audit.workspace_identity, audit.preview_id, audit.revision)
             latest = self.get_preview(audit.workspace_identity, audit.preview_id)
@@ -518,8 +578,6 @@ class InMemoryPreviewStore:
             if (not isinstance(latest_revision, int) or isinstance(latest_revision, bool) or
                     latest_revision != audit.revision):
                 raise ValueError("audit_context_stale")
-            from delivery_system.auditor import validate_current_commit_context
-            from delivery_system.rules import build_registry_v1
             canonical_payload = preview.get("canonical_payload")
             if not isinstance(canonical_payload, Mapping):
                 raise ValueError("sealed_preview_unavailable")
@@ -528,7 +586,16 @@ class InMemoryPreviewStore:
                 [str(value) for value in canonical_payload.get("evidence_ids", [])],
             )
             promotion = _reload_promotion(self, canonical_payload, evidence)
-            validate_current_commit_context(audit, preview, evidence, build_registry_v1(), self.workspace_identity or audit.workspace_identity, promotion)
+            _validate_current_audit_context(
+                audit, authority, preview, evidence, promotion,
+                self.workspace_identity or audit.workspace_identity,
+            )
+            _verify_candidate(audit, authority, canonical_payload, evidence, self.audit_backend_scope)
+            if promotion is not None:
+                if canonical_payload.get("remote_authority") != promotion.trust_context.remote_authority:
+                    raise ValueError("audit_commit_boundary_required")
+            elif canonical_payload.get("remote_authority") is not None:
+                raise ValueError("audit_commit_boundary_required")
             existing = self.find_audit_by_payload(audit.workspace_identity, audit.preview_id, audit.revision, audit.audit_payload_digest)
             if existing is not None and existing.status is AuditStatus.ACTIVE:
                 return existing
@@ -638,6 +705,8 @@ class SQLitePreviewStore:
         self.context = context
         self.trust_context = trust_context
         self.path = Path(context.state_path)
+        normalized_state = os.path.normcase(os.path.abspath(str(self.path)))
+        self.audit_backend_scope = digest({"backend": "sqlite", "workspace_identity": context.workspace_identity, "state": normalized_state})
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
@@ -882,6 +951,10 @@ class SQLitePreviewStore:
             connection.commit()
 
     def commit_audit(self, audit: AuditRecord) -> AuditRecord:
+        del audit
+        raise ValueError("audit_commit_boundary_required")
+
+    def _apply_audit_commit_atomic(self, audit: AuditRecord, authority: AuditCommitAuthority) -> AuditRecord:
         import json
         with closing(self._connect()) as connection:
             try:
@@ -914,9 +987,11 @@ class SQLitePreviewStore:
                         raise ValueError("evidence_not_found")
                     evidence.append(json.loads(evidence_row[0]))
                 promotion = _reload_promotion(self, canonical, evidence)
-                from delivery_system.auditor import validate_current_commit_context
-                from delivery_system.rules import build_registry_v1
-                validate_current_commit_context(audit, preview_payload, evidence, build_registry_v1(), self.context.workspace_identity, promotion)
+                _validate_current_audit_context(
+                    audit, authority, preview_payload, evidence, promotion,
+                    self.context.workspace_identity,
+                )
+                _verify_candidate(audit, authority, canonical, evidence, self.audit_backend_scope)
                 current_rows = connection.execute(
                     "SELECT audit_id, payload FROM audit_history WHERE workspace_identity=? ORDER BY audit_id, event_no",
                     (audit.workspace_identity,),

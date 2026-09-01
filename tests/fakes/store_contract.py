@@ -117,7 +117,10 @@ def run_store_contract(testcase, store_factory: Callable[[], tuple[PreviewStore,
 
 
 def run_auditor_store_contract(testcase, context, store, auditor, preview) -> int:
-    """Replay the Slice 2B audit persistence contract against one adapter."""
+    """Replay the Slice 2B audit persistence contract against one adapter.
+
+    Direct formal Store writes remain adversarial no-authority boundary checks.
+    """
     canonical = store.get_preview_revision(context.workspace_identity, preview["preview_id"], preview["revision"])["canonical_payload"]
     evaluations = [
         RuleEvaluationDraft(rule.rule_id, rule.rule_version, SemanticOutcome.PASSED, "contract pass")
