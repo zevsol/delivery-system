@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import json
 import os
 from pathlib import Path
 import sqlite3
@@ -38,6 +39,16 @@ from delivery_system.remote_snapshot import (
     _is_timezone_aware_timestamp,
 )
 from delivery_system.runtime_authority import _PROMOTION_MARKER, RuntimePromotion, _reload_promotion
+from delivery_system.store_reads import (
+    StoreReadMiss,
+    read_inmemory_evidence_records,
+    read_inmemory_preview_latest,
+    read_inmemory_preview_revision,
+    read_sqlite_evidence_records,
+    read_sqlite_latest_preview_revision,
+    read_sqlite_preview_latest,
+    read_sqlite_preview_revision,
+)
 
 class StorePreflightError(RuntimeError):
     def __init__(self, code: str):
@@ -478,10 +489,10 @@ class InMemoryPreviewStore:
 
     def get_preview(self, workspace_identity: str, preview_id: str) -> dict[str, object]:
         try:
-            result = deepcopy(self._previews[(workspace_identity, preview_id)])
+            result = read_inmemory_preview_latest(self._previews, workspace_identity, preview_id)
             self._validate_loaded_trust(result)
             return result
-        except KeyError as exc:
+        except StoreReadMiss as exc:
             raise ValueError("preview_not_found") from exc
 
     def get_preview_revision(self, workspace_identity: str, preview_id: str, revision: int | None = None) -> dict[str, object]:
@@ -490,10 +501,10 @@ class InMemoryPreviewStore:
         if revision is None:
             return self.get_preview(workspace_identity, preview_id)
         try:
-            result = deepcopy(self._preview_history[(workspace_identity, preview_id, revision)])
+            result = read_inmemory_preview_revision(self._preview_history, workspace_identity, preview_id, revision)
             self._validate_loaded_trust(result)
             return result
-        except KeyError as exc:
+        except StoreReadMiss as exc:
             raise ValueError("preview_not_found") from exc
 
     def _validate_loaded_trust(self, preview: Mapping[str, Any]) -> None:
@@ -507,13 +518,10 @@ class InMemoryPreviewStore:
     def get_evidence_records(self, workspace_identity: str, evidence_ids: list[str]) -> list[dict[str, object]]:
         if workspace_identity != (self.workspace_identity or workspace_identity):
             raise ValueError("evidence_workspace_mismatch")
-        result = []
-        for evidence_id in evidence_ids:
-            record = self._evidence.get((workspace_identity, evidence_id))
-            if record is None:
-                raise ValueError("evidence_not_found")
-            result.append(deepcopy(record.to_dict()))
-        return result
+        try:
+            return read_inmemory_evidence_records(self._evidence, workspace_identity, evidence_ids)
+        except StoreReadMiss as exc:
+            raise ValueError("evidence_not_found") from exc
 
     def resolve_item_id(self, workspace_identity: str, previous_preview_id: str, client_ref: str, revision: int | None = None) -> str:
         if revision is None:
@@ -572,8 +580,20 @@ class InMemoryPreviewStore:
 
     def _apply_audit_commit_atomic(self, audit: AuditRecord, authority: AuditCommitAuthority) -> AuditRecord:
         with self._lock:
-            preview = self.get_preview_revision(audit.workspace_identity, audit.preview_id, audit.revision)
-            latest = self.get_preview(audit.workspace_identity, audit.preview_id)
+            try:
+                preview = read_inmemory_preview_revision(
+                    self._preview_history, audit.workspace_identity, audit.preview_id, audit.revision,
+                )
+            except StoreReadMiss as exc:
+                raise ValueError("preview_not_found") from exc
+            self._validate_loaded_trust(preview)
+            try:
+                latest = read_inmemory_preview_latest(
+                    self._previews, audit.workspace_identity, audit.preview_id,
+                )
+            except StoreReadMiss as exc:
+                raise ValueError("preview_not_found") from exc
+            self._validate_loaded_trust(latest)
             latest_revision = latest.get("revision")
             if (not isinstance(latest_revision, int) or isinstance(latest_revision, bool) or
                     latest_revision != audit.revision):
@@ -581,10 +601,14 @@ class InMemoryPreviewStore:
             canonical_payload = preview.get("canonical_payload")
             if not isinstance(canonical_payload, Mapping):
                 raise ValueError("sealed_preview_unavailable")
-            evidence = self.get_evidence_records(
-                audit.workspace_identity,
-                [str(value) for value in canonical_payload.get("evidence_ids", [])],
-            )
+            try:
+                evidence = read_inmemory_evidence_records(
+                    self._evidence,
+                    audit.workspace_identity,
+                    [str(value) for value in canonical_payload.get("evidence_ids", [])],
+                )
+            except StoreReadMiss as exc:
+                raise ValueError("evidence_not_found") from exc
             promotion = _reload_promotion(self, canonical_payload, evidence)
             _validate_current_audit_context(
                 audit, authority, preview, evidence, promotion,
@@ -864,25 +888,18 @@ class SQLitePreviewStore:
         return self.get_preview_revision(workspace_identity, preview_id, None)
 
     def get_preview_revision(self, workspace_identity: str, preview_id: str, revision: int | None = None) -> dict[str, object]:
-        import json
-
         if workspace_identity != self.context.workspace_identity:
             raise ValueError("preview crosses Workspace boundary")
-        with closing(self._connect()) as connection:
-            if revision is None:
-                row = connection.execute(
-                    "SELECT revision, payload FROM records WHERE workspace_identity=? AND record_type='preview' AND record_id=? ORDER BY revision DESC LIMIT 1",
-                    (workspace_identity, preview_id),
-                ).fetchone()
-            else:
-                row = connection.execute(
-                    "SELECT revision, payload FROM records WHERE workspace_identity=? AND record_type='preview' AND record_id=? AND revision=?",
-                    (workspace_identity, preview_id, revision),
-                ).fetchone()
-        if row is None:
-            raise ValueError("preview_not_found")
-        result = json.loads(row[1])
-        result["revision"] = row[0]
+        try:
+            with closing(self._connect()) as connection:
+                if revision is None:
+                    result = read_sqlite_preview_latest(connection, workspace_identity, preview_id)
+                else:
+                    result = read_sqlite_preview_revision(connection, workspace_identity, preview_id, revision)
+        except StoreReadMiss as exc:
+            raise ValueError("preview_not_found") from exc
+        if revision is not None:
+            result["revision"] = revision
         canonical = result.get("canonical_payload")
         if isinstance(canonical, Mapping) and canonical.get("preview_level") == PreviewLevel.REPOSITORY_AWARE.value:
             if self.trust_context is None:
@@ -894,18 +911,11 @@ class SQLitePreviewStore:
     def get_evidence_records(self, workspace_identity: str, evidence_ids: list[str]) -> list[dict[str, object]]:
         if workspace_identity != self.context.workspace_identity:
             raise ValueError("evidence_workspace_mismatch")
-        import json
-        result = []
-        with closing(self._connect()) as connection:
-            for evidence_id in evidence_ids:
-                row = connection.execute(
-                    "SELECT payload FROM records WHERE workspace_identity=? AND record_type='evidence' AND record_id=? ORDER BY revision DESC LIMIT 1",
-                    (workspace_identity, evidence_id),
-                ).fetchone()
-                if row is None:
-                    raise ValueError("evidence_not_found")
-                result.append(json.loads(row[0]))
-        return result
+        try:
+            with closing(self._connect()) as connection:
+                return read_sqlite_evidence_records(connection, workspace_identity, evidence_ids)
+        except StoreReadMiss as exc:
+            raise ValueError("evidence_not_found") from exc
 
     def resolve_item_id(self, workspace_identity: str, previous_preview_id: str, client_ref: str, revision: int | None = None) -> str:
         if workspace_identity != self.context.workspace_identity:
@@ -955,37 +965,34 @@ class SQLitePreviewStore:
         raise ValueError("audit_commit_boundary_required")
 
     def _apply_audit_commit_atomic(self, audit: AuditRecord, authority: AuditCommitAuthority) -> AuditRecord:
-        import json
         with closing(self._connect()) as connection:
             try:
                 connection.execute("BEGIN IMMEDIATE")
-                latest_row = connection.execute(
-                    "SELECT MAX(revision) FROM records WHERE workspace_identity=? AND record_type='preview' AND record_id=?",
-                    (self.context.workspace_identity, audit.preview_id),
-                ).fetchone()
-                if latest_row is None or latest_row[0] is None:
+                latest_revision = read_sqlite_latest_preview_revision(
+                    connection, self.context.workspace_identity, audit.preview_id,
+                )
+                if latest_revision is None:
                     raise ValueError("preview_not_found")
-                if int(latest_row[0]) != audit.revision:
+                if int(latest_revision) != audit.revision:
                     raise ValueError("audit_context_stale")
-                preview_row = connection.execute(
-                    "SELECT payload FROM records WHERE workspace_identity=? AND record_type='preview' AND record_id=? AND revision=?",
-                    (self.context.workspace_identity, audit.preview_id, audit.revision),
-                ).fetchone()
-                if preview_row is None:
-                    raise ValueError("preview_not_found")
-                preview_payload = json.loads(preview_row[0])
+                try:
+                    preview_payload = read_sqlite_preview_revision(
+                        connection, self.context.workspace_identity, audit.preview_id, audit.revision,
+                    )
+                except StoreReadMiss as exc:
+                    raise ValueError("preview_not_found") from exc
                 canonical = preview_payload.get("canonical_payload")
                 if not isinstance(canonical, dict):
                     raise ValueError("sealed_preview_unavailable")
-                evidence = []
-                for evidence_id in canonical.get("evidence_ids", []):
-                    evidence_row = connection.execute(
-                        "SELECT payload FROM records WHERE workspace_identity=? AND record_type='evidence' AND record_id=? AND revision=?",
-                        (self.context.workspace_identity, evidence_id, audit.revision),
-                    ).fetchone()
-                    if evidence_row is None:
-                        raise ValueError("evidence_not_found")
-                    evidence.append(json.loads(evidence_row[0]))
+                try:
+                    evidence = read_sqlite_evidence_records(
+                        connection,
+                        self.context.workspace_identity,
+                        [str(value) for value in canonical.get("evidence_ids", [])],
+                        audit.revision,
+                    )
+                except StoreReadMiss as exc:
+                    raise ValueError("evidence_not_found") from exc
                 promotion = _reload_promotion(self, canonical, evidence)
                 _validate_current_audit_context(
                     audit, authority, preview_payload, evidence, promotion,
