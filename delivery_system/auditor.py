@@ -12,6 +12,7 @@ from typing import Any, Mapping, cast
 from delivery_system.protocol import digest
 from delivery_system.rules import ResultClass, RuleCategory, RuleRegistry, SemanticOutcome
 from delivery_system.audit_state import AuditRecord, AuditResult, AuditStatus
+from delivery_system.audit_commit_authority import _mint_audit_commit_authority
 from delivery_system.runtime import (
     AuditContextService,
     RuntimeContext, _preview_binding_value, compute_audit_context_digest,
@@ -466,4 +467,10 @@ class RuntimeAuditor:
             created_at=datetime.now(timezone.utc).isoformat(),
         )
         validate_committed_audit(audit, context["sealed_preview"], context["evidence_records"], self.registry)
-        return self.store.commit_audit(audit)
+        authority = _mint_audit_commit_authority(
+            audit,
+            context["sealed_preview"],
+            context["evidence_records"],
+            self.store.audit_backend_scope,
+        )
+        return self.store._apply_audit_commit_atomic(audit, authority)
