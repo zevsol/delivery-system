@@ -1,6 +1,8 @@
 import json
 import sqlite3
+import threading
 from contextlib import closing
+from copy import deepcopy
 from dataclasses import FrozenInstanceError
 import os
 import subprocess
@@ -9,6 +11,23 @@ import unittest
 from typing import Any, cast
 from pathlib import Path
 from unittest.mock import patch
+
+
+class _BeginGateConnection:
+    def __init__(self, connection, acquired, release):
+        self._connection = connection
+        self._acquired = acquired
+        self._release = release
+
+    def execute(self, sql, *args):
+        result = self._connection.execute(sql, *args)
+        if sql == "BEGIN IMMEDIATE":
+            self._acquired.set()
+            self._release.wait(5)
+        return result
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
 
 from delivery_system import sqlite_schema
 from delivery_system.runtime import (
@@ -357,6 +376,77 @@ class Revision22RuntimeTests(unittest.TestCase):
                 store.save_preview_revision("request-1", "preview-1", 2, "plan-2", "remote", "ops", "repo", [{"client_ref": "item", "previous_client_ref": "item", "item_id": "runtime-1"}])
             self.assertEqual(store.get_audit(context.workspace_identity, audit.audit_id).status, AuditStatus.ACTIVE)
             self.assertFalse(store.validate_approval_current(approval))
+
+    def test_sqlite_approval_revision_race_invalidates_stale_approval(self):
+        def prepare(directory):
+            context, store = self._sqlite_store(directory)
+            audit, approval = self._preview_and_audit(store, context)
+            canonical = deepcopy(store.get_preview_revision(context.workspace_identity, "preview-1", 1)["canonical_payload"])
+            canonical["revision"] = 2
+            canonical["items"] = [{"client_ref": "item", "previous_client_ref": "item", "item_id": "runtime-2"}]
+            digest = __import__("delivery_system.protocol", fromlist=["digest"]).digest
+            canonical["sealed_preview_digest"] = digest({key: value for key, value in canonical.items() if key != "sealed_preview_digest"})
+            return context, store, audit, approval, canonical
+
+        def save_revision(store, context, canonical):
+            store.save_preview_revision(
+                canonical["request_id"], canonical["preview_id"], 2,
+                canonical["plan_digest"], canonical["remote_snapshot_digest"],
+                canonical["operation_set_digest"], canonical["repository_identity"],
+                canonical["items"], workspace_identity=context.workspace_identity,
+                canonical_payload=canonical, evidence_records=[],
+            )
+
+        binding = {
+            "plan_digest": "sha256:test-plan",
+            "remote_snapshot_digest": "sha256:test-remote",
+            "operation_set_digest": "sha256:test-ops",
+            "repository_identity": "repo",
+        }
+        with patch("delivery_system.runtime._preview_is_approval_eligible", return_value=True), \
+                patch("delivery_system.runtime._preview_binding_value", side_effect=lambda _preview, key: binding[key]):
+            with tempfile.TemporaryDirectory() as directory:
+                context, store, audit, approval, canonical = prepare(directory)
+                binding.update(plan_digest=approval.plan_digest, remote_snapshot_digest=approval.remote_snapshot_digest, operation_set_digest=approval.operation_set_digest)
+                acquired = threading.Event()
+                release = threading.Event()
+                original_connect = store._connect
+                store._connect = lambda: _BeginGateConnection(original_connect(), acquired, release)
+                results = []
+                def run_revision():
+                    try:
+                        save_revision(store, context, canonical)
+                        results.append("revision")
+                    except Exception as exc:
+                        results.append(exc)
+
+                def run_approval():
+                    try:
+                        store.record_approval(approval)
+                        results.append("approval")
+                    except Exception as exc:
+                        results.append(exc)
+
+                revision_thread = threading.Thread(target=run_revision)
+                approval_thread = threading.Thread(target=run_approval)
+                approval_thread.start()
+                self.assertTrue(acquired.wait(5))
+                revision_thread.start()
+                release.set()
+                approval_thread.join(5)
+                revision_thread.join(5)
+                self.assertEqual(sorted(results), ["approval", "revision"], results)
+                self.assertEqual(store.get_audit(context.workspace_identity, audit.audit_id).status, AuditStatus.STALE)
+                self.assertFalse(store.validate_approval_current(approval))
+
+            with tempfile.TemporaryDirectory() as directory:
+                context, store, audit, approval, canonical = prepare(directory)
+                binding.update(plan_digest=approval.plan_digest, remote_snapshot_digest=approval.remote_snapshot_digest, operation_set_digest=approval.operation_set_digest)
+                save_revision(store, context, canonical)
+                with self.assertRaisesRegex(ValueError, "^approval_stale$"):
+                    store.record_approval(approval)
+                self.assertEqual(store.get_audit(context.workspace_identity, audit.audit_id).status, AuditStatus.STALE)
+                self.assertFalse(store.validate_approval_current(approval))
 
     def test_approval_rejects_empty_repository_and_naive_time(self):
         with tempfile.TemporaryDirectory() as directory:

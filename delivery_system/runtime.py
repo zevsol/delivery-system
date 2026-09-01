@@ -994,22 +994,32 @@ class SQLitePreviewStore:
                 and audit.status is AuditStatus.ACTIVE]
 
     def transition_audit_status(self, audit_id: str, status: AuditStatus, reason: str) -> AuditRecord:
-        current = self.get_audit(self.context.workspace_identity, audit_id)
-        updated = current.transition(status, reason)
         import json
         with closing(self._connect()) as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            event_no = connection.execute(
-                "SELECT COALESCE(MAX(event_no), 0)+1 FROM audit_history WHERE workspace_identity=? AND audit_id=?",
-                (self.context.workspace_identity, audit_id),
-            ).fetchone()[0]
-            connection.execute(
-                "INSERT INTO audit_history VALUES (?, ?, ?, ?, ?, ?)",
-                (self.context.workspace_identity, audit_id, event_no,
-                 json.dumps(updated.to_dict(), sort_keys=True), reason, datetime.now().astimezone().isoformat()),
-            )
-            connection.commit()
-        return updated
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT payload FROM audit_history WHERE workspace_identity=? AND audit_id=? ORDER BY event_no DESC LIMIT 1",
+                    (self.context.workspace_identity, audit_id),
+                ).fetchone()
+                if row is None:
+                    raise ValueError("audit_not_found")
+                current = AuditRecord.from_dict(json.loads(row[0]))
+                updated = current.transition(status, reason)
+                event_no = connection.execute(
+                    "SELECT COALESCE(MAX(event_no), 0)+1 FROM audit_history WHERE workspace_identity=? AND audit_id=?",
+                    (self.context.workspace_identity, audit_id),
+                ).fetchone()[0]
+                connection.execute(
+                    "INSERT INTO audit_history VALUES (?, ?, ?, ?, ?, ?)",
+                    (self.context.workspace_identity, audit_id, event_no,
+                     json.dumps(updated.to_dict(), sort_keys=True), reason, datetime.now().astimezone().isoformat()),
+                )
+                connection.commit()
+                return updated
+            except Exception:
+                connection.rollback()
+                raise
 
     def record_approval(self, approval: ApprovalRecord) -> None:
         import json

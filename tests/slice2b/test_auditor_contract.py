@@ -17,6 +17,7 @@ from delivery_system.auditor import (
     build_finding_id,
 )
 from delivery_system.runtime import (
+    AuditRecord,
     AuditResult,
     AuditStatus,
     InMemoryPreviewStore,
@@ -27,6 +28,31 @@ from delivery_system.runtime import (
 from delivery_system.protocol import digest
 from delivery_system.rules import build_registry_v1
 from tests.fakes.store_contract import run_auditor_store_contract
+
+
+class _BeginGateConnection:
+    def __init__(self, connection, acquired=None, release=None, attempting=None, allow_begin=None):
+        self._connection = connection
+        self._acquired = acquired
+        self._release = release
+        self._attempting = attempting
+        self._allow_begin = allow_begin
+
+    def execute(self, sql, *args):
+        if sql == "BEGIN IMMEDIATE" and self._attempting is not None:
+            self._attempting.set()
+        if sql == "BEGIN IMMEDIATE" and self._allow_begin is not None:
+            if not self._allow_begin.wait(5):
+                raise AssertionError("timed out waiting to allow BEGIN IMMEDIATE")
+        result = self._connection.execute(sql, *args)
+        if sql == "BEGIN IMMEDIATE" and self._acquired is not None:
+            self._acquired.set()
+            if not self._release.wait(5):
+                raise AssertionError("timed out waiting to release BEGIN IMMEDIATE")
+        return result
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
 
 
 def sourced(value, source="user_asserted"):
@@ -75,6 +101,41 @@ class AuditorContractTests(unittest.TestCase):
             for rule in self.registry.semantic_rules
             if rule.applicability == "Applicable"
         ]
+
+    def _audit_candidate(self, auditor, preview, audit_id, rationale):
+        context = auditor.get_context(preview["preview_id"], preview["revision"])
+        evaluations = [replace(item, rationale=rationale) for item in self._passed_evaluations()]
+        evaluation_payload, finding_payload = auditor._validate(context, evaluations, [])
+        payload = {
+            "workspace_identity": auditor.context.workspace_identity,
+            "preview_id": preview["preview_id"],
+            "revision": preview["revision"],
+            "audit_scope": context["audit_scope"],
+            "sealed_preview_digest": context["sealed_preview"]["sealed_preview_digest"],
+            "plan_digest": context["sealed_preview"]["plan_digest"],
+            "operation_set_digest": context["sealed_preview"]["operation_set_digest"],
+            "remote_snapshot_digest": context["sealed_preview"].get("remote_snapshot_digest"),
+            "audit_context_digest": context["audit_context_digest"],
+            "rule_registry_version": self.registry.registry_version,
+            "rule_registry_digest": self.registry.registry_digest,
+            "semantic_evaluations": evaluation_payload,
+            "findings": finding_payload,
+            "result": AuditResult.PASSED.value,
+        }
+        return AuditRecord.create(
+            audit_id, preview["preview_id"], preview["revision"],
+            payload["plan_digest"], payload["remote_snapshot_digest"],
+            payload["operation_set_digest"], AuditResult.PASSED,
+            workspace_identity=auditor.context.workspace_identity,
+            audit_scope=context["audit_scope"], audit_payload_digest=digest(payload),
+            audit_context_digest=context["audit_context_digest"],
+            rule_registry_version=self.registry.registry_version,
+            rule_registry_digest=self.registry.registry_digest,
+            rule_evaluations=tuple(evaluation_payload), findings=tuple(finding_payload),
+            evidence_refs=tuple(sorted(record["evidence_id"] for record in context["evidence_records"])),
+            sealed_preview_digest=payload["sealed_preview_digest"],
+            created_at="2026-08-11T00:00:00+00:00",
+        )
 
     def test_registry_digest_binds_contract_and_context_exposes_rules(self):
         context = self._context()
@@ -388,6 +449,144 @@ class AuditorContractTests(unittest.TestCase):
         self.assertTrue(all(not isinstance(result, Exception) for result in results), results)
         self.assertEqual(results[0].audit_id, results[1].audit_id)
         self.assertEqual(len(self.auditor.store._audits), 1)
+
+    def test_sqlite_concurrent_different_payloads_leave_one_active(self):
+        with tempfile.TemporaryDirectory() as directory:
+            context = RuntimeContext.from_workspace_root(directory)
+            store_a = SQLitePreviewStore(context, ignore_checker=lambda _: True, tracked_checker=lambda _: False)
+            store_b = SQLitePreviewStore(context, ignore_checker=lambda _: True, tracked_checker=lambda _: False)
+            preview = RuntimePlanner(context, store_a).preview(plan_payload())
+            auditor = RuntimeAuditor(context, store_a, self.registry)
+            candidate_a = self._audit_candidate(auditor, preview, "audit-a", "first")
+            candidate_b = self._audit_candidate(auditor, preview, "audit-b", "second")
+            acquired = threading.Event()
+            release = threading.Event()
+            attempting = threading.Event()
+            allow_begin = threading.Event()
+            original_connect = store_a._connect
+            store_a._connect = lambda: _BeginGateConnection(original_connect(), acquired, release)
+            original_connect_b = store_b._connect
+            store_b._connect = lambda: _BeginGateConnection(original_connect_b(), attempting=attempting, allow_begin=allow_begin)
+            results = []
+
+            def submit(store, candidate):
+                try:
+                    results.append(store.commit_audit(candidate))
+                except Exception as exc:
+                    results.append(exc)
+
+            first = threading.Thread(target=submit, args=(store_a, candidate_a))
+            second = threading.Thread(target=submit, args=(store_b, candidate_b))
+            first.start()
+            self.assertTrue(acquired.wait(5))
+            second.start()
+            self.assertTrue(attempting.wait(5))
+            release.set()
+            first.join(5)
+            self.assertFalse(first.is_alive())
+            allow_begin.set()
+            second.join(5)
+            self.assertFalse(second.is_alive())
+            self.assertEqual(len(results), 2)
+            self.assertTrue(all(not isinstance(result, Exception) for result in results), results)
+            audits = [store_a.get_audit(context.workspace_identity, audit_id)
+                      for audit_id in ("audit-a", "audit-b")]
+            self.assertEqual(sum(audit.status is AuditStatus.ACTIVE for audit in audits), 1)
+            self.assertEqual(sum(audit.status is AuditStatus.STALE for audit in audits), 1)
+
+    def test_sqlite_concurrent_identical_payloads_are_idempotent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            context = RuntimeContext.from_workspace_root(directory)
+            store_a = SQLitePreviewStore(context, ignore_checker=lambda _: True, tracked_checker=lambda _: False)
+            store_b = SQLitePreviewStore(context, ignore_checker=lambda _: True, tracked_checker=lambda _: False)
+            preview = RuntimePlanner(context, store_a).preview(plan_payload())
+            auditor = RuntimeAuditor(context, store_a, self.registry)
+            candidate = self._audit_candidate(auditor, preview, "audit-same", "same")
+            acquired = threading.Event()
+            release = threading.Event()
+            attempting = threading.Event()
+            allow_begin = threading.Event()
+            original_connect = store_a._connect
+            store_a._connect = lambda: _BeginGateConnection(original_connect(), acquired, release)
+            original_connect_b = store_b._connect
+            store_b._connect = lambda: _BeginGateConnection(original_connect_b(), attempting=attempting, allow_begin=allow_begin)
+            results = []
+
+            def submit(store):
+                try:
+                    results.append(store.commit_audit(candidate))
+                except Exception as exc:
+                    results.append(exc)
+
+            first = threading.Thread(target=submit, args=(store_a,))
+            second = threading.Thread(target=submit, args=(store_b,))
+            first.start()
+            self.assertTrue(acquired.wait(5))
+            second.start()
+            self.assertTrue(attempting.wait(5))
+            release.set()
+            first.join(5)
+            self.assertFalse(first.is_alive())
+            allow_begin.set()
+            second.join(5)
+            self.assertFalse(second.is_alive())
+            self.assertEqual(len(results), 2)
+            self.assertTrue(all(not isinstance(result, Exception) for result in results), results)
+            self.assertEqual(results[0].audit_id, results[1].audit_id)
+            self.assertEqual(len(store_a._current_audits(context.workspace_identity)), 1)
+
+    def test_sqlite_transition_rechecks_current_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            context = RuntimeContext.from_workspace_root(directory)
+            store = SQLitePreviewStore(context, ignore_checker=lambda _: True, tracked_checker=lambda _: False)
+            preview = RuntimePlanner(context, store).preview(plan_payload())
+            auditor = RuntimeAuditor(context, store, self.registry)
+            candidate = self._audit_candidate(auditor, preview, "audit-transition", "same")
+            store.commit_audit(candidate)
+            store_a = SQLitePreviewStore(context, ignore_checker=lambda _: True, tracked_checker=lambda _: False)
+            store_b = SQLitePreviewStore(context, ignore_checker=lambda _: True, tracked_checker=lambda _: False)
+            observed = threading.Barrier(2)
+            acquired = threading.Event()
+            release = threading.Event()
+            attempting = threading.Event()
+            allow_begin = threading.Event()
+            original_get_audit_a = store_a.get_audit
+            original_get_audit_b = store_b.get_audit
+            def get_then_wait(original, *args):
+                current = original(*args)
+                observed.wait(5)
+                return current
+
+            store_a.get_audit = lambda *args: get_then_wait(original_get_audit_a, *args)
+            store_b.get_audit = lambda *args: get_then_wait(original_get_audit_b, *args)
+            original_connect_a = store_a._connect
+            store_a._connect = lambda: _BeginGateConnection(original_connect_a(), acquired, release)
+            original_connect_b = store_b._connect
+            store_b._connect = lambda: _BeginGateConnection(original_connect_b(), attempting=attempting, allow_begin=allow_begin)
+            results = []
+
+            def transition(store, status):
+                try:
+                    results.append(store.transition_audit_status("audit-transition", status, "race"))
+                except Exception as exc:
+                    results.append(exc)
+
+            first = threading.Thread(target=transition, args=(store_a, AuditStatus.INVALID))
+            second = threading.Thread(target=transition, args=(store_b, AuditStatus.STALE))
+            first.start()
+            second.start()
+            self.assertTrue(acquired.wait(5))
+            self.assertTrue(attempting.wait(5))
+            release.set()
+            first.join(5)
+            self.assertFalse(first.is_alive())
+            allow_begin.set()
+            second.join(5)
+            self.assertFalse(second.is_alive())
+            self.assertEqual(len(results), 2)
+            self.assertEqual(sum(not isinstance(result, Exception) for result in results), 1, results)
+            self.assertEqual(sum(isinstance(result, ValueError) and str(result) == "invalid audit status transition" for result in results), 1, results)
+            self.assertEqual(store.get_audit(context.workspace_identity, "audit-transition").status, AuditStatus.INVALID)
 
     def test_finding_ref_rename_preserves_finding_and_audit_identity(self):
         context = self._context()
