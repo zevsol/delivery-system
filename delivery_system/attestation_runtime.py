@@ -266,7 +266,8 @@ class RuntimeAttestationOrchestrationService:
             return _failure("attestation_preview_integrity_invalid")
         if stored_revision != revision:
             return _failure("attestation_preview_stale")
-        if stored_canonical.get("preview_level") != PreviewLevel.REPOSITORY_AWARE.value:
+        accepted_levels = {PreviewLevel.REPOSITORY_AWARE.value, PreviewLevel.WRITE_ELIGIBLE.value}
+        if stored_canonical.get("preview_level") not in accepted_levels:
             return _failure("attestation_preview_not_repository_aware")
         try:
             context = AuditContextService(self.__context, self.__store, self.__trust).get(preview_id, revision)
@@ -285,7 +286,7 @@ class RuntimeAttestationOrchestrationService:
             return _failure("attestation_preview_integrity_invalid")
         if canonical.get("workspace_identity") != self.__context.workspace_identity:
             return _failure("attestation_preview_integrity_invalid")
-        if canonical.get("preview_level") != PreviewLevel.REPOSITORY_AWARE.value:
+        if canonical.get("preview_level") not in accepted_levels:
             return _failure("attestation_preview_not_repository_aware")
         if canonical.get("preview_id") != preview_id or canonical.get("revision") != revision:
             return _failure("attestation_preview_stale")
@@ -306,7 +307,7 @@ class RuntimeAttestationOrchestrationService:
             return _failure("attestation_audit_not_active")
         if audit.result is not AuditResult.PASSED:
             return _failure("attestation_audit_not_passed")
-        if audit.audit_scope != PreviewLevel.REPOSITORY_AWARE.value or not audit.audit_context_digest:
+        if audit.audit_scope != canonical.get("preview_level") or not audit.audit_context_digest:
             return _failure("attestation_audit_binding_mismatch")
         if not audit.verify_digest():
             return _failure("attestation_audit_binding_mismatch")

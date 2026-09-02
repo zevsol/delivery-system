@@ -101,7 +101,7 @@ class PreviewOutput(StrictModel):
     planner_observations: list[dict[str, Any]]
     evidence_ids: list[str]
     stale: bool
-    write_eligible: Literal[False]
+    write_eligible: bool
     items: list[dict[str, Any]]
     sealed_preview_digest: str
     audit_context_digest: str
@@ -172,7 +172,7 @@ class RecordAuditOutput(StrictModel):
     status: Literal["Active", "Stale", "Invalid"]
     findings: list[dict[str, Any]]
     rule_evaluations: list[dict[str, Any]]
-    approval_eligible: Literal[False]
+    approval_eligible: bool
 
 
 def create_server(context: RuntimeContext | None = None, store: Any | None = None, driver: Any = None,
@@ -245,7 +245,7 @@ def create_server(context: RuntimeContext | None = None, store: Any | None = Non
             "status": audit.status.value,
             "findings": list(audit.findings),
             "rule_evaluations": list(audit.rule_evaluations),
-            "approval_eligible": False,
+            "approval_eligible": audit.approval_eligible,
         })
 
     return mcp

@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timezone
 import hashlib
+import copy
 import tempfile
 import threading
 import unittest
@@ -21,7 +22,7 @@ from delivery_system.attestation_persistence_store import SQLiteAttestationPersi
 from delivery_system.drivers.contract import DriverReadResponse, DriverTrustContext
 from delivery_system.protocol import canonical_payload, digest
 from delivery_system.rules import SemanticOutcome, build_registry_v1
-from delivery_system.runtime import AuditResult, InMemoryPreviewStore, RuntimeContext, RuntimePlanner
+from delivery_system.runtime import AuditResult, InMemoryPreviewStore, PreviewLevel, RuntimeContext, RuntimePlanner
 from tests.attestation_contract.test_attestation_contract import FakeCapabilityPolicy, FakeIssuer
 from tests.fakes.attestation_persistence_store_contract import artifact_for
 from tests.fakes.attestation_provider import FakeCapabilityResolver, FakeCredentialCapabilityProvider
@@ -121,6 +122,36 @@ class OrchestrationTests(unittest.TestCase):
         self.assertTrue(self.service.accepts_binding(binding))
         self.assertIs(self.service.lookup_binding(binding.binding_id), binding)
         self.assertFalse(self.preview["write_eligible"])
+
+    def test_write_eligible_preview_enters_existing_capability_orchestration(self):
+        valid_store = InMemoryPreviewStore(self.context.workspace_identity, TRUST)
+        valid_plan = copy.deepcopy(plan())
+        valid_plan["operation_intents"] = [{
+            "operation_kind": "create_issue", "client_refs": ["item"], "depends_on": [],
+        }]
+        preview = RuntimePlanner(
+            self.context, valid_store, FakeReadOnlyDriver(node_id="node-1"), TRUST
+        ).preview(valid_plan)
+        self.assertEqual(preview["preview_level"], PreviewLevel.WRITE_ELIGIBLE.value)
+        auditor = RuntimeAuditor(self.context, valid_store, build_registry_v1(), TRUST)
+        audit_context = auditor.get_context(preview["preview_id"], preview["revision"])
+        evaluations = [
+            RuleEvaluationDraft(rule["rule_id"], rule["rule_version"], SemanticOutcome.PASSED, "verified")
+            for rule in audit_context["semantic_rule_contexts"] if rule["applicability"] == "Applicable"
+        ]
+        audit = auditor.record_audit(
+            preview["preview_id"], preview["revision"], audit_context["audit_context_digest"], evaluations, []
+        )
+        service = RuntimeAttestationOrchestrationService(
+            self.context, valid_store, TRUST,
+            AttestationRuntimeBoundary(self.fake_issuer, self.fake_issuer, self.fake_issuer, FakeCapabilityPolicy()),
+            self.provider, self.resolver, clock=lambda: NOW,
+        )
+        result = service.orchestrate(preview["preview_id"], preview["revision"])
+        self.assertTrue(result.success)
+        assert result.binding is not None
+        self.assertEqual(result.binding.audit_id, audit.audit_id)
+        self.assertEqual(result.binding.required_capabilities, ("issues:write",))
 
     def test_github_app_provider_is_accepted_by_existing_runtime_orchestration(self):
         signer = Signer()

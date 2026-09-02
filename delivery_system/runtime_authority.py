@@ -38,7 +38,7 @@ class RuntimePromotion:
 
 
 def _reload_promotion(store: Any, canonical: Mapping[str, Any], evidence: Sequence[Mapping[str, Any]]) -> RuntimePromotion | None:
-    if canonical.get("preview_level") != PreviewLevel.REPOSITORY_AWARE.value:
+    if canonical.get("preview_level") not in {PreviewLevel.REPOSITORY_AWARE.value, PreviewLevel.WRITE_ELIGIBLE.value}:
         return None
     trust = getattr(store, "trust_context", None)
     if trust is None:
