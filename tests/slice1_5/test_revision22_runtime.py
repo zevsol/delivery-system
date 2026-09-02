@@ -397,17 +397,9 @@ class Revision22RuntimeTests(unittest.TestCase):
                 canonical_payload=canonical, evidence_records=[],
             )
 
-        binding = {
-            "plan_digest": "sha256:test-plan",
-            "remote_snapshot_digest": "sha256:test-remote",
-            "operation_set_digest": "sha256:test-ops",
-            "repository_identity": "repo",
-        }
-        with patch("delivery_system.runtime._preview_is_approval_eligible", return_value=True), \
-                patch("delivery_system.runtime._preview_binding_value", side_effect=lambda _preview, key: binding[key]):
+        with patch("delivery_system.runtime._validate_approval_against_current_preview", return_value=True):
             with tempfile.TemporaryDirectory() as directory:
                 context, store, audit, approval, canonical = prepare(directory)
-                binding.update(plan_digest=approval.plan_digest, remote_snapshot_digest=approval.remote_snapshot_digest, operation_set_digest=approval.operation_set_digest)
                 acquired = threading.Event()
                 release = threading.Event()
                 original_connect = store._connect
@@ -435,13 +427,14 @@ class Revision22RuntimeTests(unittest.TestCase):
                 release.set()
                 approval_thread.join(5)
                 revision_thread.join(5)
-                self.assertEqual(sorted(results), ["approval", "revision"], results)
+                errors = [value for value in results if isinstance(value, BaseException)]
+                self.assertEqual(errors, [], results)
+                self.assertEqual(sorted(results), ["approval", "revision"])
                 self.assertEqual(store.get_audit(context.workspace_identity, audit.audit_id).status, AuditStatus.STALE)
                 self.assertFalse(store.validate_approval_current(approval))
 
             with tempfile.TemporaryDirectory() as directory:
                 context, store, audit, approval, canonical = prepare(directory)
-                binding.update(plan_digest=approval.plan_digest, remote_snapshot_digest=approval.remote_snapshot_digest, operation_set_digest=approval.operation_set_digest)
                 save_revision(store, context, canonical)
                 with self.assertRaisesRegex(ValueError, "^approval_stale$"):
                     store.record_approval(approval)
