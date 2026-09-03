@@ -1,0 +1,15 @@
+interface:
+  display_name: "Approve GitHub Work Items"
+  short_description: "Record explicit approval for a Sealed Preview"
+  default_prompt: "Use $approve-github-work-items to record explicit Human Approval for a Delivery System Sealed Preview without writing to GitHub."
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "delivery_get_audit_context"
+      description: "Read the sealed Preview context before the approval ceremony; it does not write to GitHub"
+      transport: "stdio"
+    - type: "mcp"
+      value: "delivery_record_approval"
+      description: "Record explicit Human Approval locally; it does not issue ApplicationAuthority or write to GitHub"
+      transport: "stdio"
