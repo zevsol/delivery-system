@@ -363,7 +363,10 @@ class Slice2ASealedPreviewTests(unittest.TestCase):
                     return tools, result
 
             tools, result = asyncio.run(exercise())
-            self.assertEqual({tool.name for tool in tools.tools}, {"delivery_plan_preview", "delivery_get_audit_context", "delivery_record_audit"})
+            self.assertEqual({tool.name for tool in tools.tools}, {
+                "delivery_plan_preview", "delivery_get_audit_context", "delivery_record_audit",
+                "delivery_record_approval", "delivery_issue_application_authority",
+            })
             self.assertFalse(result.is_error)
             self.assertEqual(result.structured_content["context_status"], "audit_ready")
             self.assertEqual(result.structured_content["rule_registry_version"], "1.0")

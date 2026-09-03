@@ -3,20 +3,23 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 from typing import Any, Literal
 
 from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
-from delivery_system.runtime import AuditContextService, RuntimeContext, RuntimePlanner, SQLitePreviewStore
+from delivery_system.runtime import (
+    AuditContextService, RuntimeApprovalAuthorityService, RuntimeContext, RuntimePlanner, SQLitePreviewStore,
+)
 from delivery_system.drivers.contract import DriverTrustContext
 from delivery_system.auditor import FindingDraft, RuleEvaluationDraft, RuntimeAuditor
 from delivery_system.rules import ResultClass, RuleRegistry, SemanticOutcome, build_registry_v1
 
 
 SERVER_NAME = "delivery-system-planner"
-SERVER_VERSION = "0.3.0"
+SERVER_VERSION = "0.4.0"
 TOOL_NAME = "delivery_plan_preview"
 TOOL_ANNOTATIONS = ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=False)
 
@@ -175,14 +178,86 @@ class RecordAuditOutput(StrictModel):
     approval_eligible: bool
 
 
+class RecordApprovalInput(StrictModel):
+    preview_id: str = Field(min_length=1)
+    revision: StrictInt = Field(ge=1)
+    approval_command: str
+    approver_claim: str
+
+
+class RecordApprovalOutput(StrictModel):
+    approval_id: str
+    audit_id: str
+    audit_digest: str
+    audit_result: Literal["Passed"]
+    preview_id: str
+    revision: int
+    plan_digest: str
+    remote_snapshot_digest: str
+    operation_set_digest: str
+    repository_identity: str
+    approval_command: str
+    approver_claim: str
+    approved_at: str
+    status: Literal["valid"]
+
+
+class IssueApplicationAuthorityInput(StrictModel):
+    preview_id: str = Field(min_length=1)
+    revision: StrictInt = Field(ge=1)
+    approval_id: str = Field(min_length=1)
+
+
+class IssueApplicationAuthorityOutput(StrictModel):
+    authority_id: str
+    workspace_identity: str
+    repository_identity: str
+    preview_id: str
+    revision: int
+    sealed_preview_digest: str
+    plan_digest: str
+    operation_set_digest: str
+    remote_snapshot_digest: str
+    audit_id: str
+    audit_digest: str
+    approval_id: str
+    approval_digest: str
+    credential_binding_id: str
+    credential_instance_id: str
+    issuer_id: str
+    credential_principal_identity: str
+    github_subject_identity: str
+    driver_identity: str
+    remote_authority: str
+    required_capabilities: tuple[str, ...]
+    granted_capabilities: tuple[str, ...]
+    issued_at: str
+    expires_at: str
+
+
+def _production_clock() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def create_server(context: RuntimeContext | None = None, store: Any | None = None, driver: Any = None,
-                  trust_context: DriverTrustContext | None = None) -> MCPServer:
+                  trust_context: DriverTrustContext | None = None,
+                  approval_authority_service: RuntimeApprovalAuthorityService | None = None) -> MCPServer:
     if (driver is None) != (trust_context is None):
         raise ValueError("driver_trust_context_required")
     if store is not None and trust_context is not None:
         existing = getattr(store, "trust_context", None)
         if existing is not None and existing != trust_context:
             raise ValueError("driver_trust_context_mismatch")
+    if approval_authority_service is not None:
+        if not isinstance(approval_authority_service, RuntimeApprovalAuthorityService):
+            raise ValueError("approval_runtime_boundary_invalid")
+        if ((context is not None and approval_authority_service.context != context) or
+                (store is not None and approval_authority_service.store is not store)):
+            raise ValueError("approval_runtime_boundary_invalid")
+    elif context is not None and store is not None:
+        approval_authority_service = RuntimeApprovalAuthorityService(
+            context, store, None, clock=_production_clock,
+        )
     mcp = MCPServer(SERVER_NAME)
     registry = build_registry_v1()
 
@@ -247,6 +322,40 @@ def create_server(context: RuntimeContext | None = None, store: Any | None = Non
             "rule_evaluations": list(audit.rule_evaluations),
             "approval_eligible": audit.approval_eligible,
         })
+
+    @mcp.tool(
+        name="delivery_record_approval",
+        description="Record explicit Human Approval for the current audited preview; it never writes GitHub.",
+        annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=False),
+        structured_output=True,
+    )
+    def delivery_record_approval(payload: RecordApprovalInput) -> RecordApprovalOutput:
+        if context is None or store is None:
+            raise ValueError("workspace_identity_unavailable")
+        if approval_authority_service is None:
+            raise ValueError("approval_runtime_boundary_invalid")
+        approval = approval_authority_service.record_approval(
+            payload.preview_id, payload.revision, payload.approval_command, payload.approver_claim,
+        )
+        return RecordApprovalOutput.model_validate(approval.to_dict())
+
+    @mcp.tool(
+        name="delivery_issue_application_authority",
+        description="Issue Runtime ApplicationAuthority for an explicitly approved preview; it never writes GitHub.",
+        annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=True),
+        structured_output=True,
+    )
+    def delivery_issue_application_authority(payload: IssueApplicationAuthorityInput) -> IssueApplicationAuthorityOutput:
+        if context is None or store is None:
+            raise ValueError("workspace_identity_unavailable")
+        if approval_authority_service is None or approval_authority_service.attestation_service is None:
+            raise ValueError("attestation_service_unavailable")
+        authority = approval_authority_service.issue_application_authority(
+            payload.preview_id, payload.revision, payload.approval_id,
+        )
+        if not approval_authority_service.validate_application_authority(authority):
+            raise ValueError("application_authority_rejected")
+        return IssueApplicationAuthorityOutput.model_validate(authority.to_dict())
 
     return mcp
 
