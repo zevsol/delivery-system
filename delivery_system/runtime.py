@@ -725,6 +725,11 @@ class InMemoryPreviewStore:
             raise ValueError("approval_binding_mismatch")
         scope = next((scope for (scope, identifier), value in self._audits.items()
                       if identifier == approval.audit_id and value.preview_id == approval.preview_id), "")
+        existing = self._approvals.get((scope, approval.approval_id))
+        if existing is not None:
+            if existing.to_dict() == approval.to_dict():
+                return
+            raise ValueError("approval_binding_conflict")
         self._approvals[(scope, approval.approval_id)] = approval
 
     def get_approval(self, workspace_identity: str, approval_id: str) -> ApprovalRecord:
@@ -1177,11 +1182,41 @@ class SQLitePreviewStore:
                 ).fetchone()[0]
                 if latest != approval.revision:
                     raise ValueError("approval_stale")
-                connection.execute(
-                    "INSERT INTO records(workspace_identity, record_type, record_id, revision, payload) VALUES (?, 'approval', ?, ?, ?)",
-                    (self.context.workspace_identity, approval.approval_id, approval.revision,
-                     json.dumps(approval.to_dict(), sort_keys=True)),
-                )
+                existing_row = connection.execute(
+                    "SELECT payload FROM records WHERE workspace_identity=? AND record_type='approval' AND record_id=? ORDER BY revision DESC LIMIT 1",
+                    (self.context.workspace_identity, approval.approval_id),
+                ).fetchone()
+                if existing_row is not None:
+                    existing = ApprovalRecord.from_dict(json.loads(existing_row[0]))
+                    if existing.to_dict() == approval.to_dict():
+                        connection.commit()
+                        return
+                    raise ValueError("approval_binding_conflict")
+                try:
+                    connection.execute(
+                        "INSERT INTO records(workspace_identity, record_type, record_id, revision, payload) VALUES (?, 'approval', ?, ?, ?)",
+                        (self.context.workspace_identity, approval.approval_id, approval.revision,
+                         json.dumps(approval.to_dict(), sort_keys=True)),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raced_row = connection.execute(
+                        "SELECT payload FROM records WHERE workspace_identity=? AND record_type='approval' AND record_id=? ORDER BY revision DESC LIMIT 1",
+                        (self.context.workspace_identity, approval.approval_id),
+                    ).fetchone()
+                    if raced_row is None:
+                        raise ValueError("approval_invalid") from exc
+                    try:
+                        raced = ApprovalRecord.from_dict(json.loads(raced_row[0]))
+                    except ValueError as parse_error:
+                        raise ValueError("approval_invalid") from parse_error
+                    if raced.to_dict() != approval.to_dict():
+                        raise ValueError("approval_binding_conflict") from exc
+                    if (not _validate_approval_against_current_preview(
+                            raced, audit, preview, self.context.workspace_identity
+                        ) or latest != approval.revision):
+                        raise ValueError("approval_stale") from exc
+                    connection.commit()
+                    return
                 connection.commit()
             except Exception as exc:
                 connection.rollback()
@@ -1199,13 +1234,7 @@ class SQLitePreviewStore:
         if row is None:
             raise ValueError("approval_not_found")
         data = json.loads(row[0])
-        return ApprovalRecord(
-            data["approval_id"], data["audit_id"], data["audit_digest"],
-            AuditResult(data["audit_result"]), data["preview_id"], data["revision"],
-            data["plan_digest"], data["remote_snapshot_digest"], data["operation_set_digest"],
-            data["repository_identity"], data["approval_command"], data["approver_claim"],
-            data["approved_at"], data["status"],
-        )
+        return ApprovalRecord.from_dict(data)
 
     def validate_approval_current(self, approval: ApprovalRecord) -> bool:
         if not approval.is_structurally_valid():
@@ -1543,3 +1572,213 @@ class AuditContextService:
             "rule_registry_version": None,
             "rule_registry_digest": None,
         }
+
+
+class RuntimeApprovalAuthorityService:
+    """Runtime-owned bridge from explicit approval to immutable authority."""
+
+    def __init__(self, context: RuntimeContext, store: PreviewStore, attestation_service: Any,
+                 *, clock: Callable[[], datetime]) -> None:
+        if not isinstance(context, RuntimeContext) or not callable(clock):
+            raise TypeError("approval_runtime_boundary_invalid")
+        self.context = context
+        self.store = store
+        self.attestation_service = attestation_service
+        self.clock = clock
+        self._lock = threading.RLock()
+        self._authorities: dict[str, Any] = {}
+
+    @staticmethod
+    def _approval_id(audit: AuditRecord) -> str:
+        return "approval-" + hashlib.sha256(canonical_payload({
+            "domain": "delivery-system:human-approval:v1",
+            "workspace_identity": audit.workspace_identity,
+            "audit_id": audit.audit_id,
+            "audit_digest": audit.audit_digest,
+            "preview_id": audit.preview_id,
+            "revision": audit.revision,
+        }).encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _approval_digest(approval: ApprovalRecord) -> str:
+        return digest({"domain": "delivery-system:approval-binding:v1", "approval": approval.to_dict()})
+
+    @staticmethod
+    def _utc(value: datetime) -> str:
+        if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("approval_invalid")
+        return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def _resolve_audit(self, preview_id: str, revision: int) -> tuple[dict[str, Any], AuditRecord]:
+        try:
+            preview = self.store.get_preview(self.context.workspace_identity, preview_id)
+        except ValueError as exc:
+            raise ValueError("preview_not_found") from exc
+        if preview.get("revision") != revision:
+            raise ValueError("preview_stale")
+        audits = self.store.list_active_audits(self.context.workspace_identity, preview_id, revision)
+        if not audits:
+            raise ValueError("audit_not_found")
+        if len(audits) != 1:
+            raise ValueError("approval_audit_ambiguous")
+        audit = audits[0]
+        if not audit.verify_digest() or not audit.approval_eligible:
+            raise ValueError("audit_stale")
+        return preview, audit
+
+    def record_approval(self, preview_id: str, revision: int, approval_command: str,
+                        approver_claim: str) -> ApprovalRecord:
+        if (not isinstance(preview_id, str) or not preview_id or
+                not isinstance(revision, int) or isinstance(revision, bool) or revision < 1 or
+                not isinstance(approval_command, str) or not isinstance(approver_claim, str) or
+                not approver_claim.strip()):
+            raise ValueError("approval_invalid")
+        claim = approver_claim.strip()
+        with self._lock:
+            preview, audit = self._resolve_audit(preview_id, revision)
+            if approval_command != f"批准写入 {preview_id} {revision}":
+                raise ValueError("approval_command_invalid")
+            canonical = preview.get("canonical_payload")
+            repository_identity = canonical.get("repository_identity") if isinstance(canonical, Mapping) else None
+            if not isinstance(repository_identity, str) or not repository_identity:
+                raise ValueError("approval_binding_mismatch")
+            candidate = ApprovalRecord.create(
+                self._approval_id(audit), audit, repository_identity, claim,
+                self._utc(self.clock()), approval_command,
+            )
+            try:
+                existing = self.store.get_approval(self.context.workspace_identity, candidate.approval_id)
+            except ValueError as exc:
+                if str(exc) != "approval_not_found":
+                    raise
+                self.store.record_approval(candidate)
+                return self.store.get_approval(self.context.workspace_identity, candidate.approval_id)
+            if not self.store.validate_approval_current(existing):
+                raise ValueError("approval_stale")
+            existing_data = existing.to_dict()
+            candidate_data = candidate.to_dict()
+            existing_data.pop("approved_at")
+            candidate_data.pop("approved_at")
+            if existing_data != candidate_data:
+                raise ValueError("approval_binding_conflict")
+            return existing
+
+    def issue_application_authority(self, preview_id: str, revision: int, approval_id: str) -> Any:
+        from delivery_system.application_authority import ApplicationAuthority, _AUTHORITY_MARKER
+        if not isinstance(approval_id, str) or not approval_id:
+            raise ValueError("application_authority_rejected")
+        with self._lock:
+            preview, audit = self._resolve_audit(preview_id, revision)
+            if approval_id != self._approval_id(audit):
+                raise ValueError("approval_binding_mismatch")
+            try:
+                approval = self.store.get_approval(self.context.workspace_identity, approval_id)
+            except ValueError as exc:
+                raise ValueError("approval_not_found") from exc
+            if not self.store.validate_approval_current(approval):
+                raise ValueError("approval_stale")
+            result = self.attestation_service.orchestrate(preview_id, revision)
+            if not result.success or result.binding is None:
+                code = result.failures[0].code if result.failures else "credential_binding_mismatch"
+                raise ValueError(code)
+            binding = self.attestation_service.resolve_registered_binding(result.binding.binding_id)
+            canonical = preview.get("canonical_payload")
+            if not isinstance(canonical, Mapping):
+                raise ValueError("application_authority_rejected")
+            try:
+                if datetime.fromisoformat(binding.expires_at.replace("Z", "+00:00")) <= self.clock().astimezone(timezone.utc):
+                    raise ValueError("credential_binding_mismatch")
+            except AttributeError as exc:
+                raise ValueError("credential_binding_mismatch") from exc
+            required = tuple(binding.required_capabilities)
+            granted = tuple(binding.granted_capabilities)
+            if "issues:write" not in required or not set(required).issubset(granted) or "issues:write" not in granted:
+                raise ValueError("credential_capability_insufficient")
+            values = {
+                "authority_id": "",
+                "workspace_identity": self.context.workspace_identity,
+                "repository_identity": canonical.get("repository_identity"),
+                "preview_id": preview_id, "revision": revision,
+                "sealed_preview_digest": canonical.get("sealed_preview_digest"),
+                "plan_digest": canonical.get("plan_digest"),
+                "operation_set_digest": canonical.get("operation_set_digest"),
+                "remote_snapshot_digest": canonical.get("remote_snapshot_digest"),
+                "audit_id": audit.audit_id, "audit_digest": audit.audit_digest,
+                "approval_id": approval.approval_id, "approval_digest": self._approval_digest(approval),
+                "credential_binding_id": binding.binding_id,
+                "credential_instance_id": binding.credential_instance_id, "issuer_id": binding.issuer_id,
+                "credential_principal_identity": binding.credential_principal_identity,
+                "github_subject_identity": binding.github_subject_identity,
+                "driver_identity": binding.driver_identity, "remote_authority": binding.remote_authority,
+                "required_capabilities": required, "granted_capabilities": granted,
+                "issued_at": self._utc(self.clock()), "expires_at": binding.expires_at,
+            }
+            for field in ("workspace_identity", "repository_identity", "preview_id", "revision", "plan_digest",
+                          "sealed_preview_digest", "operation_set_digest", "remote_snapshot_digest"):
+                if getattr(binding, field, None) != values[field]:
+                    raise ValueError("credential_binding_mismatch")
+            for field in ("audit_id", "audit_digest"):
+                if getattr(binding, field, None) != values[field]:
+                    raise ValueError("credential_binding_mismatch")
+            if (binding.remote_authority != values["remote_authority"] or
+                    binding.driver_identity != values["driver_identity"] or
+                    binding.credential_instance_id != values["credential_instance_id"] or
+                    binding.issuer_id != values["issuer_id"] or
+                    binding.credential_principal_identity != values["credential_principal_identity"] or
+                    binding.github_subject_identity != values["github_subject_identity"] or
+                    tuple(binding.granted_capabilities) != granted):
+                raise ValueError("credential_binding_mismatch")
+            values["authority_id"] = ApplicationAuthority.expected_id(values)
+            existing = self._authorities.get(values["authority_id"])
+            if existing is not None:
+                return existing
+            authority = ApplicationAuthority._create(values, _marker=_AUTHORITY_MARKER)
+            self._authorities[authority.authority_id] = authority
+            return authority
+
+    def validate_application_authority(self, authority: Any) -> bool:
+        from delivery_system.application_authority import ApplicationAuthority
+        with self._lock:
+            if type(authority) is not ApplicationAuthority:
+                return False
+            try:
+                values = authority.to_dict()
+                if ApplicationAuthority.expected_id(values) != values["authority_id"]:
+                    return False
+                if self._authorities.get(values["authority_id"]) is not authority:
+                    return False
+                preview, audit = self._resolve_audit(values["preview_id"], values["revision"])
+                approval = self.store.get_approval(self.context.workspace_identity, values["approval_id"])
+                if not self.store.validate_approval_current(approval):
+                    return False
+                if values["approval_digest"] != self._approval_digest(approval):
+                    return False
+                binding = self.attestation_service.resolve_registered_binding(values["credential_binding_id"])
+                if values["audit_id"] != audit.audit_id or values["audit_digest"] != audit.audit_digest:
+                    return False
+                if values["required_capabilities"] != tuple(binding.required_capabilities):
+                    return False
+                if values["granted_capabilities"] != tuple(binding.granted_capabilities):
+                    return False
+                if not set(values["required_capabilities"]).issubset(tuple(binding.granted_capabilities)):
+                    return False
+                if "issues:write" not in values["required_capabilities"]:
+                    return False
+                expiry = datetime.fromisoformat(values["expires_at"].replace("Z", "+00:00"))
+                if expiry <= self.clock().astimezone(timezone.utc):
+                    return False
+                canonical = preview["canonical_payload"]
+                if any(values[field] != getattr(binding, field, None) for field in (
+                    "workspace_identity", "repository_identity", "preview_id", "revision", "plan_digest",
+                    "sealed_preview_digest", "operation_set_digest", "remote_snapshot_digest",
+                    "audit_id", "audit_digest", "credential_instance_id", "issuer_id",
+                    "credential_principal_identity", "github_subject_identity", "driver_identity",
+                    "remote_authority", "expires_at",
+                )):
+                    return False
+                return all(values[field] == canonical.get(field) for field in (
+                    "workspace_identity", "repository_identity", "preview_id", "revision",
+                    "sealed_preview_digest", "plan_digest", "operation_set_digest", "remote_snapshot_digest",
+                ))
+            except Exception:
+                return False

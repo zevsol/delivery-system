@@ -477,6 +477,15 @@ class RuntimeAttestationOrchestrationService:
                 return None
             return binding
 
+    def resolve_registered_binding(self, binding_id: str) -> RuntimeCredentialCapabilityBinding:
+        """Resolve an intact binding owned by this Runtime service."""
+        if not isinstance(binding_id, str) or not binding_id:
+            raise ValueError("credential_binding_mismatch")
+        binding = self.lookup_binding(binding_id)
+        if binding is None:
+            raise ValueError("credential_binding_mismatch")
+        return binding
+
     def accepts_binding(self, binding: RuntimeCredentialCapabilityBinding) -> bool:
         with self.__lock:
             return type(binding) is RuntimeCredentialCapabilityBinding and self._registered_binding_is_intact(binding)

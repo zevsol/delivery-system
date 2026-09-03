@@ -264,3 +264,25 @@ class ApprovalRecord:
         if isinstance(self.audit_result, AuditResult):
             result["audit_result"] = self.audit_result.value
         return result
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "ApprovalRecord":
+        if not isinstance(data, Mapping):
+            raise ValueError("approval_invalid")
+        required = {
+            "approval_id", "audit_id", "audit_digest", "audit_result", "preview_id", "revision",
+            "plan_digest", "remote_snapshot_digest", "operation_set_digest", "repository_identity",
+            "approval_command", "approver_claim", "approved_at", "status",
+        }
+        if set(data) != required:
+            raise ValueError("approval_invalid")
+        try:
+            return cls(
+                data["approval_id"], data["audit_id"], data["audit_digest"],
+                AuditResult(data["audit_result"]), data["preview_id"], data["revision"],
+                data["plan_digest"], data["remote_snapshot_digest"], data["operation_set_digest"],
+                data["repository_identity"], data["approval_command"], data["approver_claim"],
+                data["approved_at"], data["status"],
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("approval_invalid") from exc
