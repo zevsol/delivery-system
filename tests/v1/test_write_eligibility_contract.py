@@ -286,7 +286,10 @@ class WriteEligibilityRuntimeTests(unittest.TestCase):
             preview, audit, tools = asyncio.run(exercise())
             self.assertTrue(preview.structured_content["write_eligible"])
             self.assertTrue(audit.structured_content["approval_eligible"])
-            self.assertEqual({tool.name for tool in tools.tools}, {"delivery_plan_preview", "delivery_get_audit_context", "delivery_record_audit"})
+            self.assertEqual({tool.name for tool in tools.tools}, {
+                "delivery_plan_preview", "delivery_get_audit_context", "delivery_record_audit",
+                "delivery_record_approval", "delivery_issue_application_authority",
+            })
 
 
 if __name__ == "__main__":
