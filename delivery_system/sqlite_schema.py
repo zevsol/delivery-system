@@ -18,6 +18,15 @@ _V4_TABLES = _V3_TABLES + (
     "attestation_binding_references",
     "attestation_revalidation_events",
 )
+_V6_TABLES = _V4_TABLES + (
+    "application_execution", "operation_attempts", "operation_receipts", "application_receipts",
+)
+_V6_LAYOUT = {
+    "application_execution": (("workspace_identity", "TEXT", 1, None, 1), ("application_id", "TEXT", 1, None, 2), ("payload", "TEXT", 1, None, 0)),
+    "operation_attempts": (("workspace_identity", "TEXT", 1, None, 1), ("application_id", "TEXT", 1, None, 2), ("operation_identity", "TEXT", 1, None, 3), ("payload", "TEXT", 1, None, 0)),
+    "operation_receipts": (("workspace_identity", "TEXT", 1, None, 1), ("application_id", "TEXT", 1, None, 2), ("operation_identity", "TEXT", 1, None, 3), ("payload", "TEXT", 1, None, 0)),
+    "application_receipts": (("workspace_identity", "TEXT", 1, None, 1), ("application_id", "TEXT", 1, None, 2), ("payload", "TEXT", 1, None, 0)),
+}
 
 
 class SchemaOwnerError(Exception):
@@ -437,6 +446,39 @@ CREATE INDEX idx_attestation_references_workspace_binding ON attestation_binding
 CREATE INDEX idx_attestation_events_workspace_artifact_sequence ON attestation_revalidation_events(workspace_identity, artifact_id, event_sequence);
 """
 
+_V6_DDL = r"""
+CREATE TABLE application_execution (
+    workspace_identity TEXT NOT NULL CHECK (length(workspace_identity) > 0),
+    application_id TEXT NOT NULL CHECK (length(application_id) > 0),
+    payload TEXT NOT NULL CHECK (length(payload) > 0),
+    PRIMARY KEY (workspace_identity, application_id)
+);
+CREATE TABLE operation_attempts (
+    workspace_identity TEXT NOT NULL CHECK (length(workspace_identity) > 0),
+    application_id TEXT NOT NULL CHECK (length(application_id) > 0),
+    operation_identity TEXT NOT NULL CHECK (length(operation_identity) > 0),
+    payload TEXT NOT NULL CHECK (length(payload) > 0),
+    PRIMARY KEY (workspace_identity, application_id, operation_identity)
+);
+CREATE TABLE operation_receipts (
+    workspace_identity TEXT NOT NULL CHECK (length(workspace_identity) > 0),
+    application_id TEXT NOT NULL CHECK (length(application_id) > 0),
+    operation_identity TEXT NOT NULL CHECK (length(operation_identity) > 0),
+    payload TEXT NOT NULL CHECK (length(payload) > 0),
+    PRIMARY KEY (workspace_identity, application_id, operation_identity)
+);
+CREATE TABLE application_receipts (
+    workspace_identity TEXT NOT NULL CHECK (length(workspace_identity) > 0),
+    application_id TEXT NOT NULL CHECK (length(application_id) > 0),
+    payload TEXT NOT NULL CHECK (length(payload) > 0),
+    PRIMARY KEY (workspace_identity, application_id)
+);
+CREATE INDEX idx_application_execution_workspace_state ON application_execution(workspace_identity, application_id);
+CREATE INDEX idx_operation_attempts_workspace_request ON operation_attempts(workspace_identity, application_id, operation_identity);
+CREATE INDEX idx_operation_receipts_workspace_application ON operation_receipts(workspace_identity, application_id);
+CREATE INDEX idx_application_receipts_workspace_application ON application_receipts(workspace_identity, application_id);
+"""
+
 _V4_LAYOUT = {
     "attestation_artifacts": [(name, "INTEGER" if name == "claims_revision" else "TEXT", 1, pk) for name, pk in (
         ("workspace_identity", 1), ("artifact_id", 2), ("artifact_contract_version", 0), ("attestation_id", 0), ("claims_payload_json", 0), ("detached_proof", 0), ("claims_digest", 0), ("artifact_digest", 0), ("original_verified_at", 0), ("created_at", 0), ("claims_attestation_version", 0), ("claims_issuer_id", 0), ("claims_key_id", 0), ("claims_signature_algorithm", 0), ("claims_credential_class", 0), ("claims_credential_instance_id", 0), ("claims_github_subject_identity", 0), ("claims_repository_identity", 0), ("claims_granted_capabilities_json", 0), ("claims_driver_identity", 0), ("claims_remote_authority", 0), ("claims_preview_id", 0), ("claims_revision", 0), ("claims_operation_set_digest", 0), ("claims_remote_snapshot_digest", 0), ("claims_evidence_digest", 0), ("claims_issued_at", 0), ("claims_expires_at", 0), ("claims_nonce", 0), ("claims_source_verification_digest", 0), ("claims_challenge_digest", 0), ("claims_credential_principal_identity", 0), ("canonical_json", 0))],
@@ -447,7 +489,7 @@ _V4_LAYOUT = {
 }
 
 
-def _v4_fingerprint(connection: sqlite3.Connection) -> bool:
+def _v4_fingerprint(connection: sqlite3.Connection, *, allow_v6: bool = False) -> bool:
     if _safe_sql(connection, "PRAGMA user_version")[0][0] != 0 or _safe_sql(connection, "PRAGMA application_id")[0][0] != 0:
         return False
     objects = _objects(connection)
@@ -459,6 +501,10 @@ def _v4_fingerprint(connection: sqlite3.Connection) -> bool:
             "idx_attestation_events_workspace_artifact_sequence",
         }
     }
+    if allow_v6:
+        expected_objects |= {("table", name) for name in _V6_TABLES[len(_V4_TABLES):]} | {("index", name) for name in (
+            "idx_application_execution_workspace_state", "idx_operation_attempts_workspace_request",
+            "idx_operation_receipts_workspace_application", "idx_application_receipts_workspace_application")}
     if {(kind, name) for kind, name, _table_name, _sql in objects} != expected_objects:
         return False
     for table in _V4_TABLES:
@@ -651,6 +697,14 @@ def ensure_schema_v4(connection: sqlite3.Connection, *, expected_workspace_ident
             _metadata(connection)
         if not any(name == "store_meta" for _, name, _, _ in objects):
             raise SchemaOwnerError("attestation_persistence_schema_shape_mismatch")
+        current_version, current_workspace = _metadata(connection)
+        if current_version == 6:
+            if current_workspace != expected or not _v6_fingerprint(connection):
+                raise SchemaOwnerError("attestation_persistence_schema_shape_mismatch")
+            connection.commit()
+            return
+        if current_version > 6:
+            raise SchemaOwnerError("attestation_persistence_schema_version_unsupported")
         if _v3_fingerprint(connection):
             version, _ = _metadata(connection)
             if version > 5:
@@ -676,8 +730,13 @@ def ensure_schema_v4(connection: sqlite3.Connection, *, expected_workspace_ident
             return
         if _v4_fingerprint(connection):
             version, workspace = _metadata(connection)
-            if version > 5:
+            if version > 6:
                 raise SchemaOwnerError("attestation_persistence_schema_version_unsupported")
+            if version == 6:
+                if not _v6_fingerprint(connection) or workspace != expected:
+                    raise SchemaOwnerError("attestation_persistence_schema_shape_mismatch")
+                connection.commit()
+                return
             if version not in {4, 5}:
                 raise SchemaOwnerError("attestation_persistence_schema_metadata_corrupt")
             if workspace != expected:
@@ -703,6 +762,69 @@ def ensure_schema_v4(connection: sqlite3.Connection, *, expected_workspace_ident
         if _is_busy(exc):
             raise SchemaOwnerError("attestation_persistence_sqlite_busy") from exc
         raise SchemaOwnerError("attestation_persistence_sqlite_operational") from exc
+
+
+def _v6_fingerprint(connection: sqlite3.Connection) -> bool:
+    """Validate the additive execution tables and indexes of schema V6."""
+    try:
+        if not _v4_fingerprint(connection, allow_v6=True):
+            return False
+        objects = _objects(connection)
+        for table, expected_columns in _V6_LAYOUT.items():
+            columns = _table_xinfo(connection, table)
+            if len(columns) != len(expected_columns) or any((row[1], row[2].upper(), row[3], row[4], row[5]) != wanted for row, wanted in zip(columns, expected_columns)):
+                return False
+            if any(row[6] != 0 for row in columns) or _check_expressions(_table_sql(objects, table)) != _check_expressions(_script_table_definition(_V6_DDL, table)):
+                return False
+        expected_indexes = {
+            "idx_application_execution_workspace_state": ("application_execution", ("workspace_identity", "application_id")),
+            "idx_operation_attempts_workspace_request": ("operation_attempts", ("workspace_identity", "application_id", "operation_identity")),
+            "idx_operation_receipts_workspace_application": ("operation_receipts", ("workspace_identity", "application_id")),
+            "idx_application_receipts_workspace_application": ("application_receipts", ("workspace_identity", "application_id")),
+        }
+        for name, (table, columns) in expected_indexes.items():
+            explicit = {row[1]: row for row in _safe_sql(connection, f"PRAGMA index_list({table})")}
+            row = explicit.get(name)
+            if row is None or int(row[2]) != 0 or str(row[3]) != "c" or int(row[4]) != 0 or _index_xinfo(connection, name) != _expected_index_xinfo(columns):
+                return False
+        return True
+    except (SchemaOwnerError, sqlite3.Error):
+        return False
+
+
+def ensure_schema_v6(connection: sqlite3.Connection, *, expected_workspace_identity: str) -> None:
+    """Atomically add and validate execution persistence on a V5 store."""
+    ensure_schema_v4(connection, expected_workspace_identity=expected_workspace_identity)
+    expected = _workspace(expected_workspace_identity)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        version, workspace = _metadata(connection)
+        if workspace != expected:
+            raise SchemaOwnerError("attestation_persistence_workspace_mismatch")
+        if version == 6:
+            if not _v6_fingerprint(connection):
+                raise SchemaOwnerError("attestation_persistence_schema_shape_mismatch")
+            connection.commit()
+            return
+        if version != 5 or not _v4_fingerprint(connection):
+            raise SchemaOwnerError("attestation_persistence_schema_version_unsupported")
+        _execute_script(connection, _V6_DDL)
+        connection.execute("UPDATE store_meta SET schema_version = 6")
+        if not _v6_fingerprint(connection):
+            raise SchemaOwnerError("attestation_persistence_migration_failed")
+        connection.commit()
+    except SchemaOwnerError:
+        try:
+            connection.rollback()
+        except sqlite3.Error:
+            pass
+        raise
+    except sqlite3.Error as exc:
+        try:
+            connection.rollback()
+        except sqlite3.Error:
+            pass
+        raise SchemaOwnerError("attestation_persistence_migration_failed") from exc
     except sqlite3.Error as exc:
         try:
             connection.rollback()
