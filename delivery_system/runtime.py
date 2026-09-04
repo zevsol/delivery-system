@@ -15,6 +15,7 @@ import subprocess
 from typing import Any, Callable, Mapping, Protocol, Sequence
 from copy import deepcopy
 from datetime import datetime, timezone
+from types import MappingProxyType
 
 from delivery_system import sqlite_schema
 from delivery_system.audit_state import AuditRecord, ApprovalRecord, AuditResult, AuditStatus
@@ -1575,11 +1576,55 @@ class AuditContextService:
         }
 
 
+def _freeze_runtime_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze_runtime_value(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_runtime_value(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_freeze_runtime_value(item) for item in value)
+    return value
+
+
+def _thaw_runtime_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _thaw_runtime_value(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_runtime_value(item) for item in value]
+    if isinstance(value, frozenset):
+        return {_thaw_runtime_value(item) for item in value}
+    return value
+
+
+class _ApplierCapability:
+    __slots__ = ("_service", "_store", "_dispatch")
+
+    def __init__(self, service: Any, store: Any, dispatch: Callable[[str, Any], Any]) -> None:
+        self._service = service
+        self._store = store
+        self._dispatch = dispatch
+
+    def validate(self, service: Any, store: Any) -> None:
+        if self._service is not service or self._store is not store:
+            raise ValueError("applier_orchestration_required")
+
+    def dispatch(self, kind: str, command: Any) -> Any:
+        if kind not in {"create_issue", "add_sub_issue", "add_dependency"}:
+            raise ValueError("write_operation_kind_invalid")
+        return self._dispatch(kind, command)
+
+
+def _compose_production_write_executor(token_provider: Any) -> Any:
+    """Compose the only production write executor at the Runtime boundary."""
+    from .drivers.github_write import GitHubRestWriteDriver, HttpsWriteTransport
+    return GitHubRestWriteDriver(HttpsWriteTransport(), token_provider)
+
+
 class RuntimeApprovalAuthorityService:
     """Runtime-owned bridge from explicit approval to immutable authority."""
 
     def __init__(self, context: RuntimeContext, store: PreviewStore, attestation_service: Any,
-                 *, clock: Callable[[], datetime]) -> None:
+                 *, clock: Callable[[], datetime], write_token_provider: Any = None) -> None:
         if not isinstance(context, RuntimeContext) or not callable(clock):
             raise TypeError("approval_runtime_boundary_invalid")
         self.context = context
@@ -1590,6 +1635,25 @@ class RuntimeApprovalAuthorityService:
         self._authorities: dict[str, Any] = {}
         self._execution_context_registry: dict[int, tuple[Any, tuple[Any, ...]]] = {}
         self._live_artifact_registry: dict[int, tuple[Any, str, Any, Any]] = {}
+        self._write_orchestration_enabled = write_token_provider is not None
+        if write_token_provider is not None:
+            write_executor = _compose_production_write_executor(write_token_provider)
+            if not all(callable(getattr(write_executor, name, None)) for name in
+                       ("create_issue", "add_sub_issue", "add_dependency")):
+                raise ValueError("write_executor_invalid")
+            if getattr(write_executor, "executor_identity", None) != "delivery-system:github-rest-write-v1":
+                raise ValueError("write_executor_invalid")
+            def dispatch(kind: str, command: Any) -> Any:
+                if kind == "create_issue":
+                    return write_executor.create_issue(command)
+                if kind == "add_sub_issue":
+                    return write_executor.add_sub_issue(command)
+                if kind == "add_dependency":
+                    return write_executor.add_dependency(command)
+                raise ValueError("write_operation_kind_invalid")
+            self._write_executor_factory = lambda execution_store: _ApplierCapability(self, execution_store, dispatch)
+        else:
+            self._write_executor_factory = None
 
     @staticmethod
     def _approval_id(audit: AuditRecord) -> str:
@@ -1805,6 +1869,15 @@ class RuntimeApprovalAuthorityService:
         from .application_identity import CredentialContinuityAnchor
         return CredentialContinuityAnchor.from_authority(self.resolve_application_authority(authority_id))
 
+    def create_applier(self, execution_store: Any) -> Any:
+        if not self._write_orchestration_enabled or self._write_executor_factory is None:
+            raise ValueError("write_executor_required")
+        if getattr(execution_store, "runtime_service", None) is not self:
+            raise ValueError("applier_store_binding_invalid")
+        from .applier import Applier
+        capability = self._write_executor_factory(execution_store)
+        return Applier._from_runtime(self, execution_store, capability)
+
     def validate_execution_context(self, context: Any) -> None:
         from .application_identity import CredentialContinuityAnchor, LogicalApplicationIdentity
         from .write_operations import normalize_write_operations
@@ -1814,14 +1887,15 @@ class RuntimeApprovalAuthorityService:
             entry = self._execution_context_registry.get(id(context))
             if entry is None or entry[0] is not context or context._service is not self:
                 raise ValueError("runtime_context_owner_mismatch")
-            authority, identity, anchor, operations, operation_digest = entry[1]
+            authority, identity, anchor, operations, operation_digest, items = entry[1]
             current = self._authorities.get(authority.authority_id)
             if current is None or not self.validate_application_authority(current):
                 raise ValueError("runtime_authority_invalid")
             if current is not authority or context._authority is not authority:
                 raise ValueError("runtime_context_owner_mismatch")
             if (context.identity.to_dict() != identity or context.continuity_anchor.to_dict() != anchor or
-                    context._expected_operations != operations or context.operation_set_digest != operation_digest):
+                context._expected_operations != operations or context.operation_set_digest != operation_digest or
+                context._items != items):
                 raise ValueError("runtime_context_owner_mismatch")
             if (LogicalApplicationIdentity.from_authority(authority).to_dict() != identity or
                     CredentialContinuityAnchor.from_authority(authority).to_dict() != anchor or
@@ -1857,7 +1931,27 @@ class RuntimeApprovalAuthorityService:
         object.__setattr__(context, "continuity_anchor", CredentialContinuityAnchor.from_authority(authority))
         object.__setattr__(context, "_expected_operations", operations)
         object.__setattr__(context, "operation_set_digest", identity.values()["operation_set_digest"])
-        snapshot = (authority, identity.to_dict(), context.continuity_anchor.to_dict(), operations, context.operation_set_digest)
+        # ``items`` in the sealed payload is only the stable reference/index
+        # projection.  Execution needs the approved sourced fields as well;
+        # those live in the semantic payload and are snapshotted here so the
+        # Applier never accepts a caller-provided item map.
+        semantic_payload = canonical_preview.get("semantic_payload")
+        items = semantic_payload.get("work_items", []) if isinstance(semantic_payload, Mapping) else []
+        if not isinstance(items, list) or any(not isinstance(item, Mapping) for item in items):
+            raise ValueError("sealed_item_projection_invalid")
+        frozen_items = tuple(_freeze_runtime_value(item) for item in items)
+        refs = [item.get("client_ref") for item in items]
+        if any(type(ref) is not str or not ref for ref in refs) or len(set(refs)) != len(refs):
+            raise ValueError("sealed_item_projection_invalid")
+        sealed_refs = canonical_preview.get("items", [])
+        if (not isinstance(sealed_refs, list) or
+                [entry.get("client_ref") for entry in sealed_refs] != refs or
+                any(not isinstance(entry, Mapping) or type(entry.get("item_id")) is not str or not entry["item_id"]
+                    for entry in sealed_refs)):
+            raise ValueError("sealed_item_projection_invalid")
+        object.__setattr__(context, "_items", frozen_items)
+        snapshot = (authority, identity.to_dict(), context.continuity_anchor.to_dict(), operations,
+                    context.operation_set_digest, frozen_items)
         self._execution_context_registry[id(context)] = (context, snapshot)
         object.__setattr__(context, "_provenance", AuthorityProvenance._from_live_authority(authority, context))
         return context
@@ -1865,7 +1959,8 @@ class RuntimeApprovalAuthorityService:
 class RuntimeApplicationExecutionContext:
     """Ephemeral service-owned boundary for constructing new PC2-A evidence."""
 
-    __slots__ = ("_service", "_authority", "identity", "continuity_anchor", "_expected_operations", "operation_set_digest", "_provenance")
+    __slots__ = ("_service", "_authority", "identity", "continuity_anchor", "_expected_operations",
+                 "operation_set_digest", "_provenance", "_items")
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         raise ValueError("runtime_context_internal_only")
@@ -1882,6 +1977,10 @@ class RuntimeApplicationExecutionContext:
     def expected_operations(self) -> tuple[dict[str, Any], ...]:
         return tuple({key: list(value) if isinstance(value, list) else value for key, value in operation.items()}
                      for operation in self._expected_operations)
+
+    @property
+    def canonical_items(self) -> tuple[dict[str, Any], ...]:
+        return tuple(_thaw_runtime_value(item) for item in self._items)
 
     @property
     def service(self) -> Any:
@@ -1931,7 +2030,8 @@ class RuntimeApplicationExecutionContext:
                                           _live_context=self, state=values["state"], next_operation_index=values["next_operation_index"],
                                           owner_id=values["owner_id"], current_attempt_id=values["current_attempt_id"],
                                           recovery_code=values["recovery_code"], operation_receipt_refs=values["operation_receipt_refs"],
-                                          started_at=historical.started_at, updated_at=values["updated_at"], completed_at=values["completed_at"])
+                                          started_at=historical.started_at, updated_at=values["updated_at"], completed_at=values["completed_at"],
+                                          orchestration_policy=historical.orchestration_policy)
         self._service._live_artifact_registry[id(state)] = (state, "execution", self, state.payload())
         return state
 
@@ -1988,3 +2088,23 @@ class RuntimeApplicationExecutionContext:
         receipt = ApplicationReceipt.create(self.identity, self.operation_set_digest, self._expected_operations, receipts, started_at, completed_at)
         self._service._live_artifact_registry[id(receipt)] = (receipt, "application_receipt", self, receipt.payload())
         return receipt
+
+    def new_application_receipt_from_refs(self, refs: Any, started_at: str, completed_at: str) -> Any:
+        """Create a new live finalization candidate from already validated durable refs."""
+        from .receipts import ApplicationReceipt
+        self._require_current()
+        receipt_id = "application-receipt-" + digest({
+            "domain": "delivery-system:application-receipt-id:v1",
+            "application_id": self.identity.application_id,
+        }).split(":", 1)[1]
+        receipt = ApplicationReceipt(receipt_id, self.identity.application_id, self.identity,
+                                     self.operation_set_digest, tuple(refs), "Applied",
+                                     started_at, completed_at, _live_context=self).with_digest()
+        self._service._live_artifact_registry[id(receipt)] = (receipt, "application_receipt", self, receipt.payload())
+        return receipt
+
+    def _with_live_digest(self, artifact: Any, kind: str) -> Any:
+        """Internal composition helper for digest-bearing CAS candidates."""
+        candidate = artifact.with_digest()
+        self._service._live_artifact_registry[id(candidate)] = (candidate, kind, self, candidate.payload())
+        return candidate
