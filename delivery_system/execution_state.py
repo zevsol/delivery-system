@@ -13,6 +13,7 @@ from .write_operations import normalize_write_operations
 
 APPLICATION_STATES = frozenset({"Pending", "Applying", "PartiallyApplied", "Failed", "Blocked", "OutcomeUnknown", "Applied"})
 ATTEMPT_STATES = frozenset({"Pending", "Applying", "Failed", "Blocked", "OutcomeUnknown", "Applied"})
+APPLIER_ORCHESTRATION_POLICY = "delivery-system:applier-orchestration-v1"
 
 _ATTEMPT_TRANSITIONS = {
     "Pending": frozenset({"Applying", "Failed", "Blocked"}),
@@ -40,6 +41,8 @@ def validate_application_transition(previous: "ApplicationExecutionState", candi
             previous.continuity_anchor != candidate.continuity_anchor or
             previous.started_at != candidate.started_at):
         raise ValueError("application_binding_conflict")
+    if previous.orchestration_policy != candidate.orchestration_policy:
+        raise ValueError("application_orchestration_policy_invalid")
     if previous.completed_at is not None and candidate.completed_at != previous.completed_at:
         raise ValueError("application_coordination_invalid")
     if (previous.next_operation_index != len(previous.operation_receipt_refs) or
@@ -114,6 +117,7 @@ class ApplicationExecutionState:
     updated_at: str = ""
     completed_at: str | None = None
     continuity_anchor: CredentialContinuityAnchor | Mapping[str, Any] | None = None
+    orchestration_policy: str | None = None
     state_digest: str = ""
     _live_context: Any = None
 
@@ -122,6 +126,8 @@ class ApplicationExecutionState:
         anchor = self.continuity_anchor if isinstance(self.continuity_anchor, CredentialContinuityAnchor) else CredentialContinuityAnchor.from_dict(self.continuity_anchor)
         if self.application_id != identity.application_id or self.state not in APPLICATION_STATES or type(self.next_operation_index) is not int or self.next_operation_index < 0:
             raise ValueError("application_state_invalid")
+        if self.orchestration_policy not in (None, APPLIER_ORCHESTRATION_POLICY):
+            raise ValueError("application_orchestration_policy_invalid")
         if type(self.operation_receipt_refs) not in (tuple, list) or any(type(ref) is not str or not ref for ref in self.operation_receipt_refs) or len(set(self.operation_receipt_refs)) != len(self.operation_receipt_refs):
             raise ValueError("application_state_invalid")
         if not self.started_at or not self.updated_at:
@@ -133,12 +139,15 @@ class ApplicationExecutionState:
         object.__setattr__(self, "continuity_anchor", anchor)
 
     def payload(self) -> dict[str, Any]:
-        return {"application_id": self.application_id, "identity": self.identity.to_dict(), "state": self.state,
+        payload = {"application_id": self.application_id, "identity": self.identity.to_dict(), "state": self.state,
                 "next_operation_index": self.next_operation_index, "owner_id": self.owner_id,
                 "current_attempt_id": self.current_attempt_id, "recovery_code": self.recovery_code,
                 "operation_receipt_refs": list(self.operation_receipt_refs), "started_at": self.started_at,
                 "updated_at": self.updated_at, "completed_at": self.completed_at,
                 "continuity_anchor": self.continuity_anchor.to_dict()}
+        if self.orchestration_policy is not None:
+            payload["orchestration_policy"] = self.orchestration_policy
+        return payload
 
     def with_digest(self) -> "ApplicationExecutionState":
         return ApplicationExecutionState(**{**self.__dict__, "state_digest": digest(self.payload())})
