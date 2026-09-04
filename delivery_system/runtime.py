@@ -1912,6 +1912,29 @@ class RuntimeApplicationExecutionContext:
         self._service._live_artifact_registry[id(state)] = (state, "execution", self, state.payload())
         return state
 
+    def continue_execution_state(self, historical: Any, **changes: Any) -> Any:
+        from .execution_state import ApplicationExecutionState
+        self._require_current()
+        if type(historical) is not ApplicationExecutionState or not historical.verify_integrity():
+            raise ValueError("historical_execution_invalid")
+        if (historical.identity.to_dict() != self.identity.to_dict() or
+                historical.application_id != self.identity.application_id or
+                historical.continuity_anchor != self.continuity_anchor):
+            raise ValueError("credential_continuity_mismatch")
+        allowed = {"state", "next_operation_index", "owner_id", "current_attempt_id", "recovery_code",
+                   "operation_receipt_refs", "updated_at", "completed_at"}
+        if set(changes) - allowed:
+            raise ValueError("application_binding_conflict")
+        values = {name: getattr(historical, name) for name in allowed}
+        values.update(changes)
+        state = ApplicationExecutionState(historical.application_id, self.identity, continuity_anchor=self.continuity_anchor,
+                                          _live_context=self, state=values["state"], next_operation_index=values["next_operation_index"],
+                                          owner_id=values["owner_id"], current_attempt_id=values["current_attempt_id"],
+                                          recovery_code=values["recovery_code"], operation_receipt_refs=values["operation_receipt_refs"],
+                                          started_at=historical.started_at, updated_at=values["updated_at"], completed_at=values["completed_at"])
+        self._service._live_artifact_registry[id(state)] = (state, "execution", self, state.payload())
+        return state
+
     def new_attempt(self, operation_index: int, **values: Any) -> Any:
         from .application_identity import operation_identity, request_identity
         from .execution_state import OperationAttemptState
@@ -1921,6 +1944,34 @@ class RuntimeApplicationExecutionContext:
         attempt = OperationAttemptState(self.identity.application_id, op_id, operation_index, operation, self._provenance,
                                      self._authority.driver_identity, self._authority.remote_authority, request_identity(op_id),
                                      _live_context=self, identity=self.identity, **values)
+        self._service._live_artifact_registry[id(attempt)] = (attempt, "attempt", self, attempt.payload())
+        return attempt
+
+    def continue_attempt(self, historical: Any, **changes: Any) -> Any:
+        from .execution_state import OperationAttemptState
+        from .application_identity import CredentialContinuityAnchor, operation_identity, request_identity
+        self._require_current()
+        if type(historical) is not OperationAttemptState or not historical.verify_integrity():
+            raise ValueError("historical_attempt_invalid")
+        expected = self._expected_operations[historical.operation_index] if historical.operation_index < len(self._expected_operations) else None
+        if (historical.identity.to_dict() != self.identity.to_dict() or historical.application_id != self.identity.application_id or
+                expected is None or historical.payload()["operation"] != expected or
+                historical.operation_identity != operation_identity(self.identity.application_id, historical.operation_index, expected) or
+                historical.request_identity != request_identity(historical.operation_identity)):
+            raise ValueError("operation_attempt_binding_invalid")
+        old = historical.authority_binding
+        old_anchor = (CredentialContinuityAnchor("PRINCIPAL", (old.credential_principal_identity,))
+                      if old.credential_principal_identity else CredentialContinuityAnchor("LEGACY_INSTANCE", (old.issuer_id, old.credential_instance_id)))
+        if old_anchor != self.continuity_anchor or historical.driver_identity != self._authority.driver_identity or historical.remote_authority != self._authority.remote_authority:
+            raise ValueError("credential_continuity_mismatch")
+        allowed = {"state", "updated_at", "failure_code"}
+        if set(changes) - allowed:
+            raise ValueError("operation_attempt_binding_invalid")
+        values = {name: getattr(historical, name) for name in allowed}; values.update(changes)
+        attempt = OperationAttemptState(historical.application_id, historical.operation_identity, historical.operation_index,
+                                        historical.operation, historical.authority_binding, historical.driver_identity,
+                                        historical.remote_authority, historical.request_identity, values["state"],
+                                        historical.started_at, values["updated_at"], self.identity, values["failure_code"], _live_context=self)
         self._service._live_artifact_registry[id(attempt)] = (attempt, "attempt", self, attempt.payload())
         return attempt
 

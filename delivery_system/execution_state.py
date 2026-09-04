@@ -14,6 +14,65 @@ from .write_operations import normalize_write_operations
 APPLICATION_STATES = frozenset({"Pending", "Applying", "PartiallyApplied", "Failed", "Blocked", "OutcomeUnknown", "Applied"})
 ATTEMPT_STATES = frozenset({"Pending", "Applying", "Failed", "Blocked", "OutcomeUnknown", "Applied"})
 
+_ATTEMPT_TRANSITIONS = {
+    "Pending": frozenset({"Applying", "Failed", "Blocked"}),
+    "Applying": frozenset({"Applied", "Failed", "Blocked", "OutcomeUnknown"}),
+    "Failed": frozenset(), "Blocked": frozenset(), "OutcomeUnknown": frozenset(), "Applied": frozenset(),
+}
+_APPLICATION_TRANSITIONS = {
+    "Pending": frozenset({"Applying", "Failed", "Blocked"}),
+    "Applying": frozenset({"PartiallyApplied", "Failed", "Blocked", "OutcomeUnknown"}),
+    "PartiallyApplied": frozenset({"Applying", "Failed", "Blocked"}),
+    "Failed": frozenset(), "Blocked": frozenset(), "OutcomeUnknown": frozenset(), "Applied": frozenset(),
+}
+
+
+def validate_attempt_transition(previous: "OperationAttemptState", candidate: "OperationAttemptState") -> None:
+    if candidate.state not in _ATTEMPT_TRANSITIONS.get(previous.state, frozenset()):
+        raise ValueError("attempt_state_transition_invalid")
+
+
+def validate_application_transition(previous: "ApplicationExecutionState", candidate: "ApplicationExecutionState") -> None:
+    if candidate.state not in _APPLICATION_TRANSITIONS.get(previous.state, frozenset()):
+        raise ValueError("application_state_transition_invalid")
+    if (previous.application_id != candidate.application_id or
+            previous.identity.to_dict() != candidate.identity.to_dict() or
+            previous.continuity_anchor != candidate.continuity_anchor or
+            previous.started_at != candidate.started_at):
+        raise ValueError("application_binding_conflict")
+    if previous.completed_at is not None and candidate.completed_at != previous.completed_at:
+        raise ValueError("application_coordination_invalid")
+    if (previous.next_operation_index != len(previous.operation_receipt_refs) or
+            candidate.next_operation_index != len(candidate.operation_receipt_refs)):
+        raise ValueError("application_progress_invalid")
+    progress_delta = candidate.next_operation_index - previous.next_operation_index
+    if progress_delta not in (0, 1):
+        raise ValueError("application_progress_invalid")
+    if previous.state != "Applying" or candidate.state != "PartiallyApplied":
+        if progress_delta != 0 or candidate.operation_receipt_refs != previous.operation_receipt_refs:
+            raise ValueError("application_progress_invalid")
+    if progress_delta == 0 and candidate.operation_receipt_refs != previous.operation_receipt_refs:
+        raise ValueError("application_progress_invalid")
+    if progress_delta == 1 and candidate.operation_receipt_refs[:-1] != previous.operation_receipt_refs:
+        raise ValueError("application_progress_invalid")
+
+    if previous.state in {"Pending", "PartiallyApplied"}:
+        if previous.owner_id is not None or previous.current_attempt_id is not None:
+            raise ValueError("application_coordination_invalid")
+        if candidate.state == "Applying" and (not candidate.owner_id or not candidate.current_attempt_id):
+            raise ValueError("application_coordination_invalid")
+        if candidate.state in {"Failed", "Blocked"} and (candidate.owner_id is not None or candidate.current_attempt_id is not None):
+            raise ValueError("application_coordination_invalid")
+    elif previous.state == "Applying":
+        if candidate.state == "PartiallyApplied":
+            if progress_delta != 1 or candidate.owner_id is not None or candidate.current_attempt_id is not None:
+                raise ValueError("application_coordination_invalid")
+        elif candidate.state in {"Failed", "Blocked", "OutcomeUnknown"}:
+            if (progress_delta != 0 or candidate.operation_receipt_refs != previous.operation_receipt_refs or
+                    candidate.current_attempt_id != previous.current_attempt_id or
+                    candidate.owner_id not in {None, previous.owner_id}):
+                raise ValueError("application_coordination_invalid")
+
 
 def _text(value: Any, code: str) -> str:
     if type(value) is not str or not value:
@@ -67,6 +126,8 @@ class ApplicationExecutionState:
             raise ValueError("application_state_invalid")
         if not self.started_at or not self.updated_at:
             raise ValueError("application_state_invalid")
+        if self.state in {"Pending", "PartiallyApplied"} and (self.owner_id is not None or self.current_attempt_id is not None):
+            raise ValueError("application_coordination_invalid")
         object.__setattr__(self, "identity", identity)
         object.__setattr__(self, "operation_receipt_refs", tuple(self.operation_receipt_refs))
         object.__setattr__(self, "continuity_anchor", anchor)
