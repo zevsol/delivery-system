@@ -9,7 +9,9 @@ from pathlib import Path
 from typing import Any
 
 from . import sqlite_schema
-from .execution_state import ApplicationExecutionState, OperationAttemptState
+from .application_identity import operation_identity
+from .execution_state import (ApplicationExecutionState, OperationAttemptState,
+                               validate_application_transition, validate_attempt_transition)
 from .receipts import ApplicationReceipt, OperationReceipt
 
 
@@ -124,6 +126,102 @@ class SQLiteExecutionStore:
                                (self.workspace_identity, candidate.application_id, candidate.operation_identity, payload))
             connection.commit()
         return candidate
+
+    def create_attempt_if_absent(self, attempt: OperationAttemptState) -> OperationAttemptState:
+        """Atomically claim the first durable attempt for one operation."""
+        candidate = attempt.with_digest()
+        if attempt.identity.values()["workspace_identity"] != self.workspace_identity:
+            raise ValueError("operation_attempt_binding_conflict")
+        if attempt.state != "Applying" or attempt.failure_code is not None:
+            raise ValueError("operation_attempt_claim_state_invalid")
+        payload = json.dumps(candidate.payload() | {"attempt_digest": candidate.attempt_digest}, ensure_ascii=False, sort_keys=True)
+        with closing(self._connection()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute("SELECT 1 FROM operation_attempts WHERE workspace_identity=? AND application_id=? AND operation_identity=?",
+                                         (self.workspace_identity, candidate.application_id, candidate.operation_identity)).fetchone()
+            if existing is not None:
+                connection.rollback()
+                raise ValueError("operation_attempt_already_exists")
+            if attempt._live_context is None or self.runtime_service is None:
+                raise ValueError("runtime_authority_required")
+            self.runtime_service.validate_live_artifact(attempt, attempt._live_context, "attempt")
+            connection.execute("INSERT INTO operation_attempts(workspace_identity, application_id, operation_identity, payload) VALUES (?, ?, ?, ?)",
+                               (self.workspace_identity, candidate.application_id, candidate.operation_identity, payload))
+            connection.commit()
+        return candidate
+
+    def transition_attempt(self, expected_attempt_digest: str, candidate: OperationAttemptState) -> OperationAttemptState:
+        live_candidate = candidate
+        stored_candidate = candidate.with_digest()
+        if live_candidate.identity.values()["workspace_identity"] != self.workspace_identity:
+            raise ValueError("operation_attempt_binding_conflict")
+        with closing(self._connection()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT payload FROM operation_attempts WHERE workspace_identity=? AND application_id=? AND operation_identity=?",
+                                     (self.workspace_identity, live_candidate.application_id, live_candidate.operation_identity)).fetchone()
+            if row is None:
+                connection.rollback(); raise ValueError("operation_attempt_not_found")
+            previous = OperationAttemptState(**json.loads(row[0]))
+            if not previous.verify_integrity() or previous.attempt_digest != expected_attempt_digest:
+                connection.rollback(); raise ValueError("attempt_state_stale")
+            validate_attempt_transition(previous, live_candidate)
+            if live_candidate._live_context is None or self.runtime_service is None:
+                connection.rollback(); raise ValueError("runtime_authority_required")
+            self.runtime_service.validate_live_artifact(live_candidate, live_candidate._live_context, "attempt")
+            if (previous.identity.to_dict(), previous.operation_index, dict(previous.operation), previous.request_identity,
+                    previous.authority_binding.to_dict(), previous.started_at) != (live_candidate.identity.to_dict(), live_candidate.operation_index,
+                    dict(live_candidate.operation), live_candidate.request_identity, live_candidate.authority_binding.to_dict(), live_candidate.started_at):
+                connection.rollback(); raise ValueError("operation_attempt_binding_conflict")
+            payload = json.dumps(stored_candidate.payload() | {"attempt_digest": stored_candidate.attempt_digest}, ensure_ascii=False, sort_keys=True)
+            connection.execute("UPDATE operation_attempts SET payload=? WHERE workspace_identity=? AND application_id=? AND operation_identity=?",
+                               (payload, self.workspace_identity, live_candidate.application_id, live_candidate.operation_identity))
+            connection.commit()
+        return stored_candidate
+
+    def transition_execution(self, expected_state_digest: str, candidate: ApplicationExecutionState) -> ApplicationExecutionState:
+        live_candidate = candidate
+        stored_candidate = candidate.with_digest()
+        if live_candidate.identity.values()["workspace_identity"] != self.workspace_identity:
+            raise ValueError("application_binding_conflict")
+        with closing(self._connection()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT payload FROM application_execution WHERE workspace_identity=? AND application_id=?",
+                                     (self.workspace_identity, live_candidate.application_id)).fetchone()
+            if row is None:
+                connection.rollback(); raise ValueError("application_not_found")
+            previous = ApplicationExecutionState(**json.loads(row[0]))
+            if not previous.verify_integrity() or previous.state_digest != expected_state_digest:
+                connection.rollback(); raise ValueError("application_state_stale")
+            if live_candidate.state == "Applied":
+                connection.rollback(); raise ValueError("application_finalization_required")
+            validate_application_transition(previous, live_candidate)
+            if live_candidate._live_context is None or self.runtime_service is None:
+                connection.rollback(); raise ValueError("runtime_authority_required")
+            self.runtime_service.validate_live_artifact(live_candidate, live_candidate._live_context, "execution")
+            progress_delta = live_candidate.next_operation_index - previous.next_operation_index
+            if progress_delta == 1:
+                appended_id = live_candidate.operation_receipt_refs[-1]
+                receipt_rows = connection.execute("SELECT payload FROM operation_receipts WHERE workspace_identity=? AND application_id=?",
+                                                  (self.workspace_identity, live_candidate.application_id)).fetchall()
+                appended = None
+                for receipt_row in receipt_rows:
+                    loaded = OperationReceipt(**json.loads(receipt_row[0]))
+                    if loaded.operation_receipt_id == appended_id:
+                        appended = loaded
+                        break
+                if appended is None or not appended.verify_integrity() or appended.identity.to_dict() != live_candidate.identity.to_dict() or appended.operation_index != previous.next_operation_index:
+                    connection.rollback(); raise ValueError("application_progress_invalid")
+                if live_candidate._live_context is not None:
+                    operations = live_candidate._live_context.expected_operations
+                    if previous.next_operation_index >= len(operations) or appended.operation_identity != operation_identity(live_candidate.application_id, previous.next_operation_index, operations[previous.next_operation_index]):
+                        connection.rollback(); raise ValueError("application_progress_invalid")
+            else:
+                appended = None
+            payload = json.dumps(stored_candidate.payload() | {"state_digest": stored_candidate.state_digest}, ensure_ascii=False, sort_keys=True)
+            connection.execute("UPDATE application_execution SET payload=? WHERE workspace_identity=? AND application_id=?",
+                               (payload, self.workspace_identity, live_candidate.application_id))
+            connection.commit()
+        return stored_candidate
 
     def get_attempt(self, application_id: str, operation_identity: str) -> OperationAttemptState:
         with closing(self._connection()) as connection:
