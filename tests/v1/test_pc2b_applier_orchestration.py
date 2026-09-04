@@ -7,6 +7,7 @@ import threading
 import unittest
 
 from delivery_system.application_identity import operation_identity
+from delivery_system.attestation import IssuerTrustDecision
 from delivery_system.drivers.write_contract import (
     WRITE_CONTRACT_VERSION,
     WRITE_EXECUTOR_IDENTITY,
@@ -19,6 +20,8 @@ from delivery_system.applier import ApplyResult, render_create_issue
 from delivery_system.applier import _materialize, _trusted_success_result
 from delivery_system.execution_state import APPLIER_ORCHESTRATION_POLICY
 from delivery_system.runtime import RuntimeApprovalAuthorityService
+from delivery_system.attestation_github_app import GitHubAppInstallationCapabilityEvidence
+from delivery_system.github_app_credential import GitHubAppInstallationCredentialLease
 import delivery_system.runtime as runtime_module
 from tests.fakes.fake_write_driver import FakeWriteDriver
 from tests.v1 import test_operational_approval_authority as approval_fixture
@@ -102,15 +105,34 @@ class _FailingCommitConnection:
 
 
 class ApplierOrchestrationTests(unittest.TestCase):
-    def _compose(self, observations=(), driver=None):
+    def _compose(self, observations=(), driver=None, real_executor=False):
         harness = approval_fixture.OperationalApprovalAuthorityTests()
         directory, context, preview_store, preview, audit, foundation = harness._setup("memory")
         driver = driver or FakeWriteDriver(observations)
-        with patch.object(runtime_module, "_compose_production_write_executor", return_value=driver):
+        provider = foundation.attestation_service._RuntimeAttestationOrchestrationService__provider
+        issuer = foundation.attestation_service._RuntimeAttestationOrchestrationService__boundary._AttestationRuntimeBoundary__issuer_policy
+        issuer.evaluate = lambda issuer_id, key_id, signature_algorithm, attestation_version, credential_class: IssuerTrustDecision(True)
+        provider.attestation_version = "2"
+        provider.lease_evidence = GitHubAppInstallationCapabilityEvidence(
+            app_id=1, installation_id=1, installation_account_identity="owner", repository_id=1,
+            repository_identity="owner/repo",
+            repository_scope=("owner/repo",),
+            effective_permissions=(("issues", "write"),),
+            expires_at="2026-08-14T13:00:00Z", observed_at="2026-08-14T11:00:00Z",
+            credential_instance_id="fake-instance-1",
+        )
+        lease = GitHubAppInstallationCredentialLease._mint("pc4-test-token", provider.lease_evidence)
+        if real_executor:
             service = RuntimeApprovalAuthorityService(
                 context, preview_store, foundation.attestation_service,
-                clock=foundation.clock, write_token_provider=object(),
+                clock=foundation.clock, host_credential_lease=lease,
             )
+        else:
+            with patch.object(runtime_module, "_compose_production_write_executor", return_value=driver):
+                service = RuntimeApprovalAuthorityService(
+                    context, preview_store, foundation.attestation_service,
+                    clock=foundation.clock, host_credential_lease=lease,
+                )
         approval = service.record_approval(
             preview["preview_id"], 1,
             f"批准写入 {preview['preview_id']} 1", "human",
@@ -228,14 +250,8 @@ class ApplierOrchestrationTests(unittest.TestCase):
             shadow = RuntimeApprovalAuthorityService(
                 context, service.store, service.attestation_service, clock=service.clock,
             )
-            approval = shadow.record_approval(
-                preview["preview_id"], 1,
-                f"批准写入 {preview['preview_id']} 1", "human",
-            )
-            shadow_authority = shadow.issue_application_authority(
-                preview["preview_id"], 1, approval.approval_id,
-            )
-            shadow_context = shadow.create_execution_context(shadow_authority.authority_id)
+            shadow._authorities[authority.authority_id] = authority
+            shadow_context = shadow.create_execution_context(authority.authority_id)
             shadow_store = SQLiteExecutionStore(path, context.workspace_identity, runtime_service=shadow)
             state = shadow_store.get_execution(
                 shadow_context.identity.application_id,
@@ -784,7 +800,7 @@ class ApplierOrchestrationTests(unittest.TestCase):
             owner = "execution-owner-" + "a" * 32
             state, attempt = store.claim_next_operation(capability, persisted.application_id, persisted.state_digest, runtime_context, owner, now)
             command = _materialize(runtime_context, attempt, store)
-            observation = capability.dispatch("create_issue", command)
+            observation = capability.dispatch(runtime_context, "create_issue", command)
             receipt = runtime_context.new_receipt(attempt.operation_index, _trusted_success_result(runtime_context, attempt, observation), attempt.started_at, now)
             store.complete_operation_success(capability, initial.application_id, state.state_digest, attempt.operation_identity,
                 attempt.attempt_digest, owner, runtime_context, receipt, now)

@@ -41,6 +41,11 @@ from delivery_system.remote_snapshot import (
     _is_timezone_aware_timestamp,
 )
 from delivery_system.runtime_authority import _PROMOTION_MARKER, RuntimePromotion, _reload_promotion
+from delivery_system.attestation_github_app import (
+    github_app_installation_principal,
+    github_app_installation_source_verification_digest,
+)
+from delivery_system.github_app_credential import GitHubAppInstallationCredentialLease
 from delivery_system.store_reads import (
     StoreReadMiss,
     read_inmemory_evidence_records,
@@ -1608,10 +1613,24 @@ class _ApplierCapability:
         if self._service is not service or self._store is not store:
             raise ValueError("applier_orchestration_required")
 
-    def dispatch(self, kind: str, command: Any) -> Any:
+    def dispatch(self, context: Any, kind: str, command: Any) -> Any:
         if kind not in {"create_issue", "add_sub_issue", "add_dependency"}:
             raise ValueError("write_operation_kind_invalid")
+        self._service._validate_live_credential_dispatch(context, self._store)
         return self._dispatch(kind, command)
+
+
+class _LeaseBoundTokenProvider:
+    __slots__ = ("_lease",)
+
+    def __init__(self, lease: GitHubAppInstallationCredentialLease) -> None:
+        if type(lease) is not GitHubAppInstallationCredentialLease:
+            raise ValueError("host_credential_capability_invalid")
+        lease._validate_integrity()
+        self._lease = lease
+
+    def get_token(self) -> str:
+        return self._lease._dispatch_token()
 
 
 def _compose_production_write_executor(token_provider: Any) -> Any:
@@ -1624,7 +1643,7 @@ class RuntimeApprovalAuthorityService:
     """Runtime-owned bridge from explicit approval to immutable authority."""
 
     def __init__(self, context: RuntimeContext, store: PreviewStore, attestation_service: Any,
-                 *, clock: Callable[[], datetime], write_token_provider: Any = None) -> None:
+                 *, clock: Callable[[], datetime], host_credential_lease: Any = None) -> None:
         if not isinstance(context, RuntimeContext) or not callable(clock):
             raise TypeError("approval_runtime_boundary_invalid")
         self.context = context
@@ -1635,9 +1654,17 @@ class RuntimeApprovalAuthorityService:
         self._authorities: dict[str, Any] = {}
         self._execution_context_registry: dict[int, tuple[Any, tuple[Any, ...]]] = {}
         self._live_artifact_registry: dict[int, tuple[Any, str, Any, Any]] = {}
-        self._write_orchestration_enabled = write_token_provider is not None
-        if write_token_provider is not None:
-            write_executor = _compose_production_write_executor(write_token_provider)
+        if host_credential_lease is not None:
+            if type(host_credential_lease) is not GitHubAppInstallationCredentialLease:
+                raise ValueError("host_credential_capability_invalid")
+            host_credential_lease._validate_integrity()
+        self._host_credential_lease = host_credential_lease
+        self._host_credential_snapshot = (
+            host_credential_lease._snapshot() if host_credential_lease is not None else None
+        )
+        self._write_orchestration_enabled = host_credential_lease is not None
+        if host_credential_lease is not None:
+            write_executor = _compose_production_write_executor(_LeaseBoundTokenProvider(host_credential_lease))
             if not all(callable(getattr(write_executor, name, None)) for name in
                        ("create_issue", "add_sub_issue", "add_dependency")):
                 raise ValueError("write_executor_invalid")
@@ -1654,6 +1681,70 @@ class RuntimeApprovalAuthorityService:
             self._write_executor_factory = lambda execution_store: _ApplierCapability(self, execution_store, dispatch)
         else:
             self._write_executor_factory = None
+
+    def _validate_live_credential_dispatch(self, context: Any, store: Any) -> None:
+        if type(context) is not RuntimeApplicationExecutionContext or store is None:
+            raise ValueError("credential_currentness_mismatch")
+        if self._host_credential_lease is None or self._host_credential_snapshot is None:
+            raise ValueError("credential_capability_unregistered")
+        if type(self._host_credential_lease) is not GitHubAppInstallationCredentialLease:
+            raise ValueError("credential_capability_unregistered")
+        context._require_current()
+        authority = context._authority
+        binding = self.attestation_service.resolve_registered_binding(authority.credential_binding_id)
+        lease = self._host_credential_lease
+        try:
+            lease._validate_integrity()
+        except ValueError:
+            raise ValueError("credential_capability_unregistered") from None
+        evidence = lease._snapshot()
+        if evidence is not self._host_credential_snapshot:
+            raise ValueError("credential_currentness_mismatch")
+        if binding.credential_class != lease._credential_class():
+            raise ValueError("credential_instance_mismatch")
+        if (authority.credential_instance_id != binding.credential_instance_id or
+                authority.credential_principal_identity != binding.credential_principal_identity or
+                authority.repository_identity != binding.repository_identity or
+                tuple(authority.required_capabilities) != tuple(binding.required_capabilities) or
+                tuple(authority.granted_capabilities) != tuple(binding.granted_capabilities) or
+                authority.expires_at != binding.expires_at):
+            raise ValueError("credential_currentness_mismatch")
+        if evidence.credential_instance_id != binding.credential_instance_id:
+            raise ValueError("credential_instance_mismatch")
+        if github_app_installation_principal(evidence.app_id, evidence.installation_id) != binding.credential_principal_identity:
+            raise ValueError("credential_principal_mismatch")
+        if evidence.repository_identity != binding.repository_identity:
+            raise ValueError("credential_repository_mismatch")
+        if evidence.repository_scope != (binding.repository_identity,):
+            raise ValueError("credential_scope_mismatch")
+        if dict(evidence.effective_permissions).get("issues") != "write":
+            raise ValueError("credential_capability_mismatch")
+        if evidence.expires_at != binding.expires_at:
+            raise ValueError("credential_currentness_mismatch")
+        if "issues:write" not in tuple(binding.required_capabilities) or "issues:write" not in tuple(binding.granted_capabilities):
+            raise ValueError("credential_capability_mismatch")
+        now = self.clock().astimezone(timezone.utc)
+        try:
+            expires = datetime.fromisoformat(evidence.expires_at.replace("Z", "+00:00"))
+        except (AttributeError, TypeError, ValueError):
+            raise ValueError("credential_currentness_mismatch") from None
+        if expires <= now:
+            raise ValueError("credential_expired")
+        request = {
+            "repository_identity": binding.repository_identity,
+            "required_capabilities": tuple(binding.required_capabilities),
+            "github_subject_identity": binding.github_subject_identity,
+            "driver_identity": binding.driver_identity,
+            "remote_authority": binding.remote_authority,
+            "preview_id": binding.preview_id,
+            "revision": binding.revision,
+            "operation_set_digest": binding.operation_set_digest,
+            "remote_snapshot_digest": binding.remote_snapshot_digest,
+            "evidence_digest": binding.evidence_digest,
+            "challenge_digest": binding.challenge_digest,
+        }
+        if github_app_installation_source_verification_digest(evidence, request) != binding.source_verification_digest:
+            raise ValueError("credential_currentness_mismatch")
 
     @staticmethod
     def _approval_id(audit: AuditRecord) -> str:
