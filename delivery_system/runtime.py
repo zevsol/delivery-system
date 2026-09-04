@@ -51,6 +51,7 @@ from delivery_system.store_reads import (
     read_sqlite_preview_revision,
 )
 
+
 class StorePreflightError(RuntimeError):
     def __init__(self, code: str):
         self.code = code
@@ -1587,6 +1588,8 @@ class RuntimeApprovalAuthorityService:
         self.clock = clock
         self._lock = threading.RLock()
         self._authorities: dict[str, Any] = {}
+        self._execution_context_registry: dict[int, tuple[Any, tuple[Any, ...]]] = {}
+        self._live_artifact_registry: dict[int, tuple[Any, str, Any, Any]] = {}
 
     @staticmethod
     def _approval_id(audit: AuditRecord) -> str:
@@ -1782,3 +1785,155 @@ class RuntimeApprovalAuthorityService:
                 ))
             except Exception:
                 return False
+
+    def resolve_application_authority(self, authority_id: str) -> Any:
+        """Resolve and validate only the protected authority registered by this Runtime."""
+        if not isinstance(authority_id, str) or not authority_id.strip():
+            raise ValueError("application_authority_rejected")
+        with self._lock:
+            authority = self._authorities.get(authority_id)
+            if authority is None:
+                raise ValueError("application_authority_not_found")
+            if not self.validate_application_authority(authority):
+                raise ValueError("application_authority_rejected")
+            return authority
+
+    def resolve_application_provenance(self, authority_id: str) -> Any:
+        return self.create_execution_context(authority_id).provenance
+
+    def resolve_credential_continuity(self, authority_id: str) -> Any:
+        from .application_identity import CredentialContinuityAnchor
+        return CredentialContinuityAnchor.from_authority(self.resolve_application_authority(authority_id))
+
+    def validate_execution_context(self, context: Any) -> None:
+        from .application_identity import CredentialContinuityAnchor, LogicalApplicationIdentity
+        from .write_operations import normalize_write_operations
+        if type(context) is not RuntimeApplicationExecutionContext:
+            raise ValueError("runtime_context_owner_mismatch")
+        with self._lock:
+            entry = self._execution_context_registry.get(id(context))
+            if entry is None or entry[0] is not context or context._service is not self:
+                raise ValueError("runtime_context_owner_mismatch")
+            authority, identity, anchor, operations, operation_digest = entry[1]
+            current = self._authorities.get(authority.authority_id)
+            if current is None or not self.validate_application_authority(current):
+                raise ValueError("runtime_authority_invalid")
+            if current is not authority or context._authority is not authority:
+                raise ValueError("runtime_context_owner_mismatch")
+            if (context.identity.to_dict() != identity or context.continuity_anchor.to_dict() != anchor or
+                    context._expected_operations != operations or context.operation_set_digest != operation_digest):
+                raise ValueError("runtime_context_owner_mismatch")
+            if (LogicalApplicationIdentity.from_authority(authority).to_dict() != identity or
+                    CredentialContinuityAnchor.from_authority(authority).to_dict() != anchor or
+                    tuple(normalize_write_operations(context._expected_operations)) != operations or
+                    operation_digest != identity["application"]["operation_set_digest"]):
+                raise ValueError("runtime_context_owner_mismatch")
+
+    def validate_live_artifact(self, artifact: Any, context: Any, expected_kind: str) -> None:
+        self.validate_execution_context(context)
+        entry = self._live_artifact_registry.get(id(artifact))
+        if (entry is None or entry[0] is not artifact or entry[1] != expected_kind or
+                entry[2] is not context or artifact._live_context is not context or artifact.payload() != entry[3]):
+            raise ValueError("runtime_authority_required")
+
+    def create_execution_context(self, authority_id: str) -> Any:
+        """Create the service-owned live foundation for new execution evidence."""
+        from .application_identity import CredentialContinuityAnchor, LogicalApplicationIdentity
+        from .receipts import AuthorityProvenance
+        from .write_operations import normalize_write_operations
+        authority = self.resolve_application_authority(authority_id)
+        preview, _audit = self._resolve_audit(authority.preview_id, authority.revision)
+        canonical_preview = preview.get("canonical_payload")
+        if not isinstance(canonical_preview, Mapping):
+            raise ValueError("operation_set_mismatch")
+        operations = tuple(normalize_write_operations(canonical_preview["operation_intents"]))
+        identity = LogicalApplicationIdentity.from_authority(authority)
+        if canonical_preview.get("operation_set_digest") != identity.values()["operation_set_digest"]:
+            raise ValueError("operation_set_mismatch")
+        context = object.__new__(RuntimeApplicationExecutionContext)
+        object.__setattr__(context, "_service", self)
+        object.__setattr__(context, "_authority", authority)
+        object.__setattr__(context, "identity", identity)
+        object.__setattr__(context, "continuity_anchor", CredentialContinuityAnchor.from_authority(authority))
+        object.__setattr__(context, "_expected_operations", operations)
+        object.__setattr__(context, "operation_set_digest", identity.values()["operation_set_digest"])
+        snapshot = (authority, identity.to_dict(), context.continuity_anchor.to_dict(), operations, context.operation_set_digest)
+        self._execution_context_registry[id(context)] = (context, snapshot)
+        object.__setattr__(context, "_provenance", AuthorityProvenance._from_live_authority(authority, context))
+        return context
+
+class RuntimeApplicationExecutionContext:
+    """Ephemeral service-owned boundary for constructing new PC2-A evidence."""
+
+    __slots__ = ("_service", "_authority", "identity", "continuity_anchor", "_expected_operations", "operation_set_digest", "_provenance")
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        raise ValueError("runtime_context_internal_only")
+
+    @property
+    def _execution_context(self) -> "RuntimeApplicationExecutionContext":
+        return self
+
+    @property
+    def provenance(self) -> Any:
+        return self._provenance
+
+    @property
+    def expected_operations(self) -> tuple[dict[str, Any], ...]:
+        return tuple({key: list(value) if isinstance(value, list) else value for key, value in operation.items()}
+                     for operation in self._expected_operations)
+
+    @property
+    def service(self) -> Any:
+        return self._service
+
+    def to_dict(self) -> dict[str, Any]:
+        return self._authority.to_dict()
+
+    def __getattr__(self, name: str) -> Any:
+        if name in {"authority_id", "workspace_identity", "repository_identity", "preview_id", "revision",
+                    "sealed_preview_digest", "plan_digest", "operation_set_digest", "remote_snapshot_digest",
+                    "audit_id", "audit_digest", "approval_id", "approval_digest", "credential_binding_id",
+                    "credential_instance_id", "issuer_id", "credential_principal_identity", "github_subject_identity",
+                    "driver_identity", "remote_authority", "required_capabilities", "granted_capabilities", "issued_at", "expires_at"}:
+            return getattr(self._authority, name)
+        raise AttributeError(name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttributeError("runtime_execution_context_immutable")
+
+    def _require_current(self) -> None:
+        self._service.validate_execution_context(self)
+
+    def new_execution_state(self, **values: Any) -> Any:
+        from .execution_state import ApplicationExecutionState
+        self._require_current()
+        state = ApplicationExecutionState(values.pop("application_id", self.identity.application_id), self.identity, continuity_anchor=self.continuity_anchor, _live_context=self, **values)
+        self._service._live_artifact_registry[id(state)] = (state, "execution", self, state.payload())
+        return state
+
+    def new_attempt(self, operation_index: int, **values: Any) -> Any:
+        from .application_identity import operation_identity, request_identity
+        from .execution_state import OperationAttemptState
+        self._require_current()
+        operation = self._expected_operations[operation_index]
+        op_id = operation_identity(self.identity.application_id, operation_index, operation)
+        attempt = OperationAttemptState(self.identity.application_id, op_id, operation_index, operation, self._provenance,
+                                     self._authority.driver_identity, self._authority.remote_authority, request_identity(op_id),
+                                     _live_context=self, identity=self.identity, **values)
+        self._service._live_artifact_registry[id(attempt)] = (attempt, "attempt", self, attempt.payload())
+        return attempt
+
+    def new_receipt(self, operation_index: int, remote_result: Mapping[str, Any], started_at: str, completed_at: str) -> Any:
+        from .receipts import OperationReceipt
+        self._require_current()
+        receipt = OperationReceipt.create(self.identity, operation_index, self._expected_operations[operation_index], self, remote_result, started_at, completed_at)
+        self._service._live_artifact_registry[id(receipt)] = (receipt, "operation_receipt", self, receipt.payload())
+        return receipt
+
+    def finalize_application_receipt(self, receipts: Any, started_at: str, completed_at: str) -> Any:
+        from .receipts import ApplicationReceipt
+        self._require_current()
+        receipt = ApplicationReceipt.create(self.identity, self.operation_set_digest, self._expected_operations, receipts, started_at, completed_at)
+        self._service._live_artifact_registry[id(receipt)] = (receipt, "application_receipt", self, receipt.payload())
+        return receipt
