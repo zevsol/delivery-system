@@ -1,1 +1,1 @@
-"""Bundled MCP adapter for the read-only Planner tool."""
+"""Bundled MCP adapter for Delivery System Runtime tools."""

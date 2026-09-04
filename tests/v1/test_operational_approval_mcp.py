@@ -94,7 +94,7 @@ class OperationalApprovalMcpTests(unittest.TestCase):
                 return await client.call_tool(tool_name, {"payload": payload})
         return self.run_async(exercise())
 
-    def test_discovery_has_exact_five_tools_and_annotations(self):
+    def test_discovery_has_exact_six_tools_and_annotations(self):
         async def exercise():
             async with Client(mcp, raise_exceptions=True) as client:
                 return await client.list_tools()
@@ -103,6 +103,7 @@ class OperationalApprovalMcpTests(unittest.TestCase):
         expected = {
             "delivery_plan_preview", "delivery_get_audit_context", "delivery_record_audit",
             "delivery_record_approval", "delivery_issue_application_authority",
+            "delivery_apply_approved_work_items",
         }
         self.assertEqual(set(by_name), expected)
         for name, expected_values in {
@@ -425,7 +426,7 @@ class OperationalApprovalMcpTests(unittest.TestCase):
                     return tools, result
 
             tools, result = self.run_async(exercise())
-            self.assertEqual(len(tools.tools), 5)
+            self.assertEqual(len(tools.tools), 6)
             self.assertTrue(result.is_error)
             self.assertIn("attestation_service_unavailable", str(result.content))
 

@@ -267,7 +267,7 @@ class WriteEligibilityRuntimeTests(unittest.TestCase):
             )
             self.assertEqual(auditor.record_audit(preview["preview_id"], 1, audit_context["audit_context_digest"], evaluations, [finding]).approval_eligible, False)
 
-    def test_existing_mcp_tools_surface_true_booleans_without_new_tools(self):
+    def test_current_mcp_tools_surface_true_booleans_with_write_tool(self):
         with tempfile.TemporaryDirectory() as directory:
             context = RuntimeContext.from_workspace_root(directory)
             store = InMemoryPreviewStore(context.workspace_identity, TRUST)
@@ -289,6 +289,7 @@ class WriteEligibilityRuntimeTests(unittest.TestCase):
             self.assertEqual({tool.name for tool in tools.tools}, {
                 "delivery_plan_preview", "delivery_get_audit_context", "delivery_record_audit",
                 "delivery_record_approval", "delivery_issue_application_authority",
+                "delivery_apply_approved_work_items",
             })
 
 
