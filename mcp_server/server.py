@@ -8,18 +8,20 @@ from typing import Any, Literal
 
 from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
-from pydantic import BaseModel, ConfigDict, Field, StrictInt
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr
 
 from delivery_system.runtime import (
     AuditContextService, RuntimeApprovalAuthorityService, RuntimeContext, RuntimePlanner, SQLitePreviewStore,
 )
+from delivery_system.applier import ApplyResult
+from delivery_system.execution_store import SQLiteExecutionStore
 from delivery_system.drivers.contract import DriverTrustContext
 from delivery_system.auditor import FindingDraft, RuleEvaluationDraft, RuntimeAuditor
 from delivery_system.rules import ResultClass, RuleRegistry, SemanticOutcome, build_registry_v1
 
 
 SERVER_NAME = "delivery-system-planner"
-SERVER_VERSION = "0.4.0"
+SERVER_VERSION = "0.5.0"
 TOOL_NAME = "delivery_plan_preview"
 TOOL_ANNOTATIONS = ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=False)
 
@@ -235,13 +237,26 @@ class IssueApplicationAuthorityOutput(StrictModel):
     expires_at: str
 
 
+class ApplyApprovedWorkItemsInput(StrictModel):
+    application_authority_id: StrictStr = Field(min_length=1)
+
+
+class ApplyApprovedWorkItemsOutput(StrictModel):
+    application_id: StrictStr = Field(min_length=1)
+    state: Literal["Pending", "Applying", "PartiallyApplied", "Failed", "Blocked", "OutcomeUnknown", "Applied"]
+    next_operation_index: StrictInt = Field(ge=0)
+    application_receipt_id: StrictStr | None = Field(default=None, min_length=1)
+    recovery_code: StrictStr | None = Field(default=None, min_length=1)
+
+
 def _production_clock() -> datetime:
     return datetime.now(timezone.utc)
 
 
 def create_server(context: RuntimeContext | None = None, store: Any | None = None, driver: Any = None,
                   trust_context: DriverTrustContext | None = None,
-                  approval_authority_service: RuntimeApprovalAuthorityService | None = None) -> MCPServer:
+                  approval_authority_service: RuntimeApprovalAuthorityService | None = None,
+                  execution_store: SQLiteExecutionStore | None = None) -> MCPServer:
     if (driver is None) != (trust_context is None):
         raise ValueError("driver_trust_context_required")
     if store is not None and trust_context is not None:
@@ -258,6 +273,16 @@ def create_server(context: RuntimeContext | None = None, store: Any | None = Non
         approval_authority_service = RuntimeApprovalAuthorityService(
             context, store, None, clock=_production_clock,
         )
+    if execution_store is not None:
+        if (context is None or store is None or approval_authority_service is None or
+                type(execution_store) is not SQLiteExecutionStore or
+                type(approval_authority_service) is not RuntimeApprovalAuthorityService or
+                type(context) is not RuntimeContext or
+                approval_authority_service.context is not context or
+                approval_authority_service.store is not store or
+                execution_store.workspace_identity != context.workspace_identity or
+                execution_store.runtime_service is not approval_authority_service):
+            raise ValueError("write_execution_boundary_invalid")
     mcp = MCPServer(SERVER_NAME)
     registry = build_registry_v1()
 
@@ -356,6 +381,28 @@ def create_server(context: RuntimeContext | None = None, store: Any | None = Non
         if not approval_authority_service.validate_application_authority(authority):
             raise ValueError("application_authority_rejected")
         return IssueApplicationAuthorityOutput.model_validate(authority.to_dict())
+
+    @mcp.tool(
+        name="delivery_apply_approved_work_items",
+        description="Apply an existing Runtime ApplicationAuthority through the bounded Applier; may mutate GitHub when the host write execution boundary is configured.",
+        annotations=ToolAnnotations(read_only_hint=False, destructive_hint=True, open_world_hint=True),
+        structured_output=True,
+    )
+    def delivery_apply_approved_work_items(payload: ApplyApprovedWorkItemsInput) -> ApplyApprovedWorkItemsOutput:
+        if payload.application_authority_id != payload.application_authority_id.strip():
+            raise ValueError("application_authority_id_invalid")
+        if context is None or store is None or approval_authority_service is None or execution_store is None:
+            raise ValueError("write_execution_boundary_unavailable")
+        result: ApplyResult = approval_authority_service.create_applier(execution_store).apply(
+            payload.application_authority_id,
+        )
+        return ApplyApprovedWorkItemsOutput.model_validate({
+            "application_id": result.application_id,
+            "state": result.state,
+            "next_operation_index": result.next_operation_index,
+            "application_receipt_id": result.application_receipt_id,
+            "recovery_code": result.recovery_code,
+        })
 
     return mcp
 
