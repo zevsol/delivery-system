@@ -26,6 +26,7 @@ from delivery_system.protocol import canonical_payload, digest
 SOURCE_VERIFICATION_DOMAIN = "delivery-system:github-app-installation-capability-evidence:v1"
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,127}$")
 _SUPPORTED_REQUIREMENTS = ("issues:write",)
+GITHUB_APP_INSTALLATION_CREDENTIAL_CLASS = "github-app-installation-token"
 _PERMISSIONS = frozenset({"issues"})
 
 
@@ -60,6 +61,10 @@ class GitHubAppInstallationCapabilityEvidence:
     expires_at: str
     observed_at: str
     credential_instance_id: str
+
+
+def github_app_installation_principal(app_id: int, installation_id: int) -> str:
+    return f"github-app-installation-{app_id}-{installation_id}"
 
 
 class GitHubAppInstallationEvidenceSource(Protocol):
@@ -199,6 +204,34 @@ def _permission(evidence: GitHubAppInstallationCapabilityEvidence, name: str) ->
     return dict(evidence.effective_permissions).get(name)
 
 
+def github_app_installation_source_verification_digest(
+    evidence: GitHubAppInstallationCapabilityEvidence, request: Mapping[str, Any]
+) -> str:
+    return digest({
+        "domain": SOURCE_VERIFICATION_DOMAIN,
+        "evidence": {
+            "app_id": evidence.app_id,
+            "installation_id": evidence.installation_id,
+            "installation_account_identity": evidence.installation_account_identity,
+            "repository_id": evidence.repository_id,
+            "repository_identity": evidence.repository_identity,
+            "repository_scope": list(evidence.repository_scope),
+            "effective_permissions": {key: value for key, value in evidence.effective_permissions},
+            "observed_at": evidence.observed_at,
+            "expires_at": evidence.expires_at,
+            "credential_instance_id": evidence.credential_instance_id,
+        },
+        "request_binding": {
+            key: request[key] for key in (
+                "repository_identity", "required_capabilities", "github_subject_identity",
+                "driver_identity", "remote_authority", "preview_id", "revision",
+                "operation_set_digest", "remote_snapshot_digest", "evidence_digest",
+                "challenge_digest",
+            )
+        },
+    })
+
+
 class GitHubAppCredentialCapabilityProvider(CredentialCapabilityProvider):
     """Concrete offline provider behind the existing Attestation V2 boundary."""
 
@@ -252,32 +285,6 @@ class GitHubAppCredentialCapabilityProvider(CredentialCapabilityProvider):
             "challenge_digest": request.challenge_digest,
         }
 
-    @staticmethod
-    def _source_digest(evidence: GitHubAppInstallationCapabilityEvidence, request: Mapping[str, Any]) -> str:
-        return digest({
-            "domain": SOURCE_VERIFICATION_DOMAIN,
-            "evidence": {
-                "app_id": evidence.app_id,
-                "installation_id": evidence.installation_id,
-                "installation_account_identity": evidence.installation_account_identity,
-                "repository_id": evidence.repository_id,
-                "repository_identity": evidence.repository_identity,
-                "repository_scope": list(evidence.repository_scope),
-                "effective_permissions": {key: value for key, value in evidence.effective_permissions},
-                "observed_at": evidence.observed_at,
-                "expires_at": evidence.expires_at,
-                "credential_instance_id": evidence.credential_instance_id,
-            },
-            "request_binding": {
-                key: request[key] for key in (
-                    "repository_identity", "required_capabilities", "github_subject_identity",
-                    "driver_identity", "remote_authority", "preview_id", "revision",
-                    "operation_set_digest", "remote_snapshot_digest", "evidence_digest",
-                    "challenge_digest",
-                )
-            },
-        })
-
     def attest(self, request: CredentialCapabilityRequest) -> SignedCredentialCapabilityAttestation:
         try:
             if not isinstance(request, CredentialCapabilityRequest):
@@ -307,7 +314,9 @@ class GitHubAppCredentialCapabilityProvider(CredentialCapabilityProvider):
             if now >= expires:
                 raise GitHubAppCapabilityProviderError("evidence_expired")
             granted = ("issues:write",) if _permission(evidence, "issues") == "write" else ()
-            source_digest = self._source_digest(evidence, {**values, "repository_identity": values["repository_identity"]})
+            source_digest = github_app_installation_source_verification_digest(
+                evidence, {**values, "repository_identity": values["repository_identity"]}
+            )
             try:
                 raw_issuer_id = self.__signer.issuer_id
                 raw_key_id = self.__signer.key_id
@@ -321,7 +330,7 @@ class GitHubAppCredentialCapabilityProvider(CredentialCapabilityProvider):
             nonce = _id(self._dependency_call(self.__nonce_factory), "nonce")
             claims = CredentialCapabilityAttestationClaims(
                 attestation_version="2", attestation_id="", issuer_id=issuer_id, key_id=key_id,
-                signature_algorithm=algorithm, credential_class="github-app-installation-token",
+                signature_algorithm=algorithm, credential_class=GITHUB_APP_INSTALLATION_CREDENTIAL_CLASS,
                 credential_instance_id=instance_id,
                 github_subject_identity=values["github_subject_identity"],
                 repository_identity=values["repository_identity"], granted_capabilities=granted,
@@ -331,7 +340,7 @@ class GitHubAppCredentialCapabilityProvider(CredentialCapabilityProvider):
                 remote_snapshot_digest=values["remote_snapshot_digest"], evidence_digest=values["evidence_digest"],
                 issued_at=issued_at, expires_at=evidence.expires_at, nonce=nonce,
                 source_verification_digest=source_digest, challenge_digest=values["challenge_digest"],
-                credential_principal_identity=f"github-app-installation-{evidence.app_id}-{evidence.installation_id}",
+                credential_principal_identity=github_app_installation_principal(evidence.app_id, evidence.installation_id),
             )
             payload = canonical_payload(claims.to_payload()).encode("utf-8")
             proof = self._dependency_call(lambda: self.__signer.sign(payload))

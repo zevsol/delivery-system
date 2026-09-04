@@ -139,7 +139,22 @@ def _apply(service: Any, store: SQLiteExecutionStore, capability: Any, authority
                 raise
             return ApplyResult(application_id, state.state, state.next_operation_index,
                                recovery_code="application_recovery_required")
-        observation = capability.dispatch(attempt.operation["operation_kind"], command)
+        try:
+            observation = capability.dispatch(context, attempt.operation["operation_kind"], command)
+        except ValueError as exc:
+            code = str(exc)
+            if code in {
+                "credential_capability_unregistered", "credential_principal_mismatch",
+                "credential_instance_mismatch", "credential_repository_mismatch",
+                "credential_scope_mismatch", "credential_capability_mismatch",
+                "credential_currentness_mismatch", "credential_expired",
+            }:
+                state = store.settle_operation(capability, application_id, state.state_digest,
+                                               attempt.operation_identity, attempt.attempt_digest, owner,
+                                               context, "Blocked", code, service._utc(service.clock()))
+                return ApplyResult(application_id, state.state, state.next_operation_index,
+                                   recovery_code=code)
+            raise
         try:
             context._require_current()
         except ValueError as exc:

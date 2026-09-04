@@ -13,6 +13,11 @@ from delivery_system.attestation import (
     CredentialCapabilityAttestationClaims,
     SignedCredentialCapabilityAttestation,
 )
+from delivery_system.attestation_github_app import (
+    GitHubAppInstallationCapabilityEvidence,
+    github_app_installation_principal,
+    github_app_installation_source_verification_digest,
+)
 from delivery_system.protocol import canonical_payload
 
 
@@ -41,6 +46,7 @@ class FakeCredentialCapabilityProvider(CredentialCapabilityProvider):
         self.challenge_digest_override: str | None = None
         self.attestation_version = attestation_version
         self.credential_principal_identity = "fake-app-installation-1"
+        self.lease_evidence: GitHubAppInstallationCapabilityEvidence | None = None
 
     def attest(self, request: CredentialCapabilityRequest) -> SignedCredentialCapabilityAttestation | Any:
         self.calls += 1
@@ -50,6 +56,24 @@ class FakeCredentialCapabilityProvider(CredentialCapabilityProvider):
         if self.malformed is not None:
             self.last_attestation = self.malformed
             return self.last_attestation
+        evidence = self.lease_evidence
+        principal = self.credential_principal_identity
+        source_verification_digest = request.evidence_digest
+        if evidence is not None:
+            principal = github_app_installation_principal(evidence.app_id, evidence.installation_id)
+            source_verification_digest = github_app_installation_source_verification_digest(evidence, {
+                "repository_identity": request.repository_identity,
+                "required_capabilities": request.required_capabilities,
+                "github_subject_identity": request.github_subject_identity,
+                "driver_identity": request.driver_identity,
+                "remote_authority": request.remote_authority,
+                "preview_id": request.preview_id,
+                "revision": request.revision,
+                "operation_set_digest": request.operation_set_digest,
+                "remote_snapshot_digest": request.remote_snapshot_digest,
+                "evidence_digest": request.evidence_digest,
+                "challenge_digest": request.challenge_digest,
+            })
         claims = CredentialCapabilityAttestationClaims(
             attestation_version=self.attestation_version, attestation_id="", issuer_id="host-issuer", key_id="key-1",
             signature_algorithm="ed25519", credential_class="github-app-installation-token",
@@ -67,9 +91,9 @@ class FakeCredentialCapabilityProvider(CredentialCapabilityProvider):
             issued_at=self.issued_at,
             expires_at=self.expires_at,
             nonce="fake-nonce-1",
-            source_verification_digest=request.evidence_digest,
+            source_verification_digest=source_verification_digest,
             challenge_digest=(self.challenge_digest_override or request.challenge_digest) if self.attestation_version == "2" else "",
-            credential_principal_identity=self.credential_principal_identity if self.attestation_version == "2" else "",
+            credential_principal_identity=principal if self.attestation_version == "2" else "",
         )
         payload = canonical_payload(claims.to_payload()).encode("utf-8")
         proof = base64.urlsafe_b64encode(hashlib.sha512(payload).digest()).decode("ascii").rstrip("=")
