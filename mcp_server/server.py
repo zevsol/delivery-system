@@ -410,8 +410,13 @@ def create_server(context: RuntimeContext | None = None, store: Any | None = Non
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="delivery-system-mcp")
     parser.add_argument("--workspace-root", required=True)
+    parser.add_argument("--host-profile", choices=("github-app-write",), default=None)
     args = parser.parse_args(argv)
     context = RuntimeContext.from_workspace_root(args.workspace_root)
+    if args.host_profile == "github-app-write":
+        from delivery_system.host_composition import compose_write_enabled_host
+        compose_write_enabled_host(context).create_server().run()
+        return
     store = SQLitePreviewStore(context)
     create_server(context, store).run()
 
