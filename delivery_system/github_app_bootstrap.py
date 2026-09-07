@@ -263,14 +263,17 @@ def _open_private_key(path: str) -> BinaryIO:
 class FileGitHubAppPrivateKeySource:
     """Bounded, file-backed RSA key loader with secret-safe failures."""
 
-    __slots__ = ("__path",)
+    __slots__ = ("__path", "__opened_file_validator")
 
-    def __init__(self, path: str | os.PathLike[str]) -> None:
+    def __init__(self, path: str | os.PathLike[str], *,
+                 opened_file_validator: Callable[[int], None] | None = None) -> None:
         if isinstance(path, os.PathLike):
             path = os.fspath(path)
-        if type(path) is not str or not path or not os.path.isabs(path):
+        if (type(path) is not str or not path or not os.path.isabs(path) or
+                (opened_file_validator is not None and not callable(opened_file_validator))):
             raise _configuration_error()
         object.__setattr__(self, "_FileGitHubAppPrivateKeySource__path", path)
+        object.__setattr__(self, "_FileGitHubAppPrivateKeySource__opened_file_validator", opened_file_validator)
 
     def __setattr__(self, name: str, value: object) -> None:
         raise _configuration_error()
@@ -286,6 +289,8 @@ class FileGitHubAppPrivateKeySource:
 
     def __load_rsa_private_key(self) -> RSAPrivateKey:
         with _open_private_key(self.__path) as stream:
+            if self.__opened_file_validator is not None:
+                self.__opened_file_validator(stream.fileno())
             file_stat = os.fstat(stream.fileno())
             if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_size <= 0 or file_stat.st_size > MAX_PRIVATE_KEY_BYTES:
                 raise _acquisition_error()
