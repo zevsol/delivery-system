@@ -35,6 +35,14 @@ class TokenProvider(Protocol):
     def get_token(self) -> str | None: ...
 
 
+class InstallationReadAuthProvider(Protocol):
+    """One Host-owned authority for an installation read token and subject."""
+
+    def get_token(self) -> str | None: ...
+
+    def authenticated_subject_identity(self) -> str: ...
+
+
 class RestTransport(Protocol):
     def request(self, method: str, path: str, headers: Mapping[str, str]) -> "TransportResponse": ...
 
@@ -90,7 +98,7 @@ class HttpsRestTransport:
             body = response.read(MAX_RESPONSE_BYTES + 1)
             if len(body) > MAX_RESPONSE_BYTES:
                 raise RestDriverError("query_scope_incomplete")
-            return TransportResponse(response.status, dict(response.getheaders()), body)
+            return TransportResponse(response.status, _normalise_response_headers(response.getheaders()), body)
         except socket.timeout as exc:
             raise RestDriverError("remote_timeout") from exc
         except RestDriverError:
@@ -101,12 +109,50 @@ class HttpsRestTransport:
             connection.close()
 
 
+def _normalise_response_headers(raw_headers: object) -> dict[str, str]:
+    grouped: dict[str, tuple[str, list[str]]] = {}
+    try:
+        for pair in raw_headers:  # type: ignore[union-attr]
+            if not isinstance(pair, (tuple, list)) or len(pair) != 2:
+                raise ValueError
+            key, value = pair
+            if type(key) is not str or type(value) is not str:
+                raise ValueError
+            folded = key.lower()
+            if folded in grouped:
+                grouped[folded][1].append(value)
+            else:
+                grouped[folded] = (key, [value])
+    except (TypeError, ValueError):
+        raise RestDriverError("driver_response_invalid") from None
+    return {key: ",".join(values) for key, values in grouped.values()}
+
+
 def _header(headers: Mapping[str, str], name: str) -> str | None:
     return next((value for key, value in headers.items() if key.lower() == name.lower()), None)
 
 
+def _headers_named(headers: Mapping[str, object], name: str) -> tuple[object, ...]:
+    return tuple(
+        value for key, value in headers.items()
+        if isinstance(key, str) and key.lower() == name.lower()
+    )
+
+
+def _single_header(headers: Mapping[str, object], name: str) -> str | None:
+    values = _headers_named(headers, name)
+    if len(values) > 1:
+        raise RestDriverError("driver_response_invalid")
+    if not values:
+        return None
+    value = values[0]
+    if type(value) is not str or "," in value:
+        raise RestDriverError("driver_response_invalid")
+    return value
+
+
 def _json(response: TransportResponse) -> Any:
-    content_type = _header(response.headers, "Content-Type") or ""
+    content_type = _single_header(response.headers, "Content-Type") or ""
     if "json" not in content_type.lower():
         raise RestDriverError("driver_response_invalid")
     try:
@@ -144,15 +190,14 @@ class LocalRestReadOnlyDriver(ReadOnlyDriver):
         parsed = urlparse(API_ORIGIN + path)
         if parsed.scheme != "https" or parsed.netloc != API_HOST:
             raise RestDriverError("origin_redirect_forbidden")
+        token = self._request_token()
         requests = getattr(self._read_state, "requests", 0) + 1
         self._read_state.requests = requests
         if requests > MAX_REQUESTS_PER_READ:
             raise RestDriverError("query_scope_incomplete")
         request_headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": API_VERSION, "User-Agent": USER_AGENT}
-        if self.token_provider is not None:
-            token = self.token_provider.get_token()
-            if token:
-                request_headers["Authorization"] = f"Bearer {token}"
+        if token:
+            request_headers["Authorization"] = f"Bearer {token}"
         response = self.transport.request("GET", path, request_headers)
         if not isinstance(response, TransportResponse):
             raise RestDriverError("driver_response_invalid")
@@ -161,10 +206,15 @@ class LocalRestReadOnlyDriver(ReadOnlyDriver):
         if response.status >= 300:
             if 300 <= response.status < 400:
                 raise RestDriverError("origin_redirect_forbidden")
-            if response.status == 403 and _header(response.headers, "X-RateLimit-Remaining") == "0":
+            if response.status == 403 and _single_header(response.headers, "X-RateLimit-Remaining") == "0":
                 raise RestDriverError("rate_limited")
             raise RestDriverError(_status_error(response.status))
         return _json(response), response.headers
+
+    def _request_token(self) -> str | None:
+        if self.token_provider is None:
+            return None
+        return self.token_provider.get_token()
 
     def _collection(self, path: str, *, limit: int | None = None) -> list[Mapping[str, Any]]:
         values: list[Mapping[str, Any]] = []
@@ -233,24 +283,38 @@ class LocalRestReadOnlyDriver(ReadOnlyDriver):
             "repository_url": str(raw["repository_url"]),
         }
 
-    def read_repository(self, repository: str, query_scope: Mapping[str, object]) -> DriverReadResponse:
-        self._read_state.requests = 0
-        from delivery_system.protocol import canonical_payload
-        if canonical_payload(dict(query_scope)) != canonical_payload(self.fixed_query_scope):
-            raise RestDriverError("query_scope_incomplete")
-        requested = normalize_repository_identity(repository)
-        owner, name = requested.split("/")
-        prefix = f"/repos/{quote(owner, safe='')}/{quote(name, safe='')}"
-        user, _ = self._get("/user")
-        repo, _ = self._get(prefix)
-        if not isinstance(user, Mapping) or not isinstance(repo, Mapping):
-            raise RestDriverError("driver_response_invalid")
-        if any(user.get(key) in (None, "") for key in ("id", "node_id", "login")):
-            raise RestDriverError("driver_response_invalid")
+    def _read_repository_after_auth(
+        self,
+        repository: str,
+        requested: str,
+        query_scope: Mapping[str, object],
+        prefix: str,
+        repo: Mapping[str, Any],
+        *,
+        authenticated_subject: str,
+        authenticated_user_id: str | None = None,
+        authenticated_user_node_id: str | None = None,
+        authenticated_login: str | None = None,
+        strict_permissions: bool = False,
+    ) -> DriverReadResponse:
         if any(repo.get(key) in (None, "") for key in ("id", "node_id", "full_name", "visibility")):
             raise RestDriverError("driver_response_invalid")
         if str(repo.get("full_name", "")).lower() != requested:
             raise RestDriverError("repository_identity_mismatch")
+        raw_permissions = repo.get("permissions")
+        if strict_permissions:
+            if (
+                not isinstance(raw_permissions, Mapping)
+                or type(raw_permissions.get("pull")) is not bool
+                or type(raw_permissions.get("push")) is not bool
+            ):
+                raise RestDriverError("driver_response_invalid")
+            read_permission = raw_permissions["pull"]
+            write_permission = raw_permissions["push"]
+        else:
+            permissions = raw_permissions or {}
+            read_permission = bool(permissions.get("pull"))
+            write_permission = bool(permissions.get("push"))
         raw_issues = self._collection(prefix + "/issues?state=all&per_page=100", limit=MAX_ISSUES)
         expected_repo_url = API_ORIGIN + prefix
         if any(str(raw.get("repository_url", "")).rstrip("/").lower() != expected_repo_url.lower() for raw in raw_issues if raw.get("pull_request") is None):
@@ -300,27 +364,145 @@ class LocalRestReadOnlyDriver(ReadOnlyDriver):
         query = dict(query_scope)
         query.setdefault("api_origin", API_ORIGIN)
         content = {
-            "schema_version": "github-rest-remote-content-v1",
             "requested_repository": repository, "canonical_repository": requested,
             "remote_repository_id": str(repo.get("id")), "remote_repository_node_id": str(repo.get("node_id")),
-            "authenticated_user_id": str(user.get("id")), "authenticated_user_node_id": str(user.get("node_id")),
-            "authenticated_login": str(user.get("login")), "authenticated_subject": str(user.get("node_id")),
-            "visibility": repo.get("visibility"), "permissions": {"read": bool((repo.get("permissions") or {}).get("pull")), "write": bool((repo.get("permissions") or {}).get("push"))},
+            "authenticated_subject": authenticated_subject,
+            "visibility": repo.get("visibility"), "permissions": {"read": read_permission, "write": write_permission},
             "capabilities": {"issues": True, "relationships": True}, "query_scope": query,
             "query_complete": True, "pagination_complete": True, "issue_records": issues,
             "relationship_records": normalized_relationships,
             "evidence_material": [{"source_identity": self.trusted_driver_identity, "repository_identity": requested, "query_scope": query, "payload": {"issue_records": issues, "relationship_records": normalized_relationships}}],
             "source_identity": self.trusted_driver_identity,
         }
+        optional = {
+            "schema_version": "github-rest-remote-content-v1",
+            "authenticated_user_id": authenticated_user_id,
+            "authenticated_user_node_id": authenticated_user_node_id,
+            "authenticated_login": authenticated_login,
+        }
+        content.update({key: value for key, value in optional.items() if value is not None})
         from delivery_system.protocol import digest
         return DriverReadResponse(
             requested_repository=repository, canonical_repository=requested,
-            remote_repository_id=str(repo.get("id")), authenticated_subject=str(user.get("node_id")),
+            remote_repository_id=str(repo.get("id")), authenticated_subject=authenticated_subject,
             visibility=str(repo.get("visibility")), permissions=content["permissions"],
             capabilities={"issues": True, "relationships": True}, query_scope=query,
             query_complete=True, pagination_complete=True, issue_records=issues,
             relationship_records=normalized_relationships, evidence_material=content["evidence_material"],
             source_identity=self.trusted_driver_identity, remote_content_digest=digest(content),
-            remote_repository_node_id=str(repo.get("node_id")), authenticated_user_id=str(user.get("id")),
-            authenticated_user_node_id=str(user.get("node_id")), authenticated_login=str(user.get("login")),
+            remote_repository_node_id=str(repo.get("node_id")), authenticated_user_id=authenticated_user_id,
+            authenticated_user_node_id=authenticated_user_node_id, authenticated_login=authenticated_login,
+        )
+
+    def read_repository(self, repository: str, query_scope: Mapping[str, object]) -> DriverReadResponse:
+        self._read_state.requests = 0
+        from delivery_system.protocol import canonical_payload
+        if canonical_payload(dict(query_scope)) != canonical_payload(self.fixed_query_scope):
+            raise RestDriverError("query_scope_incomplete")
+        requested = normalize_repository_identity(repository)
+        owner, name = requested.split("/")
+        prefix = f"/repos/{quote(owner, safe='')}/{quote(name, safe='')}"
+        user, _ = self._get("/user")
+        repo, _ = self._get(prefix)
+        if not isinstance(user, Mapping) or not isinstance(repo, Mapping):
+            raise RestDriverError("driver_response_invalid")
+        if any(user.get(key) in (None, "") for key in ("id", "node_id", "login")):
+            raise RestDriverError("driver_response_invalid")
+        return self._read_repository_after_auth(
+            repository, requested, query_scope, prefix, repo,
+            authenticated_subject=str(user.get("node_id")),
+            authenticated_user_id=str(user.get("id")),
+            authenticated_user_node_id=str(user.get("node_id")),
+            authenticated_login=str(user.get("login")),
+        )
+
+
+class GitHubAppInstallationReadOnlyDriver(LocalRestReadOnlyDriver):
+    """Read-only GitHub REST Driver authenticated as one App installation."""
+
+    contract_version = "github-app-installation-rest-readonly-v1"
+    trusted_driver_identity = "delivery-system:github-app-installation-rest-readonly-v1"
+    _MAX_REPOSITORY_ID = (10 ** 20) - 1
+    _INSTALLATION_SCOPE_PATH = "/installation/repositories?per_page=100"
+
+    def __init__(
+        self,
+        auth_provider: InstallationReadAuthProvider,
+        expected_repository_id: int,
+        transport: RestTransport | None = None,
+    ) -> None:
+        if (
+            not callable(getattr(auth_provider, "get_token", None))
+            or not callable(getattr(auth_provider, "authenticated_subject_identity", None))
+        ):
+            raise ValueError("installation_auth_provider_invalid")
+        if type(expected_repository_id) is not int or not 1 <= expected_repository_id <= self._MAX_REPOSITORY_ID:
+            raise ValueError("repository_id_invalid")
+        self._installation_auth_provider = auth_provider
+        self.expected_repository_id = expected_repository_id
+        super().__init__(transport=transport or HttpsRestTransport(), token_provider=None)
+
+    def _request_token(self) -> str | None:
+        failed = False
+        token = None
+        try:
+            token = self._installation_auth_provider.get_token()
+        except Exception:
+            failed = True
+        if failed:
+            raise RestDriverError("authentication_failed")
+        if (
+            type(token) is not str
+            or not token
+            or not token.strip()
+            or token != token.strip()
+        ):
+            raise RestDriverError("authentication_failed")
+        return token
+
+    def _validate_installation_scope(self, data: object, requested: str) -> None:
+        if not isinstance(data, Mapping) or type(data.get("total_count")) is not int or data.get("total_count") != 1:
+            raise RestDriverError("installation_scope_invalid")
+        repositories = data.get("repositories")
+        if type(repositories) is not list or len(repositories) != 1 or not isinstance(repositories[0], Mapping):
+            raise RestDriverError("installation_scope_invalid")
+        repository = repositories[0]
+        if type(repository.get("id")) is not int or repository.get("id") != self.expected_repository_id:
+            raise RestDriverError("installation_scope_invalid")
+        full_name = repository.get("full_name")
+        if type(full_name) is not str or full_name != requested:
+            raise RestDriverError("installation_scope_invalid") from None
+
+    def read_repository(self, repository: str, query_scope: Mapping[str, object]) -> DriverReadResponse:
+        self._read_state.requests = 0
+        from delivery_system.protocol import canonical_payload
+        if canonical_payload(dict(query_scope)) != canonical_payload(self.fixed_query_scope):
+            raise RestDriverError("query_scope_incomplete")
+        requested = normalize_repository_identity(repository)
+        owner, name = requested.split("/")
+        prefix = f"/repos/{quote(owner, safe='')}/{quote(name, safe='')}"
+        scope, scope_headers = self._get(self._INSTALLATION_SCOPE_PATH)
+        link_values = _headers_named(scope_headers, "Link")
+        if len(link_values) > 1 or (
+            link_values and (type(link_values[0]) is not str or link_values[0] != "")
+        ):
+            raise RestDriverError("query_scope_incomplete")
+        self._validate_installation_scope(scope, requested)
+        subject_failed = False
+        authenticated_subject = None
+        try:
+            authenticated_subject = self._installation_auth_provider.authenticated_subject_identity()
+        except Exception:
+            subject_failed = True
+        if subject_failed:
+            raise RestDriverError("installation_auth_invalid")
+        if type(authenticated_subject) is not str or not authenticated_subject.strip():
+            raise RestDriverError("installation_auth_invalid")
+        repo, _ = self._get(prefix)
+        if not isinstance(repo, Mapping) or type(repo.get("id")) is not int or repo.get("id") != self.expected_repository_id:
+            raise RestDriverError("repository_identity_mismatch")
+        return self._read_repository_after_auth(
+            repository, requested, query_scope, prefix, repo,
+            authenticated_subject=authenticated_subject,
+            strict_permissions=True,
         )

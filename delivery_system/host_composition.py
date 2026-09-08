@@ -23,6 +23,7 @@ from .attestation_github_app import (
     GitHubAppCredentialCapabilityProvider,
     GitHubAppInstallationCapabilityEvidence,
     GitHubAppInstallationEvidenceRequest,
+    github_app_installation_principal,
 )
 from .attestation_key_source import FileEd25519PrivateKeySource, FileEd25519PublicKeySource
 from .attestation_runtime import RuntimeAttestationOrchestrationService
@@ -33,7 +34,7 @@ from .attestation_signing import (
     TrustedEd25519Key,
 )
 from .drivers.contract import DriverTrustContext
-from .drivers.rest import LocalRestReadOnlyDriver
+from .drivers.rest import GitHubAppInstallationReadOnlyDriver
 from .github_app_bootstrap import (
     GitHubAppBootstrapConfig,
     GitHubAppBootstrapTransport,
@@ -248,24 +249,40 @@ def _validate_external_key_paths(context: RuntimeContext, config: HostConfigurat
         raise HostCompositionError("host_key_role_path_conflict")
 
 
-class _LeaseTokenView:
-    """One read-driver view over the already-acquired Host lease."""
+class _LeaseReadAuthView:
+    """One read-auth view over the already-acquired Host lease."""
 
     __slots__ = ("__lease",)
 
     def __init__(self, lease: GitHubAppInstallationCredentialLease) -> None:
         if type(lease) is not GitHubAppInstallationCredentialLease:
             raise HostCompositionError("host_credential_capability_invalid")
-        object.__setattr__(self, "_LeaseTokenView__lease", lease)
+        object.__setattr__(self, "_LeaseReadAuthView__lease", lease)
 
     def __setattr__(self, name: str, value: object) -> None:
         raise HostCompositionError("host_credential_capability_invalid")
 
     def __repr__(self) -> str:
-        return "<_LeaseTokenView protected>"
+        return "<_LeaseReadAuthView protected>"
+
+    def __copy__(self) -> "_LeaseReadAuthView":
+        raise HostCompositionError("host_credential_capability_copy_forbidden")
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> "_LeaseReadAuthView":
+        raise HostCompositionError("host_credential_capability_copy_forbidden")
+
+    def __reduce__(self) -> Any:
+        raise HostCompositionError("host_credential_capability_serialization_forbidden")
+
+    def __reduce_ex__(self, protocol: int) -> Any:
+        raise HostCompositionError("host_credential_capability_serialization_forbidden")
 
     def get_token(self) -> str:
         return self.__lease._dispatch_token()
+
+    def authenticated_subject_identity(self) -> str:
+        snapshot = self.__lease._snapshot()
+        return github_app_installation_principal(snapshot.app_id, snapshot.installation_id)
 
 
 class _LeaseEvidenceSource:
@@ -429,12 +446,15 @@ def _compose_write_enabled_host(
         nonce_factory=nonce_factory,
     )
     trust_context = DriverTrustContext(
-        LocalRestReadOnlyDriver.trusted_driver_identity,
-        LocalRestReadOnlyDriver.origin,
-        LocalRestReadOnlyDriver.contract_version,
+        GitHubAppInstallationReadOnlyDriver.trusted_driver_identity,
+        GitHubAppInstallationReadOnlyDriver.origin,
+        GitHubAppInstallationReadOnlyDriver.contract_version,
     )
-    token_view = _LeaseTokenView(lease)
-    driver = LocalRestReadOnlyDriver(token_provider=token_view)
+    read_auth_view = _LeaseReadAuthView(lease)
+    driver = GitHubAppInstallationReadOnlyDriver(
+        read_auth_view,
+        configuration.github_app.repository_id,
+    )
     store = SQLitePreviewStore(context, trust_context=trust_context)
     attestation_service = RuntimeAttestationOrchestrationService(
         context,
