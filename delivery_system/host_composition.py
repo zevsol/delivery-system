@@ -284,6 +284,10 @@ class _LeaseReadAuthView:
         snapshot = self.__lease._snapshot()
         return github_app_installation_principal(snapshot.app_id, snapshot.installation_id)
 
+    def effective_permissions(self) -> Mapping[str, str]:
+        snapshot = self.__lease._snapshot()
+        return dict(snapshot.effective_permissions)
+
 
 class _LeaseEvidenceSource:
     """Secret-free attestation projection rooted in one exact lease object."""

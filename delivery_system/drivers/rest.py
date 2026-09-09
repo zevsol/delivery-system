@@ -36,11 +36,13 @@ class TokenProvider(Protocol):
 
 
 class InstallationReadAuthProvider(Protocol):
-    """One Host-owned authority for an installation read token and subject."""
+    """One Host-owned authority for installation token, subject, and permissions."""
 
     def get_token(self) -> str | None: ...
 
     def authenticated_subject_identity(self) -> str: ...
+
+    def effective_permissions(self) -> Mapping[str, str]: ...
 
 
 class RestTransport(Protocol):
@@ -296,6 +298,7 @@ class LocalRestReadOnlyDriver(ReadOnlyDriver):
         authenticated_user_node_id: str | None = None,
         authenticated_login: str | None = None,
         strict_permissions: bool = False,
+        installation_issues_permission: str | None = None,
     ) -> DriverReadResponse:
         if any(repo.get(key) in (None, "") for key in ("id", "node_id", "full_name", "visibility")):
             raise RestDriverError("driver_response_invalid")
@@ -309,8 +312,14 @@ class LocalRestReadOnlyDriver(ReadOnlyDriver):
                 or type(raw_permissions.get("push")) is not bool
             ):
                 raise RestDriverError("driver_response_invalid")
-            read_permission = raw_permissions["pull"]
-            write_permission = raw_permissions["push"]
+            if installation_issues_permission is None:
+                read_permission = raw_permissions["pull"]
+                write_permission = raw_permissions["push"]
+            else:
+                # GitHub App permissions are resource-scoped; repository pull/push
+                # roles are not the authority for this installation read scope.
+                read_permission = installation_issues_permission in {"read", "write"}
+                write_permission = installation_issues_permission == "write"
         else:
             permissions = raw_permissions or {}
             read_permission = bool(permissions.get("pull"))
@@ -434,6 +443,7 @@ class GitHubAppInstallationReadOnlyDriver(LocalRestReadOnlyDriver):
         if (
             not callable(getattr(auth_provider, "get_token", None))
             or not callable(getattr(auth_provider, "authenticated_subject_identity", None))
+            or not callable(getattr(auth_provider, "effective_permissions", None))
         ):
             raise ValueError("installation_auth_provider_invalid")
         if type(expected_repository_id) is not int or not 1 <= expected_repository_id <= self._MAX_REPOSITORY_ID:
@@ -441,6 +451,18 @@ class GitHubAppInstallationReadOnlyDriver(LocalRestReadOnlyDriver):
         self._installation_auth_provider = auth_provider
         self.expected_repository_id = expected_repository_id
         super().__init__(transport=transport or HttpsRestTransport(), token_provider=None)
+
+    def _installation_issues_permission(self) -> str:
+        try:
+            permissions = self._installation_auth_provider.effective_permissions()
+            if not isinstance(permissions, Mapping):
+                raise ValueError
+            permission = permissions.get("issues")
+        except Exception:
+            raise RestDriverError("installation_auth_invalid") from None
+        if type(permission) is not str or permission not in {"read", "write"}:
+            raise RestDriverError("installation_auth_invalid")
+        return permission
 
     def _request_token(self) -> str | None:
         failed = False
@@ -478,6 +500,7 @@ class GitHubAppInstallationReadOnlyDriver(LocalRestReadOnlyDriver):
         from delivery_system.protocol import canonical_payload
         if canonical_payload(dict(query_scope)) != canonical_payload(self.fixed_query_scope):
             raise RestDriverError("query_scope_incomplete")
+        installation_issues_permission = self._installation_issues_permission()
         requested = normalize_repository_identity(repository)
         owner, name = requested.split("/")
         prefix = f"/repos/{quote(owner, safe='')}/{quote(name, safe='')}"
@@ -505,4 +528,5 @@ class GitHubAppInstallationReadOnlyDriver(LocalRestReadOnlyDriver):
             repository, requested, query_scope, prefix, repo,
             authenticated_subject=authenticated_subject,
             strict_permissions=True,
+            installation_issues_permission=installation_issues_permission,
         )
