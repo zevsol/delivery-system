@@ -47,15 +47,24 @@ TOKEN_SENTINEL = "SYNTHETIC_INSTALLATION_TOKEN_SENTINEL"
 
 
 class FakeAuthProvider:
-    def __init__(self, token: str = TOKEN_SENTINEL, subject: str = SUBJECT) -> None:
+    def __init__(
+        self,
+        token: str = TOKEN_SENTINEL,
+        subject: str = SUBJECT,
+        effective_permissions: object = None,
+    ) -> None:
         self.token = token
         self.subject = subject
+        self.permissions = {"issues": "write"} if effective_permissions is None else effective_permissions
 
     def get_token(self) -> str:
         return self.token
 
     def authenticated_subject_identity(self) -> str:
         return self.subject
+
+    def effective_permissions(self) -> object:
+        return self.permissions
 
 
 class FakeTransport:
@@ -148,6 +157,17 @@ class InstallationDriverTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaisesRegex(ValueError, "repository_id_invalid"):
                 GitHubAppInstallationReadOnlyDriver(FakeAuthProvider(), value)
 
+    def test_constructor_requires_one_permission_authority(self) -> None:
+        class MissingPermissions:
+            def get_token(self):
+                return TOKEN_SENTINEL
+
+            def authenticated_subject_identity(self):
+                return SUBJECT
+
+        with self.assertRaisesRegex(ValueError, "installation_auth_provider_invalid"):
+            GitHubAppInstallationReadOnlyDriver(MissingPermissions(), REPOSITORY_ID)
+
     def test_scope_probe_is_first_and_never_requests_user(self) -> None:
         driver, transport = self._driver()
         result = driver.read_repository(REPOSITORY, driver.fixed_query_scope)
@@ -223,7 +243,7 @@ class InstallationDriverTests(unittest.TestCase):
                     ["/installation/repositories?per_page=100", "/repos/owner/repo"],
                 )
 
-    def test_installation_permissions_preserve_exact_read_and_write_facts(self) -> None:
+    def test_installation_pull_push_values_do_not_project_authority(self) -> None:
         for pull, push in ((True, True), (True, False), (False, False)):
             with self.subTest(pull=pull, push=push):
                 repository = {
@@ -233,7 +253,63 @@ class InstallationDriverTests(unittest.TestCase):
                 driver, transport = self._driver()
                 transport.responses["/repos/owner/repo"] = repository
                 result = driver.read_repository(REPOSITORY, driver.fixed_query_scope)
-                self.assertEqual(result.permissions, {"read": pull, "write": push})
+                self.assertEqual(result.permissions, {"read": True, "write": True})
+
+    def test_installation_permission_projection_uses_lease_authority(self) -> None:
+        repository = {
+            "id": REPOSITORY_ID, "node_id": "R9", "full_name": "Owner/Repo",
+            "visibility": "private", "permissions": {"pull": False, "push": False},
+        }
+        driver, transport = self._driver()
+        transport.responses["/repos/owner/repo"] = repository
+        result = driver.read_repository(REPOSITORY, driver.fixed_query_scope)
+        self.assertEqual(result.permissions, {"read": True, "write": True})
+        facts, failures = validate_driver_facts(
+            driver, REPOSITORY, driver.fixed_query_scope, driver.trusted_driver_identity,
+        )
+        self.assertIsNotNone(facts)
+        self.assertEqual(failures, ())
+
+    def test_installation_read_permission_projects_read_only(self) -> None:
+        repository = {
+            "id": REPOSITORY_ID, "node_id": "R9", "full_name": "Owner/Repo",
+            "visibility": "private", "permissions": {"pull": False, "push": False},
+        }
+        driver, transport = self._driver(
+            provider=FakeAuthProvider(effective_permissions={"issues": "read"}),
+        )
+        transport.responses["/repos/owner/repo"] = repository
+        result = driver.read_repository(REPOSITORY, driver.fixed_query_scope)
+        self.assertEqual(result.permissions, {"read": True, "write": False})
+        facts, failures = validate_driver_facts(
+            driver, REPOSITORY, driver.fixed_query_scope, driver.trusted_driver_identity,
+        )
+        self.assertIsNotNone(facts)
+        self.assertEqual(failures, ())
+
+    def test_installation_invalid_issues_permission_fails_before_transport(self) -> None:
+        invalid_permissions = (
+            {}, {"issues": None}, {"issues": ""}, {"issues": " read "},
+            {"issues": "write "}, {"issues": True}, {"issues": False},
+            {"issues": 0}, {"issues": 1}, {"issues": []}, {"issues": {}},
+        )
+        for permissions in invalid_permissions:
+            with self.subTest(permissions=permissions):
+                driver, transport = self._driver(
+                    provider=FakeAuthProvider(effective_permissions=permissions),
+                )
+                with self.assertRaisesRegex(RestDriverError, "installation_auth_invalid"):
+                    driver.read_repository(REPOSITORY, driver.fixed_query_scope)
+                self.assertEqual(transport.calls, [])
+
+        class RaisingProvider(FakeAuthProvider):
+            def effective_permissions(self):
+                raise RuntimeError("not exposed")
+
+        driver, transport = self._driver(provider=RaisingProvider())
+        with self.assertRaisesRegex(RestDriverError, "installation_auth_invalid"):
+            driver.read_repository(REPOSITORY, driver.fixed_query_scope)
+        self.assertEqual(transport.calls, [])
 
     def test_https_transport_preserves_raw_duplicate_link_headers(self) -> None:
         import delivery_system.drivers.rest as rest_module
@@ -407,6 +483,9 @@ class InstallationDriverTests(unittest.TestCase):
             def authenticated_subject_identity(self) -> str:
                 return SUBJECT
 
+            def effective_permissions(self) -> dict[str, str]:
+                return {"issues": "write"}
+
         broken, _ = self._driver(provider=BrokenProvider())
         with self.assertRaises(RestDriverError) as raised:
             broken.read_repository(REPOSITORY, broken.fixed_query_scope)
@@ -458,6 +537,7 @@ class HostReadAuthCompositionTests(unittest.TestCase):
         self.assertIs(view._LeaseReadAuthView__lease, composition.lease)
         self.assertEqual(view.get_token(), TOKEN)
         self.assertEqual(view.authenticated_subject_identity(), f"github-app-installation-{APP_ID}-{INSTALLATION_ID}")
+        self.assertEqual(dict(view.effective_permissions()), {"issues": "write"})
         self.assertIs(composition.provider._GitHubAppCredentialCapabilityProvider__evidence_source._LeaseEvidenceSource__lease, composition.lease)
         self.assertIs(composition.approval_authority_service._host_credential_lease, composition.lease)
         self.assertIsNone(driver.token_provider)
