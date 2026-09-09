@@ -1,6 +1,6 @@
 # Delivery System
 
-Delivery System is a Corrective Runtime Prototype for deterministic work-item planning, auditing, and explicit Human Approval of Sealed Previews.
+Delivery System is a Corrective Runtime Prototype for deterministic work-item planning, independent auditing, explicit Human Approval, and bounded application of Sealed Previews.
 
 It provides a structured planning protocol with:
 
@@ -23,8 +23,10 @@ The current Runtime Auditor records deterministic audit results for Conceptual p
 
 The user-facing `approve-github-work-items` Skill records explicit Human Approval for a specific Sealed Preview through the Runtime. Approval is not ApplicationAuthority, does not issue ApplicationAuthority, and does not execute the Applier or write to GitHub. Human Approval can be recorded locally without credential or attestation bootstrap.
 
+The user-facing `apply-github-work-items` Skill applies one exact, explicitly approved Sealed Preview through the existing bounded Applier path. Apply is separate from Human Approval and may perform irreversible GitHub Issue mutations within the approved operation set. ApplicationAuthority issuance is internal orchestration and is not a user-facing objective. Definitive success requires the durable Applied result and application receipt; ambiguous or recovery-required results stop without automatic retry and require operator or Host escalation.
+
 The current package is source code and a Python runtime prototype. It is not a ChatGPT or Codex Plugin, Universal Public Plugin, Personal Repository Beta, Host Tested installation, or external Integration Tested release.
 
 The bundled local state database is `.delivery-system/state.sqlite3` and is excluded from Git. It does not store tokens, cookies, or authentication configuration. The Planner does not provide destructive cleanup operations.
 
-The current local stdio server exposes five MCP surfaces: `delivery_plan_preview`, `delivery_get_audit_context`, `delivery_record_audit`, `delivery_record_approval`, and `delivery_issue_application_authority`. The Planner, Auditor, and Approval Skills are deterministically contract-tested; the Auditor Skill has also been behavior-tested through isolated local execution with three real Runtime audit contexts and independent semantic review. Host credential/bootstrap, installation, and GitHub integration remain outside the verified capability boundary. No GitHub application write or Applier is implemented by PC1B-C.
+The current local stdio server exposes six MCP surfaces: `delivery_plan_preview`, `delivery_get_audit_context`, `delivery_record_audit`, `delivery_record_approval`, `delivery_issue_application_authority`, and `delivery_apply_approved_work_items`. The Planner, Auditor, Approval, and Apply Skills are deterministically contract-tested; the Auditor Skill has also been behavior-tested through isolated local execution with three real Runtime audit contexts and independent semantic review. Host credential/bootstrap, installation, and formal release packaging remain outside the verified capability boundary. The bounded Applier and GitHub application path are implemented through the existing protected execution boundary.

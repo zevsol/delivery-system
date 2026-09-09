@@ -1,0 +1,19 @@
+interface:
+  display_name: "Apply GitHub Work Items"
+  short_description: "Apply an explicitly approved Sealed Preview"
+  default_prompt: "Use $apply-github-work-items to apply an explicitly approved Delivery System Sealed Preview."
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "delivery_get_audit_context"
+      description: "Read the exact approved Preview context before application"
+      transport: "stdio"
+    - type: "mcp"
+      value: "delivery_issue_application_authority"
+      description: "Internal Runtime support for protected application authority; it does not write to GitHub"
+      transport: "stdio"
+    - type: "mcp"
+      value: "delivery_apply_approved_work_items"
+      description: "Execute the bounded approved application; it may mutate GitHub Issues"
+      transport: "stdio"
