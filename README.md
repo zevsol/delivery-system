@@ -1,6 +1,8 @@
 # Delivery System
 
-Delivery System is a Corrective Runtime Prototype for deterministic work-item planning, independent auditing, explicit Human Approval, and bounded application of Sealed Previews.
+Delivery System is a governed software-delivery control system for AI-assisted development. It turns development intent into deterministic, auditable GitHub work-item previews. Before any bounded application, a Sealed Preview requires independent audit and explicit Human Approval; Apply executes only the approved operation set and, for a definitive outcome, preserves a durable result and receipt; if execution is not definitive, it preserves recovery-required evidence and stops safely.
+
+V1 is intentionally bounded to GitHub Issues and their relationships through an explicit Plan → Audit → Approve → Apply workflow.
 
 It provides a structured planning protocol with:
 

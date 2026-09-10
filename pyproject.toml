@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "delivery-system"
 version = "0.1.0"
-description = "Corrective Runtime Prototype for deterministic delivery planning."
+description = "Governed delivery control for auditable, human-approved GitHub work items."
 requires-python = ">=3.10"
 dependencies = [
   "mcp==2.0.0",
