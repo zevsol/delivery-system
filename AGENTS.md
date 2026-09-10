@@ -34,6 +34,17 @@ A roadmap item, TODO, old Finding, design idea, or historical next action is not
 * Keep temporary requirements, research evidence, review packages, checkpoints, and discussion notes under ignored `.dev/`.
 * Never ship `.dev/` content or use development-process files as Runtime sources of truth.
 
+## Workspace and artifact ownership
+
+* The repository root owns tracked product source, tests, Skills, documentation, build/project metadata, and governance. Tracked product material must remain in the repository rather than being redirected to an external workspace.
+* `.dev/` is ignored, repo-local active development-process state. It may contain temporary requirement or control briefs, current checkpoint and process notes, branch- or slice-specific review material, current development evidence, and other explicitly authorized ignored development-process records.
+* `.dev/` must not become a general dumping ground for wheel or build output, installation sandboxes, arbitrary scratch directories, reusable cross-cutting architecture research, or closed historical archives. `.dev/` remains outside normal tracked product state.
+* When operating inside a managed project workspace, workspace local owns regenerable builds, wheels, installation sandboxes, scratch, staging, temporary verification output, and other disposable machine-local artifacts. Workspace research owns active architecture or product research intended to inform future development but not itself tracked product source. Workspace archive owns completed historical reviews, checkpoints, execution evidence, closure packages, superseded repositories preserved for history, and other completed development evidence no longer needed as active `.dev/` state.
+* Workspace local, research, and archive artifacts must remain outside the Git repository unless separately promoted into tracked product documentation or code. Archive material is preservation state, not active product Runtime state.
+* Before creating a development artifact outside tracked product files, determine its ownership: tracked product material belongs in the repository; temporary repository-coupled active process state belongs in `.dev/`; disposable or regenerable output belongs in workspace local; reusable active research belongs in workspace research; and completed historical material belongs in workspace archive. If ownership is unclear, stop and resolve the destination first.
+* A parent directory used to collect multiple projects must contain project workspaces or repositories, not ad-hoc project-generated sibling artifacts. When a managed project workspace exists, use its local, research, or archive ownership domain. When no managed external workspace exists, do not invent one or create parent-level artifacts without authorization; use existing repo-local rules or obtain an explicit destination.
+* `.delivery-system/` is repo-local active product Runtime state. It is distinct from `.dev/`, workspace local, workspace research, and workspace archive. Existing security rules governing its SQLite and credential boundaries remain unchanged.
+
 ## Active development brief
 
 * `.dev/skill-brief.md` is the concise active development brief, not a chronological log.

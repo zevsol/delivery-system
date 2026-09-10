@@ -49,6 +49,7 @@ Desktop.ini
 # Build and release artifacts
 build/
 dist/
+*.egg-info/
 out/
 *.zip
 *.tar.gz
