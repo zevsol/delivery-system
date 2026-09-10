@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import re
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, StrictInt, StrictStr
 
 from delivery_system.runtime import (
-    AuditContextService, RuntimeApprovalAuthorityService, RuntimeContext, RuntimePlanner, SQLitePreviewStore,
+    AuditContextService, RuntimeApplicationStatusService, RuntimeApprovalAuthorityService,
+    RuntimeContext, RuntimePlanner, SQLitePreviewStore,
 )
 from delivery_system.applier import ApplyResult
 from delivery_system.execution_store import SQLiteExecutionStore
@@ -28,6 +30,22 @@ TOOL_ANNOTATIONS = ToolAnnotations(read_only_hint=False, destructive_hint=False,
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+_APPLICATION_ID_PATTERN = re.compile(r"^application-[0-9a-f]{64}$")
+
+
+def _validate_application_id_input(value: Any) -> Any:
+    if type(value) is not str or _APPLICATION_ID_PATTERN.fullmatch(value) is None:
+        raise ValueError("application_id_invalid")
+    return value
+
+
+ApplicationIdInput = Annotated[
+    StrictStr,
+    Field(pattern=r"^application-[0-9a-f]{64}$"),
+    BeforeValidator(_validate_application_id_input),
+]
 
 
 class SourcedValueInput(StrictModel):
@@ -249,6 +267,57 @@ class ApplyApprovedWorkItemsOutput(StrictModel):
     recovery_code: StrictStr | None = Field(default=None, min_length=1)
 
 
+class ApplicationReceiptStatusOutput(StrictModel):
+    application_receipt_id: StrictStr = Field(min_length=1)
+    receipt_digest: StrictStr = Field(min_length=1)
+    status: Literal["Applied"]
+    operation_receipt_count: StrictInt = Field(ge=0)
+    started_at: StrictStr = Field(min_length=1)
+    completed_at: StrictStr = Field(min_length=1)
+
+
+class OperationReceiptStatusOutput(StrictModel):
+    operation_receipt_id: StrictStr = Field(min_length=1)
+    receipt_digest: StrictStr = Field(min_length=1)
+    operation_index: StrictInt = Field(ge=0)
+    started_at: StrictStr = Field(min_length=1)
+    completed_at: StrictStr = Field(min_length=1)
+
+
+class AttemptStatusOutput(StrictModel):
+    operation_identity: StrictStr = Field(min_length=1)
+    operation_index: StrictInt = Field(ge=0)
+    state: Literal["Applying", "Failed", "Blocked", "OutcomeUnknown", "Applied"]
+    attempt_digest: StrictStr = Field(min_length=1)
+    started_at: StrictStr = Field(min_length=1)
+    updated_at: StrictStr = Field(min_length=1)
+    failure_code: StrictStr | None = None
+
+
+class GetApplicationStatusInput(StrictModel):
+    application_id: ApplicationIdInput
+
+
+class ApplicationStatusOutput(StrictModel):
+    application_id: StrictStr = Field(min_length=1)
+    preview_id: StrictStr = Field(min_length=1)
+    revision: StrictInt = Field(ge=1)
+    operation_set_digest: StrictStr = Field(min_length=1)
+    state: Literal["Pending", "Applying", "PartiallyApplied", "Failed", "Blocked", "OutcomeUnknown", "Applied"]
+    next_operation_index: StrictInt = Field(ge=0)
+    completed_operation_count: StrictInt = Field(ge=0)
+    total_operation_count: StrictInt = Field(ge=0)
+    attempt_count: StrictInt = Field(ge=0)
+    recovery_code: StrictStr | None = Field(default=None, min_length=1)
+    application_receipt: ApplicationReceiptStatusOutput | None = None
+    operation_receipts: list[OperationReceiptStatusOutput]
+    attempts: list[AttemptStatusOutput]
+    started_at: StrictStr = Field(min_length=1)
+    updated_at: StrictStr = Field(min_length=1)
+    completed_at: StrictStr | None = Field(default=None, min_length=1)
+    integrity_status: Literal["verified"]
+
+
 def _production_clock() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -363,6 +432,20 @@ def create_server(context: RuntimeContext | None = None, store: Any | None = Non
             payload.preview_id, payload.revision, payload.approval_command, payload.approver_claim,
         )
         return RecordApprovalOutput.model_validate(approval.to_dict())
+
+    @mcp.tool(
+        name="delivery_get_application_status",
+        description=("Read durable application execution status and bounded recovery evidence for an existing "
+                      "application; it never retries, resumes, reobserves GitHub, transitions application state, "
+                      "or performs a GitHub write."),
+        annotations=ToolAnnotations(read_only_hint=True, destructive_hint=False, open_world_hint=False),
+        structured_output=True,
+    )
+    def delivery_get_application_status(payload: GetApplicationStatusInput) -> ApplicationStatusOutput:
+        if context is None or store is None or execution_store is None:
+            raise ValueError("application_status_boundary_unavailable")
+        status = RuntimeApplicationStatusService(context, store, execution_store).get_status(payload.application_id)
+        return ApplicationStatusOutput.model_validate(status)
 
     @mcp.tool(
         name="delivery_issue_application_authority",

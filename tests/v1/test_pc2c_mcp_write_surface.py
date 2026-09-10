@@ -58,12 +58,16 @@ class McpWriteSurfaceTests(unittest.TestCase):
     def _success(number=1, numeric_id="1"):
         return ApplierOrchestrationTests._success(number=number, numeric_id=numeric_id)
 
-    def test_sixth_tool_and_exact_annotations(self):
+    def test_seventh_tool_and_exact_annotations(self):
         async def exercise():
             async with Client(mcp, raise_exceptions=True) as client:
                 return (await client.list_tools()).tools
         tools = self.run_async(exercise())
-        self.assertEqual(len(tools), 6)
+        self.assertEqual(len(tools), 7)
+        status_tool = next(tool for tool in tools if tool.name == "delivery_get_application_status")
+        self.assertEqual((status_tool.annotations.read_only_hint,
+                          status_tool.annotations.destructive_hint,
+                          status_tool.annotations.open_world_hint), (True, False, False))
         apply_tool = next(tool for tool in tools if tool.name == "delivery_apply_approved_work_items")
         self.assertEqual((apply_tool.annotations.read_only_hint,
                           apply_tool.annotations.destructive_hint,
@@ -74,6 +78,12 @@ class McpWriteSurfaceTests(unittest.TestCase):
                             {"application_authority_id": "authority"})
         self.assertTrue(result.is_error)
         self.assertIn("write_execution_boundary_unavailable", str(result.content))
+
+    def test_global_application_status_is_unconfigured_and_fails_closed(self):
+        result = self._call(mcp, "delivery_get_application_status",
+                            {"application_id": "application-" + "a" * 64})
+        self.assertTrue(result.is_error)
+        self.assertIn("application_status_boundary_unavailable", str(result.content))
 
     def test_apply_input_is_strict_and_forbids_injection(self):
         for value in (1, True):
@@ -320,7 +330,7 @@ class McpWriteSurfaceTests(unittest.TestCase):
         finally:
             directory.cleanup()
 
-    def test_global_stdio_discovers_sixth_tool_but_apply_is_unavailable(self):
+    def test_global_stdio_discovers_seventh_tool_but_apply_is_unavailable(self):
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory).resolve()
             (workspace / ".gitignore").write_text(".delivery-system/\n", encoding="utf-8")
@@ -340,7 +350,7 @@ class McpWriteSurfaceTests(unittest.TestCase):
                                                         {"payload": {"application_authority_id": "authority"}})
                         return tools, result
             tools, result = self.run_async(exercise())
-            self.assertEqual(len(tools.tools), 6)
+            self.assertEqual(len(tools.tools), 7)
             self.assertTrue(result.is_error)
             self.assertIn("write_execution_boundary_unavailable", str(result.content))
 

@@ -135,6 +135,18 @@ class ApplySkillContractTests(unittest.TestCase):
         ):
             self.assertIn(phrase, recovery)
 
+    def test_status_inspection_is_read_only_and_non_reconciling(self):
+        status = self.section(self.skill, "Status inspection")
+        for phrase in (
+            "existing application",
+            "delivery_get_application_status",
+            "Runtime-owned safe projection",
+            "Never retry, resume, reobserve GitHub, reconcile",
+            "mutate remote state",
+        ):
+            self.assertIn(phrase, status)
+        self.assertIn("Do not perform built-in remote reconciliation or remote reobservation", self.skill)
+
     def test_metadata_has_exact_internal_mcp_surface(self):
         entries = re.findall(
             r'- type: "([^"]+)"\n\s+value: "([^"]+)"\n\s+description: "([^"]+)"\n\s+transport: "([^"]+)"',

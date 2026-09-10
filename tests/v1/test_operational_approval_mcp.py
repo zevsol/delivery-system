@@ -104,6 +104,7 @@ class OperationalApprovalMcpTests(unittest.TestCase):
             "delivery_plan_preview", "delivery_get_audit_context", "delivery_record_audit",
             "delivery_record_approval", "delivery_issue_application_authority",
             "delivery_apply_approved_work_items",
+            "delivery_get_application_status",
         }
         self.assertEqual(set(by_name), expected)
         for name, expected_values in {
@@ -426,7 +427,7 @@ class OperationalApprovalMcpTests(unittest.TestCase):
                     return tools, result
 
             tools, result = self.run_async(exercise())
-            self.assertEqual(len(tools.tools), 6)
+            self.assertEqual(len(tools.tools), 7)
             self.assertTrue(result.is_error)
             self.assertIn("attestation_service_unavailable", str(result.content))
 
