@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import sqlite3
 import threading
@@ -22,6 +23,7 @@ from delivery_system.audit_state import AuditRecord, ApprovalRecord, AuditResult
 from delivery_system.audit_commit_authority import (
     AuditCommitAuthority, _verify_authority_identity, _verify_candidate,
 )
+from delivery_system.application_identity import operation_identity
 from delivery_system.canonical import canonical_payload, digest, normalize
 from delivery_system.evidence import DeclaredSource, EvidenceRecord, SourcedValue
 from delivery_system.formal_preview import PreviewLevel, SealedPreview
@@ -30,7 +32,10 @@ from delivery_system.preview_validation import (
     _validate_preview_payload,
     validate_sealed_preview_invariants,
 )
-from delivery_system.write_operations import WriteOperationEvaluation, evaluate_write_operations, operation_set_digest_payload
+from delivery_system.write_operations import (
+    WriteOperationEvaluation, evaluate_write_operations, normalize_write_operations,
+    operation_set_digest_payload,
+)
 from delivery_system.remote_snapshot import (
     RemoteCapabilitySet,
     RemoteIssueRecord,
@@ -182,6 +187,7 @@ class PreviewStore(Protocol):
     def _bind_and_save_repository_aware_preview(self, promotion: RuntimePromotion, **kwargs: Any) -> None: ...
     def get_preview(self, workspace_identity: str, preview_id: str) -> dict[str, object]: ...
     def get_preview_revision(self, workspace_identity: str, preview_id: str, revision: int | None = None) -> dict[str, object]: ...
+    def _read_preview_revision_for_status(self, workspace_identity: str, preview_id: str, revision: int) -> dict[str, object]: ...
     def get_evidence_records(self, workspace_identity: str, evidence_ids: list[str]) -> list[dict[str, object]]: ...
     def resolve_item_id(self, workspace_identity: str, previous_preview_id: str, client_ref: str,
                         revision: int | None = None) -> str: ...
@@ -557,6 +563,16 @@ class InMemoryPreviewStore:
         try:
             result = read_inmemory_preview_revision(self._preview_history, workspace_identity, preview_id, revision)
             self._validate_loaded_trust(result)
+            return result
+        except StoreReadMiss as exc:
+            raise ValueError("preview_not_found") from exc
+
+    def _read_preview_revision_for_status(self, workspace_identity: str, preview_id: str, revision: int) -> dict[str, object]:
+        if workspace_identity != (self.workspace_identity or workspace_identity):
+            raise ValueError("preview crosses Workspace boundary")
+        try:
+            result = read_inmemory_preview_revision(self._preview_history, workspace_identity, preview_id, revision)
+            result["revision"] = revision
             return result
         except StoreReadMiss as exc:
             raise ValueError("preview_not_found") from exc
@@ -958,6 +974,17 @@ class SQLitePreviewStore:
                 raise ValueError("driver_trust_context_required")
             evidence = self.get_evidence_records(workspace_identity, list(canonical.get("evidence_ids", [])))
             _reload_promotion(self, canonical, evidence)
+        return result
+
+    def _read_preview_revision_for_status(self, workspace_identity: str, preview_id: str, revision: int) -> dict[str, object]:
+        if workspace_identity != self.context.workspace_identity:
+            raise ValueError("preview crosses Workspace boundary")
+        try:
+            with closing(self._connect()) as connection:
+                result = read_sqlite_preview_revision(connection, workspace_identity, preview_id, revision)
+        except StoreReadMiss as exc:
+            raise ValueError("preview_not_found") from exc
+        result["revision"] = revision
         return result
 
     def get_evidence_records(self, workspace_identity: str, evidence_ids: list[str]) -> list[dict[str, object]]:
@@ -2199,3 +2226,408 @@ class RuntimeApplicationExecutionContext:
         candidate = artifact.with_digest()
         self._service._live_artifact_registry[id(candidate)] = (candidate, kind, self, candidate.payload())
         return candidate
+
+
+class RuntimeApplicationStatusService:
+    """Runtime-owned, read-only projection of durable application evidence."""
+
+    _APPLICATION_ID = re.compile(r"\Aapplication-[0-9a-f]{64}\Z")
+    _PREVIEW_BINDINGS = (
+        "workspace_identity", "repository_identity", "preview_id", "revision",
+        "sealed_preview_digest", "plan_digest", "operation_set_digest",
+        "remote_snapshot_digest",
+    )
+    _PREVIEW_DIGEST_ERRORS = frozenset({
+        "preview_identity_mismatch", "plan_digest_mismatch", "operation_set_digest_mismatch",
+        "sealed_preview_digest_mismatch", "remote_snapshot_digest_mismatch",
+        "repository_identity_mismatch", "sealed_preview_not_canonical", "sealed_preview_incomplete",
+    })
+
+    def __init__(self, context: RuntimeContext, store: Any, execution_store: Any) -> None:
+        if (not isinstance(context, RuntimeContext) or store is None or execution_store is None or
+                getattr(execution_store, "workspace_identity", None) != context.workspace_identity or
+                not callable(getattr(execution_store, "get_execution_bootstrap", None)) or
+                not callable(getattr(store, "_read_preview_revision_for_status", None))):
+            raise ValueError("application_status_boundary_unavailable")
+        self.context = context
+        self.store = store
+        self.execution_store = execution_store
+
+    @classmethod
+    def _validate_application_id(cls, application_id: Any) -> None:
+        if type(application_id) is not str or cls._APPLICATION_ID.fullmatch(application_id) is None:
+            raise ValueError("application_id_invalid")
+
+    @staticmethod
+    def _raise_state_error(exc: BaseException) -> None:
+        code = str(exc)
+        if code in {
+            "application_not_found", "application_binding_conflict", "state_integrity_invalid",
+            "application_replay_validation_required", "application_receipt_not_found",
+        }:
+            raise ValueError(code) from None
+        raise ValueError("state_integrity_invalid") from None
+
+    def _load_initial_records(self, application_id: str) -> Any:
+        try:
+            return self.execution_store.get_execution_bootstrap(application_id)
+        except ValueError as exc:
+            self._raise_state_error(exc)
+        except (TypeError, KeyError, json.JSONDecodeError) as exc:
+            self._raise_state_error(exc)
+
+    @classmethod
+    def _validate_preview_envelope(cls, preview: Any, values: Mapping[str, Any]) -> tuple[dict[str, Any], str]:
+        if not isinstance(preview, Mapping):
+            raise ValueError("preview_digest_mismatch")
+        canonical = preview.get("canonical_payload")
+        request_id = preview.get("request_id")
+        try:
+            sealed = SealedPreview.from_dict(canonical)
+            normalized = sealed.to_dict()
+            if normalized != dict(canonical):
+                raise ValueError("preview_digest_mismatch")
+            if (preview.get("revision") != values["revision"] or
+                    request_id != normalized["request_id"] or
+                    type(request_id) is not str or not request_id):
+                raise ValueError("preview_digest_mismatch")
+            for field in cls._PREVIEW_BINDINGS:
+                if normalized.get(field) != values[field]:
+                    if field == "workspace_identity":
+                        raise ValueError("application_binding_conflict")
+                    raise ValueError("preview_digest_mismatch")
+            unsigned = {key: value for key, value in normalized.items() if key != "sealed_preview_digest"}
+            if normalized["sealed_preview_digest"] != digest(unsigned):
+                raise ValueError("preview_digest_mismatch")
+        except ValueError:
+            raise
+        except (TypeError, KeyError, json.JSONDecodeError):
+            raise ValueError("preview_digest_mismatch") from None
+        return normalized, request_id
+
+    def _load_preview_operations(self, identity: Any) -> tuple[dict[str, Any], ...]:
+        values = identity.values()
+        try:
+            preview = self.store._read_preview_revision_for_status(
+                self.context.workspace_identity,
+                values["preview_id"],
+                values["revision"],
+            )
+        except ValueError as exc:
+            if str(exc) == "preview crosses Workspace boundary":
+                raise ValueError("application_binding_conflict") from None
+            raise
+        except (TypeError, KeyError, json.JSONDecodeError):
+            raise ValueError("preview_digest_mismatch") from None
+
+        canonical, request_id = self._validate_preview_envelope(preview, values)
+
+        evidence_records: list[dict[str, object]] = []
+        promotion = None
+        if canonical.get("preview_level") in {PreviewLevel.REPOSITORY_AWARE.value, PreviewLevel.WRITE_ELIGIBLE.value}:
+            try:
+                evidence_records = self.store.get_evidence_records(
+                    self.context.workspace_identity,
+                    list(canonical["evidence_ids"]),
+                )
+                promotion = _reload_promotion(self.store, canonical, evidence_records)
+            except ValueError:
+                raise
+            except (TypeError, KeyError, json.JSONDecodeError):
+                raise ValueError("preview_digest_mismatch") from None
+
+        try:
+            normalized = _validate_preview_payload(
+                canonical,
+                request_id,
+                values["preview_id"],
+                values["revision"],
+                values["plan_digest"],
+                values["operation_set_digest"],
+                values["remote_snapshot_digest"],
+                values["repository_identity"],
+                evidence_records,
+                self.context.workspace_identity,
+                promotion,
+            )
+        except ValueError as exc:
+            code = str(exc)
+            if code == "workspace_identity_mismatch":
+                raise ValueError("application_binding_conflict") from None
+            if code in self._PREVIEW_DIGEST_ERRORS:
+                raise ValueError("preview_digest_mismatch") from None
+            raise
+        except (TypeError, KeyError, json.JSONDecodeError):
+            raise ValueError("preview_digest_mismatch") from None
+
+        for field in self._PREVIEW_BINDINGS:
+            if normalized.get(field) != values[field]:
+                if field == "workspace_identity":
+                    raise ValueError("application_binding_conflict")
+                raise ValueError("preview_digest_mismatch")
+        try:
+            operations = normalize_write_operations(normalized["operation_intents"])
+            if digest(operation_set_digest_payload(operations)) != values["operation_set_digest"]:
+                raise ValueError("preview_digest_mismatch")
+        except ValueError:
+            raise
+        except (TypeError, KeyError):
+            raise ValueError("preview_digest_mismatch") from None
+        return operations
+
+    def _load_execution(self, application_id: str, operations: tuple[dict[str, Any], ...]) -> Any:
+        try:
+            return self.execution_store.get_execution(application_id, expected_operations=operations)
+        except ValueError as exc:
+            code = str(exc)
+            if code == "application_replay_binding_invalid":
+                raise ValueError("application_receipt_integrity_invalid") from None
+            if code in {
+                "application_not_found", "application_binding_conflict", "state_integrity_invalid",
+                "application_replay_validation_required", "receipt_integrity_invalid",
+                "application_receipt_integrity_invalid", "application_receipt_not_found",
+                "operation_receipt_not_found", "receipt_binding_conflict", "workspace_mismatch",
+            }:
+                raise ValueError(code) from None
+            raise
+        except (TypeError, KeyError, json.JSONDecodeError):
+            raise ValueError("state_integrity_invalid") from None
+
+    @staticmethod
+    def _plain(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return {key: RuntimeApplicationStatusService._plain(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [RuntimeApplicationStatusService._plain(item) for item in value]
+        return value
+
+    @staticmethod
+    def _validate_execution_state_invariants(state: Any, operations: tuple[dict[str, Any], ...]) -> None:
+        try:
+            from delivery_system.execution_store import _execution_timestamp
+
+            started = _execution_timestamp(state.started_at)
+            updated = _execution_timestamp(state.updated_at)
+            if updated < started:
+                raise ValueError("state_integrity_invalid")
+            if state.completed_at is not None:
+                completed_at = _execution_timestamp(state.completed_at)
+                if completed_at < updated:
+                    raise ValueError("state_integrity_invalid")
+            completed = state.next_operation_index
+            total = len(operations)
+            if completed < 0 or completed > total or len(state.operation_receipt_refs) != completed:
+                raise ValueError("state_integrity_invalid")
+
+            if state.state == "Pending":
+                valid = (completed == 0 and state.owner_id is None and state.current_attempt_id is None and
+                         state.recovery_code is None and state.completed_at is None)
+            elif state.state == "Applying":
+                valid = (completed < total and type(state.owner_id) is str and bool(state.owner_id) and
+                         type(state.current_attempt_id) is str and bool(state.current_attempt_id) and
+                         state.recovery_code is None and state.completed_at is None)
+            elif state.state == "PartiallyApplied":
+                valid = (completed > 0 and state.owner_id is None and state.current_attempt_id is None and
+                         state.recovery_code is None and state.completed_at is None)
+            elif state.state in {"Failed", "Blocked", "OutcomeUnknown"}:
+                valid = (completed < total and state.owner_id is None and
+                         type(state.current_attempt_id) is str and bool(state.current_attempt_id) and
+                         type(state.recovery_code) is str and bool(state.recovery_code) and
+                         state.completed_at is None)
+            elif state.state == "Applied":
+                valid = (completed == total and state.owner_id is None and state.current_attempt_id is None and
+                         state.recovery_code is None and state.completed_at is not None)
+            else:
+                valid = False
+            if not valid:
+                raise ValueError("state_integrity_invalid")
+        except ValueError:
+            raise ValueError("state_integrity_invalid") from None
+        except (TypeError, AttributeError, OverflowError):
+            raise ValueError("state_integrity_invalid") from None
+
+    def _load_application_receipt(self, application_id: str) -> Any | None:
+        try:
+            return self.execution_store.get_application_receipt(application_id)
+        except ValueError as exc:
+            code = str(exc)
+            if code == "application_receipt_not_found":
+                return None
+            if code == "application_binding_conflict":
+                raise
+            if code in {"application_receipt_integrity_invalid", "receipt_integrity_invalid", "receipt_binding_conflict", "workspace_mismatch"}:
+                raise ValueError("application_receipt_integrity_invalid" if code != "application_binding_conflict" else code) from None
+            raise ValueError("application_receipt_integrity_invalid") from None
+        except (TypeError, KeyError, json.JSONDecodeError):
+            raise ValueError("application_receipt_integrity_invalid") from None
+
+    def _project_attempts(self, application_id: str, state: Any,
+                          operations: tuple[dict[str, Any], ...]) -> list[dict[str, Any]]:
+        completed = state.next_operation_index
+        total = len(operations)
+        if completed < 0 or completed > total or len(state.operation_receipt_refs) != completed:
+            raise ValueError("state_integrity_invalid")
+        if state.state in {"Applying", "Failed", "Blocked", "OutcomeUnknown"} and completed >= total:
+            raise ValueError("state_integrity_invalid")
+        if state.state in {"Pending", "PartiallyApplied", "Applied"} and state.current_attempt_id is not None:
+            raise ValueError("state_integrity_invalid")
+
+        attempts: list[dict[str, Any]] = []
+        for index, operation in enumerate(operations):
+            operation_id = operation_identity(application_id, index, operation)
+            try:
+                attempt = self.execution_store.get_attempt(application_id, operation_id)
+            except ValueError as exc:
+                code = str(exc)
+                if code in {"operation_attempt_invalid", "operation_attempt_binding_invalid", "operation_attempt_binding_conflict", "attempt_integrity_invalid"}:
+                    raise ValueError("attempt_integrity_invalid") from None
+                if code != "operation_attempt_not_found":
+                    raise
+                if index < completed or (
+                        index == completed and state.state in {"Applying", "Failed", "Blocked", "OutcomeUnknown"}):
+                    raise
+                continue
+            if (index > completed or attempt.application_id != application_id or
+                    attempt.identity.to_dict() != state.identity.to_dict() or
+                    attempt.operation_identity != operation_id or
+                    self._plain(attempt.operation) != self._plain(operation)):
+                raise ValueError("attempt_integrity_invalid")
+            if state.state == "Pending":
+                raise ValueError("state_integrity_invalid")
+            if index > completed:
+                raise ValueError("state_integrity_invalid")
+            expected_state = "Applied" if index < completed else state.state
+            if attempt.state != expected_state or attempt.operation_index != index:
+                raise ValueError("state_integrity_invalid")
+            if index == completed and state.state in {"Applying", "Failed", "Blocked", "OutcomeUnknown"} and state.current_attempt_id != operation_id:
+                raise ValueError("state_integrity_invalid")
+            try:
+                from delivery_system.execution_store import _execution_timestamp
+                attempt_started = _execution_timestamp(attempt.started_at)
+                attempt_updated = _execution_timestamp(attempt.updated_at)
+                if attempt_updated < attempt_started or attempt_started < _execution_timestamp(state.started_at) or attempt_updated > _execution_timestamp(state.updated_at):
+                    raise ValueError("attempt_integrity_invalid")
+            except ValueError:
+                raise ValueError("attempt_integrity_invalid") from None
+            except (TypeError, AttributeError, OverflowError):
+                raise ValueError("attempt_integrity_invalid") from None
+            if attempt.state in {"Failed", "Blocked", "OutcomeUnknown"}:
+                if type(attempt.failure_code) is not str or not attempt.failure_code:
+                    raise ValueError("attempt_integrity_invalid")
+            elif attempt.failure_code is not None:
+                raise ValueError("attempt_integrity_invalid")
+            attempts.append({
+                "operation_identity": attempt.operation_identity,
+                "operation_index": attempt.operation_index,
+                "state": attempt.state,
+                "attempt_digest": attempt.attempt_digest,
+                "started_at": attempt.started_at,
+                "updated_at": attempt.updated_at,
+                "failure_code": attempt.failure_code,
+            })
+        return attempts
+
+    def _project_operation_receipts(self, application_id: str, state: Any,
+                                    operations: tuple[dict[str, Any], ...]) -> list[dict[str, Any]]:
+        receipts: list[dict[str, Any]] = []
+        for index in range(state.next_operation_index):
+            operation_id = operation_identity(application_id, index, operations[index])
+            try:
+                receipt = self.execution_store.get_operation_receipt(application_id, operation_id)
+            except ValueError as exc:
+                if str(exc) in {"operation_receipt_invalid", "operation_receipt_binding_invalid", "receipt_binding_conflict", "workspace_mismatch"}:
+                    raise ValueError("receipt_integrity_invalid") from None
+                raise
+            if (receipt.application_id != application_id or
+                    receipt.identity.to_dict() != state.identity.to_dict() or
+                    receipt.operation_identity != operation_id or
+                    self._plain(receipt.canonical_operation) != self._plain(operations[index]) or
+                    receipt.operation_index != index or
+                    receipt.operation_receipt_id != state.operation_receipt_refs[index]):
+                raise ValueError("state_integrity_invalid")
+            try:
+                from delivery_system.execution_store import _execution_timestamp
+                receipt_started = _execution_timestamp(receipt.started_at)
+                receipt_completed = _execution_timestamp(receipt.completed_at)
+                if receipt_completed < receipt_started or receipt_started < _execution_timestamp(state.started_at) or receipt_completed > _execution_timestamp(state.updated_at):
+                    raise ValueError("receipt_integrity_invalid")
+            except ValueError:
+                raise ValueError("receipt_integrity_invalid") from None
+            except (TypeError, AttributeError, OverflowError):
+                raise ValueError("receipt_integrity_invalid") from None
+            receipts.append({
+                "operation_receipt_id": receipt.operation_receipt_id,
+                "receipt_digest": receipt.receipt_digest,
+                "operation_index": receipt.operation_index,
+                "started_at": receipt.started_at,
+                "completed_at": receipt.completed_at,
+            })
+        return receipts
+
+    @staticmethod
+    def _project_application_receipt(receipt: Any, state: Any) -> dict[str, Any]:
+        try:
+            from delivery_system.execution_store import _execution_timestamp
+
+            receipt_started = _execution_timestamp(receipt.started_at)
+            receipt_completed = _execution_timestamp(receipt.completed_at)
+            execution_started = _execution_timestamp(state.started_at)
+            execution_completed = _execution_timestamp(state.completed_at)
+            if (receipt_completed < receipt_started or receipt_started < execution_started or
+                    receipt_completed > execution_completed):
+                raise ValueError("application_receipt_integrity_invalid")
+        except ValueError:
+            raise ValueError("application_receipt_integrity_invalid") from None
+        except (TypeError, AttributeError, OverflowError):
+            raise ValueError("application_receipt_integrity_invalid") from None
+        return {
+            "application_receipt_id": receipt.application_receipt_id,
+            "receipt_digest": receipt.receipt_digest,
+            "status": receipt.status,
+            "operation_receipt_count": len(receipt.operation_receipt_refs),
+            "started_at": receipt.started_at,
+            "completed_at": receipt.completed_at,
+        }
+
+    def get_status(self, application_id: str) -> dict[str, Any]:
+        self._validate_application_id(application_id)
+        identity = self._load_initial_records(application_id)
+        values = identity.values()
+        if identity.application_id != application_id:
+            raise ValueError("application_binding_conflict")
+        operations = self._load_preview_operations(identity)
+        state = self._load_execution(application_id, operations)
+        if state.application_id != application_id or state.identity.to_dict() != identity.to_dict():
+            raise ValueError("application_binding_conflict")
+        self._validate_execution_state_invariants(state, operations)
+        application_receipt = self._load_application_receipt(application_id)
+
+        operation_receipts = self._project_operation_receipts(application_id, state, operations)
+        attempts = self._project_attempts(application_id, state, operations)
+        receipt_projection = None
+        if state.state == "Applied":
+            if application_receipt is None:
+                raise ValueError("application_receipt_not_found")
+            receipt_projection = self._project_application_receipt(application_receipt, state)
+        elif application_receipt is not None:
+            raise ValueError("application_receipt_integrity_invalid")
+
+        return {
+            "application_id": application_id,
+            "preview_id": values["preview_id"],
+            "revision": values["revision"],
+            "operation_set_digest": values["operation_set_digest"],
+            "state": state.state,
+            "next_operation_index": state.next_operation_index,
+            "completed_operation_count": len(operation_receipts),
+            "total_operation_count": len(operations),
+            "attempt_count": len(attempts),
+            "recovery_code": state.recovery_code,
+            "application_receipt": receipt_projection,
+            "operation_receipts": operation_receipts,
+            "attempts": attempts,
+            "started_at": state.started_at,
+            "updated_at": state.updated_at,
+            "completed_at": state.completed_at,
+            "integrity_status": "verified",
+        }

@@ -367,6 +367,7 @@ class Slice2ASealedPreviewTests(unittest.TestCase):
                 "delivery_plan_preview", "delivery_get_audit_context", "delivery_record_audit",
                 "delivery_record_approval", "delivery_issue_application_authority",
                 "delivery_apply_approved_work_items",
+                "delivery_get_application_status",
             })
             self.assertFalse(result.is_error)
             self.assertEqual(result.structured_content["context_status"], "audit_ready")

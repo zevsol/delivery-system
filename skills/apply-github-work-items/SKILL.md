@@ -34,3 +34,10 @@ Apply does not own or perform planning, audit creation, Human Approval creation 
 - Never automatically retry an ambiguous operation. Do not perform built-in remote reconciliation or remote reobservation.
 
 The user-facing result must distinguish Approval from Application, and definitive success or failure from recovery-required. Application is not read-only; disclose that it may mutate GitHub Issues within the exact approved operation set.
+
+## Status inspection
+
+- When a user asks to inspect an existing application or its retained recovery evidence, call `delivery_get_application_status` with the exact Runtime-returned `application_id`.
+- Report only the Runtime-owned safe projection. Do not expose raw remote results, canonical operations, authority or credential data, or arbitrary persisted payloads.
+- Status inspection is read-only. Never retry, resume, reobserve GitHub, reconcile, transition application state, or mutate remote state.
+- Preserve the terminal recovery semantics above when the application remains `OutcomeUnknown`, `Failed`, `Blocked`, or otherwise recovery-required.

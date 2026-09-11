@@ -126,18 +126,28 @@ class SQLiteExecutionStore:
             connection.commit()
         return candidate
 
-    def get_execution(self, application_id: str, *, expected_operations: tuple[dict[str, Any], ...] | None = None) -> ApplicationExecutionState:
+    def _load_execution_state(self, application_id: str) -> ApplicationExecutionState:
         with closing(self._connection()) as connection:
             row = connection.execute("SELECT payload FROM application_execution WHERE workspace_identity=? AND application_id=?",
                                      (self.workspace_identity, application_id)).fetchone()
         if row is None:
             raise ValueError("application_not_found")
-        data = json.loads(row[0])
-        state = ApplicationExecutionState(**data)
-        if state.identity.values()["workspace_identity"] != self.workspace_identity:
+        try:
+            state = ApplicationExecutionState(**json.loads(row[0]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise ValueError("state_integrity_invalid") from None
+        if state.application_id != application_id or state.identity.values()["workspace_identity"] != self.workspace_identity:
             raise ValueError("application_binding_conflict")
         if not state.verify_integrity():
             raise ValueError("state_integrity_invalid")
+        return state
+
+    def get_execution_bootstrap(self, application_id: str) -> Any:
+        """Load only validated identity metadata needed to locate the Preview."""
+        return self._load_execution_state(application_id).identity
+
+    def get_execution(self, application_id: str, *, expected_operations: tuple[dict[str, Any], ...] | None = None) -> ApplicationExecutionState:
+        state = self._load_execution_state(application_id)
         if state.state == "Applied":
             if expected_operations is None:
                 raise ValueError("application_replay_validation_required")
@@ -148,8 +158,17 @@ class SQLiteExecutionStore:
                 raise ValueError("application_receipt_integrity_invalid")
             operation_indexes = []
             operation_receipts = []
-            for ref in receipt.operation_receipt_refs:
-                operation = self._get_operation_receipt_by_id(application_id, ref["operation_receipt_id"])
+            expected_operations = tuple(expected_operations)
+            if len(expected_operations) != len(receipt.operation_receipt_refs):
+                raise ValueError("application_receipt_integrity_invalid")
+            for index, (expected, ref) in enumerate(zip(expected_operations, receipt.operation_receipt_refs)):
+                operation_id = operation_identity(application_id, index, expected)
+                try:
+                    operation = self.get_operation_receipt(application_id, operation_id)
+                except ValueError as exc:
+                    if str(exc) == "operation_receipt_not_found":
+                        raise
+                    raise ValueError("receipt_integrity_invalid") from None
                 if operation.receipt_digest != ref["operation_receipt_digest"] or not operation.verify_integrity():
                     raise ValueError("application_receipt_integrity_invalid")
                 operation_indexes.append(operation.operation_index)
@@ -504,7 +523,13 @@ class SQLiteExecutionStore:
                                      (self.workspace_identity, application_id, operation_identity)).fetchone()
         if row is None:
             raise ValueError("operation_attempt_not_found")
-        attempt = OperationAttemptState(**json.loads(row[0]))
+        try:
+            attempt = OperationAttemptState(**json.loads(row[0]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise ValueError("attempt_integrity_invalid") from None
+        if (attempt.application_id != application_id or
+                attempt.operation_identity != operation_identity):
+            raise ValueError("operation_attempt_binding_conflict")
         if attempt.identity.values()["workspace_identity"] != self.workspace_identity:
             raise ValueError("operation_attempt_binding_conflict")
         if not attempt.verify_integrity():
@@ -539,23 +564,17 @@ class SQLiteExecutionStore:
                                      (self.workspace_identity, application_id, operation_identity)).fetchone()
         if row is None:
             raise ValueError("operation_receipt_not_found")
-        receipt = OperationReceipt(**json.loads(row[0]))
+        try:
+            receipt = OperationReceipt(**json.loads(row[0]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise ValueError("receipt_integrity_invalid") from None
+        if receipt.application_id != application_id or receipt.operation_identity != operation_identity:
+            raise ValueError("receipt_binding_conflict")
         if receipt.identity.values()["workspace_identity"] != self.workspace_identity:
             raise ValueError("workspace_mismatch")
         if not receipt.verify_integrity():
             raise ValueError("receipt_integrity_invalid")
         return receipt
-
-    def _get_operation_receipt_by_id(self, application_id: str, receipt_id: str) -> OperationReceipt:
-        with closing(self._connection()) as connection:
-            row = connection.execute("SELECT payload FROM operation_receipts WHERE workspace_identity=? AND application_id=?", (self.workspace_identity, application_id)).fetchall()
-        for candidate in row:
-            receipt = OperationReceipt(**json.loads(candidate[0]))
-            if receipt.operation_receipt_id == receipt_id:
-                if not receipt.verify_integrity():
-                    raise ValueError("receipt_integrity_invalid")
-                return receipt
-        raise ValueError("operation_receipt_not_found")
 
     def record_application_receipt(self, receipt: ApplicationReceipt) -> ApplicationReceipt:
         self._reject_generic_when_orchestrated()
@@ -585,9 +604,14 @@ class SQLiteExecutionStore:
                                      (self.workspace_identity, application_id)).fetchone()
         if row is None:
             raise ValueError("application_receipt_not_found")
-        receipt = ApplicationReceipt(**json.loads(row[0]))
+        try:
+            receipt = ApplicationReceipt(**json.loads(row[0]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise ValueError("application_receipt_integrity_invalid") from None
+        if receipt.application_id != application_id:
+            raise ValueError("application_binding_conflict")
         if receipt.identity.values()["workspace_identity"] != self.workspace_identity:
             raise ValueError("workspace_mismatch")
         if not receipt.verify_integrity():
-            raise ValueError("receipt_integrity_invalid")
+            raise ValueError("application_receipt_integrity_invalid")
         return receipt
