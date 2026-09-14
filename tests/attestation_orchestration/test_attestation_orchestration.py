@@ -14,6 +14,7 @@ from delivery_system.attestation_github_app import GitHubAppCredentialCapability
 from delivery_system.attestation_runtime import (
     RuntimeAttestationOrchestrationService,
     RuntimeCredentialCapabilityBinding,
+    VerifiedRuntimeCredentialContext,
     _subject_from_payload,
 )
 from delivery_system.auditor import RuleEvaluationDraft, RuntimeAuditor
@@ -113,6 +114,11 @@ class OrchestrationTests(unittest.TestCase):
         result = self.run_service()
         self.assertTrue(result.success)
         assert result.binding is not None
+        self.assertIsInstance(result.verified_context, VerifiedRuntimeCredentialContext)
+        assert result.verified_context is not None
+        self.assertIs(result.verified_context.binding, result.binding)
+        self.assertEqual(result.verified_context.envelope, self.provider.last_attestation)
+        self.assertEqual(result.verified_context.binding.verified_at, result.verified_context.verified_at)
         binding = result.binding
         self.assertEqual(binding.repository_identity, "owner/repo")
         self.assertEqual(binding.github_subject_identity, "node-1")
@@ -122,6 +128,26 @@ class OrchestrationTests(unittest.TestCase):
         self.assertTrue(self.service.accepts_binding(binding))
         self.assertIs(self.service.lookup_binding(binding.binding_id), binding)
         self.assertFalse(self.preview["write_eligible"])
+
+    def test_verified_context_rejects_binding_from_another_runtime_event(self):
+        first = self.run_service()
+        self.assertTrue(first.success)
+        assert first.verified_context is not None
+
+        second_provider = FakeCredentialCapabilityProvider()
+        second_service = RuntimeAttestationOrchestrationService(
+            self.context, self.store, TRUST,
+            AttestationRuntimeBoundary(self.fake_issuer, self.fake_issuer, self.fake_issuer, FakeCapabilityPolicy()),
+            second_provider, self.resolver, clock=lambda: NOW,
+        )
+        second = second_service.orchestrate(self.preview["preview_id"], self.preview["revision"])
+        self.assertTrue(second.success)
+        assert second.binding is not None
+        self.assertIsNot(first.binding, second.binding)
+        with self.assertRaisesRegex(ValueError, "^verified_runtime_context_source_mismatch$"):
+            VerifiedRuntimeCredentialContext._issue(
+                self.service, first.verified_context.event, second.binding
+            )
 
     def test_write_eligible_preview_enters_existing_capability_orchestration(self):
         valid_store = InMemoryPreviewStore(self.context.workspace_identity, TRUST)
@@ -592,7 +618,7 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual(len(self.service._RuntimeAttestationOrchestrationService__bindings_by_id), 0)
 
         class ConsumeFailBoundary(AttestationRuntimeBoundary):
-            def consume_ticket(self, ticket):
+            def consume_verified_event(self, ticket):
                 raise ValueError("ticket-internal")
 
         service = RuntimeAttestationOrchestrationService(

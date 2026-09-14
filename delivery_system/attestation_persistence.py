@@ -301,6 +301,49 @@ class PersistedAttestationArtifact:
         object.__setattr__(self, "artifact_id", artifact_id)
         object.__setattr__(self, "artifact_digest", artifact_digest)
 
+    @classmethod
+    def artifact_id_for(cls, workspace_identity: str, attestation_id: str) -> str:
+        workspace = _text(workspace_identity, "workspace_identity")
+        attestation = _text(attestation_id, "attestation_id")
+        return _sha_id(
+            ARTIFACT_ID_DOMAIN,
+            {"identity_version": "1", "workspace_identity": workspace, "attestation_id": attestation},
+            "artifact-",
+        )
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        workspace_identity: str,
+        claims_payload: CredentialCapabilityAttestationClaims,
+        detached_proof: str,
+        original_verified_at: str,
+        created_at: str,
+    ) -> "PersistedAttestationArtifact":
+        workspace = _text(workspace_identity, "workspace_identity")
+        claims = _claims_object(claims_payload)
+        proof = _canonical_proof(detached_proof)
+        original = _timestamp(original_verified_at)
+        created = _timestamp(created_at)
+        claims_digest = claims.claims_digest()
+        content = cls._content_payload_for(
+            workspace, claims.attestation_id, claims.to_payload(), proof,
+            claims_digest, original, created,
+        )
+        return cls(
+            ARTIFACT_CONTRACT_VERSION,
+            cls.artifact_id_for(workspace, claims.attestation_id),
+            workspace,
+            claims.attestation_id,
+            claims,
+            proof,
+            claims_digest,
+            digest(content),
+            original,
+            created,
+        )
+
     @staticmethod
     def _content_payload_for(workspace: str, attestation_id: str, claims_payload: dict[str, Any],
                              proof: str, claims_digest: str, original: str, created: str) -> dict[str, Any]:
@@ -437,6 +480,71 @@ class AttestationBindingReference:
             object.__setattr__(self, field, value)
         object.__setattr__(self, "reference_id", reference_id)
         object.__setattr__(self, "binding_reference_digest", binding_reference_digest)
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        artifact: PersistedAttestationArtifact,
+        binding_values: Mapping[str, Any],
+    ) -> "AttestationBindingReference":
+        normalized_artifact = PersistedAttestationArtifact.from_untrusted(artifact)
+        try:
+            if not isinstance(binding_values, Mapping):
+                _error("attestation_persistence_payload_invalid")
+            attestation_version = binding_values["attestation_version"]
+            if attestation_version not in {ATTESTATION_VERSION_V1, ATTESTATION_VERSION_V2}:
+                _error("attestation_persistence_payload_invalid")
+            version = (
+                REFERENCE_V2_CONTRACT_VERSION
+                if attestation_version == ATTESTATION_VERSION_V2
+                else REFERENCE_CONTRACT_VERSION
+            )
+            values: dict[str, Any] = {
+                "reference_contract_version": version,
+                "reference_id": "",
+                "workspace_identity": normalized_artifact.workspace_identity,
+                "artifact_id": normalized_artifact.artifact_id,
+                "artifact_digest": normalized_artifact.artifact_digest,
+                "binding_id": binding_values["binding_id"],
+                "repository_identity": binding_values["repository_identity"],
+                "github_subject_identity": binding_values["github_subject_identity"],
+                "driver_identity": binding_values["driver_identity"],
+                "remote_authority": binding_values["remote_authority"],
+                "preview_id": binding_values["preview_id"],
+                "revision": binding_values["revision"],
+                "plan_digest": binding_values["plan_digest"],
+                "sealed_preview_digest": binding_values["sealed_preview_digest"],
+                "operation_set_digest": binding_values["operation_set_digest"],
+                "remote_snapshot_digest": binding_values["remote_snapshot_digest"],
+                "audit_id": binding_values["audit_id"],
+                "audit_digest": binding_values["audit_digest"],
+                "evidence_id": binding_values["evidence_id"],
+                "evidence_digest": binding_values["evidence_digest"],
+                "original_verified_at": normalized_artifact.original_verified_at,
+                "binding_reference_digest": "",
+                "credential_principal_identity": "",
+                "challenge_digest": "",
+            }
+            if version == REFERENCE_V2_CONTRACT_VERSION:
+                values["credential_principal_identity"] = binding_values["credential_principal_identity"]
+                values["challenge_digest"] = binding_values["challenge_digest"]
+            values["binding_reference_digest"] = digest(cls._content_payload_for(values))
+            values["reference_id"] = _sha_id(
+                REFERENCE_ID_DOMAIN,
+                {
+                    "reference_version": "2" if version == REFERENCE_V2_CONTRACT_VERSION else "1",
+                    "workspace_identity": normalized_artifact.workspace_identity,
+                    "artifact_id": normalized_artifact.artifact_id,
+                    "binding_id": binding_values["binding_id"],
+                },
+                "binding-reference-",
+            )
+            return cls(**values)
+        except PersistenceContractError:
+            raise
+        except Exception as exc:
+            raise PersistenceContractError("attestation_persistence_payload_invalid") from exc
 
     @staticmethod
     def _content_payload_for(values: Mapping[str, Any]) -> dict[str, Any]:

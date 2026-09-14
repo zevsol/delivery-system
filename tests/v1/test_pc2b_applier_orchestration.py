@@ -122,16 +122,25 @@ class ApplierOrchestrationTests(unittest.TestCase):
             credential_instance_id="fake-instance-1",
         )
         lease = GitHubAppInstallationCredentialLease._mint("pc4-test-token", provider.lease_evidence)
+        artifact_adapter, signer, binding_store = approval_fixture.i3b_dependencies(
+            context.workspace_identity,
+        )
         if real_executor:
             service = RuntimeApprovalAuthorityService(
                 context, preview_store, foundation.attestation_service,
                 clock=foundation.clock, host_credential_lease=lease,
+                artifact_link_adapter=artifact_adapter,
+                authority_binding_signer=signer,
+                authority_binding_store=binding_store,
             )
         else:
             with patch.object(runtime_module, "_compose_production_write_executor", return_value=driver):
                 service = RuntimeApprovalAuthorityService(
                     context, preview_store, foundation.attestation_service,
                     clock=foundation.clock, host_credential_lease=lease,
+                    artifact_link_adapter=artifact_adapter,
+                    authority_binding_signer=signer,
+                    authority_binding_store=binding_store,
                 )
         approval = service.record_approval(
             preview["preview_id"], 1,
@@ -247,22 +256,18 @@ class ApplierOrchestrationTests(unittest.TestCase):
             path = directory.name + "\\execution.sqlite3"
             store = self._store(context, service, directory)
             service.create_applier(store).apply(authority.authority_id)
+            artifact_adapter, signer, binding_store = approval_fixture.i3b_dependencies(
+                context.workspace_identity,
+            )
             shadow = RuntimeApprovalAuthorityService(
                 context, service.store, service.attestation_service, clock=service.clock,
+                artifact_link_adapter=artifact_adapter,
+                authority_binding_signer=signer,
+                authority_binding_store=binding_store,
             )
             shadow._authorities[authority.authority_id] = authority
-            shadow_context = shadow.create_execution_context(authority.authority_id)
-            shadow_store = SQLiteExecutionStore(path, context.workspace_identity, runtime_service=shadow)
-            state = shadow_store.get_execution(
-                shadow_context.identity.application_id,
-                expected_operations=shadow_context.expected_operations,
-            )
-            candidate = shadow_context.continue_execution_state(
-                state, state="Applied", completed_at="2026-08-14T12:00:00Z",
-                updated_at="2026-08-14T12:00:00Z",
-            )
-            with self.assertRaisesRegex(ValueError, "^applier_orchestration_required$"):
-                shadow_store.save_execution(candidate)
+            with self.assertRaisesRegex(ValueError, "^application_authority_rejected$"):
+                shadow.create_execution_context(authority.authority_id)
         finally:
             directory.cleanup()
 

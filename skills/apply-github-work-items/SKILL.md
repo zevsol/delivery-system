@@ -35,6 +35,12 @@ Apply does not own or perform planning, audit creation, Human Approval creation 
 
 The user-facing result must distinguish Approval from Application, and definitive success or failure from recovery-required. Application is not read-only; disclose that it may mutate GitHub Issues within the exact approved operation set.
 
+## OutcomeUnknown relationship observation
+
+- Only an `OutcomeUnknown` `add_sub_issue` or `add_dependency` operation is eligible for current relationship observation. Call `delivery_observe_application_postcondition` with the exact `application_id`.
+- `postcondition_confirmed` means the desired relationship currently exists. `postcondition_absent` means the desired relationship does not currently exist. `inconclusive` means the current relationship state cannot be safely classified.
+- Every observation reports historical causal attribution as `not_established`. No observation result authorizes automatic retry or resume. Do not invoke Apply again automatically, do not mutate GitHub, and keep durable recovery state as `OutcomeUnknown`.
+
 ## Status inspection
 
 - When a user asks to inspect an existing application or its retained recovery evidence, call `delivery_get_application_status` with the exact Runtime-returned `application_id`.

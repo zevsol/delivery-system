@@ -21,6 +21,7 @@ from delivery_system.attestation import (
     CredentialCapabilityRequest,
     CredentialCapabilityAttestationClaims,
     SignedCredentialCapabilityAttestation,
+    VerifiedCredentialAttestationEvent,
 )
 from delivery_system.drivers.contract import DriverTrustContext
 from delivery_system.audit_state import AuditRecord, AuditResult, AuditStatus
@@ -79,10 +80,79 @@ class RuntimeCredentialCapabilityBinding:
         return "<RuntimeCredentialCapabilityBinding protected>"
 
 
+class VerifiedRuntimeCredentialContext:
+    """Source-owned handoff for one verified event and its Runtime binding."""
+
+    __slots__ = ("__event", "__binding", "__owner", "__weakref__")
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        raise ValueError("verified_runtime_context_internal_only")
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise ValueError("verified_runtime_context_immutable")
+
+    @classmethod
+    def _issue(
+        cls,
+        issuer: "RuntimeAttestationOrchestrationService",
+        event: VerifiedCredentialAttestationEvent,
+        binding: RuntimeCredentialCapabilityBinding,
+    ) -> "VerifiedRuntimeCredentialContext":
+        if type(issuer) is not RuntimeAttestationOrchestrationService:
+            raise ValueError("verified_runtime_context_source_mismatch")
+        if not _concrete_accepts_verified_event_binding(issuer, event, binding):
+            raise ValueError("verified_runtime_context_source_mismatch")
+        context = object.__new__(cls)
+        object.__setattr__(context, "_VerifiedRuntimeCredentialContext__event", event)
+        object.__setattr__(context, "_VerifiedRuntimeCredentialContext__binding", binding)
+        object.__setattr__(context, "_VerifiedRuntimeCredentialContext__owner", weakref.ref(issuer))
+        return context
+
+    def is_source_owned(self) -> bool:
+        if type(self) is not VerifiedRuntimeCredentialContext:
+            return False
+        try:
+            owner_ref = object.__getattribute__(self, "_VerifiedRuntimeCredentialContext__owner")
+            owner = owner_ref()
+            if type(owner) is not RuntimeAttestationOrchestrationService:
+                return False
+            return _concrete_accepts_verified_context(owner, self)
+        except Exception:
+            return False
+
+    @property
+    def event(self) -> VerifiedCredentialAttestationEvent:
+        return self.__event
+
+    @property
+    def envelope(self) -> SignedCredentialCapabilityAttestation:
+        return self.__event.envelope
+
+    @property
+    def claims(self) -> CredentialCapabilityAttestationClaims:
+        return self.__event.claims
+
+    @property
+    def verified_at(self) -> str:
+        return self.__event.verified_at
+
+    @property
+    def event_id(self) -> str:
+        return self.__event.event_id
+
+    @property
+    def binding(self) -> RuntimeCredentialCapabilityBinding:
+        return self.__binding
+
+    def __repr__(self) -> str:
+        return "<VerifiedRuntimeCredentialContext protected>"
+
+
 @dataclass(frozen=True)
 class RuntimeAttestationResult:
     binding: RuntimeCredentialCapabilityBinding | None
     failures: tuple[RuntimeAttestationFailure, ...]
+    verified_context: VerifiedRuntimeCredentialContext | None = None
 
     @property
     def success(self) -> bool:
@@ -127,6 +197,54 @@ def _normalise_requirements(value: Any) -> tuple[str, ...]:
     return normalised
 
 
+def _concrete_accepts_verified_event_binding(
+    owner: RuntimeAttestationOrchestrationService,
+    event: VerifiedCredentialAttestationEvent,
+    binding: RuntimeCredentialCapabilityBinding,
+) -> bool:
+    """Validate event/binding provenance without virtual owner dispatch."""
+    if type(owner) is not RuntimeAttestationOrchestrationService:
+        return False
+    try:
+        lock = object.__getattribute__(owner, "_RuntimeAttestationOrchestrationService__lock")
+        boundary = object.__getattribute__(owner, "_RuntimeAttestationOrchestrationService__boundary")
+        binding_events = object.__getattribute__(owner, "_RuntimeAttestationOrchestrationService__binding_events")
+        with lock:
+            return (
+                AttestationRuntimeBoundary.accepts_verified_event(boundary, event)
+                and RuntimeAttestationOrchestrationService._registered_binding_is_intact(owner, binding)
+                and binding_events.get(binding) is event
+            )
+    except Exception:
+        return False
+
+
+def _concrete_accepts_verified_context(
+    owner: RuntimeAttestationOrchestrationService,
+    context: VerifiedRuntimeCredentialContext,
+) -> bool:
+    """Validate context provenance against concrete owner state and identity."""
+    if type(owner) is not RuntimeAttestationOrchestrationService or type(context) is not VerifiedRuntimeCredentialContext:
+        return False
+    try:
+        event = object.__getattribute__(context, "_VerifiedRuntimeCredentialContext__event")
+        binding = object.__getattribute__(context, "_VerifiedRuntimeCredentialContext__binding")
+        owner_ref = object.__getattribute__(context, "_VerifiedRuntimeCredentialContext__owner")
+        if owner_ref() is not owner:
+            return False
+        lock = object.__getattribute__(owner, "_RuntimeAttestationOrchestrationService__lock")
+        contexts_by_binding = object.__getattribute__(owner, "_RuntimeAttestationOrchestrationService__contexts_by_binding")
+        binding_events = object.__getattribute__(owner, "_RuntimeAttestationOrchestrationService__binding_events")
+        with lock:
+            return (
+                contexts_by_binding.get(binding) is context
+                and binding_events.get(binding) is event
+                and _concrete_accepts_verified_event_binding(owner, event, binding)
+            )
+    except Exception:
+        return False
+
+
 class RuntimeAttestationOrchestrationService:
     """Explicit Runtime-only bridge from sealed state to an ephemeral Binding."""
 
@@ -156,6 +274,8 @@ class RuntimeAttestationOrchestrationService:
         self.__bindings_by_id: dict[str, RuntimeCredentialCapabilityBinding] = {}
         self.__bindings_by_state: dict[tuple[Any, ...], RuntimeCredentialCapabilityBinding] = {}
         self.__binding_registry: weakref.WeakKeyDictionary[RuntimeCredentialCapabilityBinding, tuple[Any, str]] = weakref.WeakKeyDictionary()
+        self.__binding_events: weakref.WeakKeyDictionary[RuntimeCredentialCapabilityBinding, VerifiedCredentialAttestationEvent] = weakref.WeakKeyDictionary()
+        self.__contexts_by_binding: weakref.WeakKeyDictionary[RuntimeCredentialCapabilityBinding, VerifiedRuntimeCredentialContext] = weakref.WeakKeyDictionary()
 
     @staticmethod
     def _binding_fields(binding: RuntimeCredentialCapabilityBinding) -> dict[str, Any]:
@@ -382,9 +502,11 @@ class RuntimeAttestationOrchestrationService:
     def _binding_payload(values: Mapping[str, Any]) -> dict[str, Any]:
         return {key: values[key] for key in values if key != "verified_at"}
 
-    def _make_binding(self, claims: CredentialCapabilityAttestationClaims, request: CredentialCapabilityRequest,
-                      canonical: Mapping[str, Any], audit: AuditRecord, evidence: EvidenceRecord,
-                      verified_at: datetime) -> RuntimeCredentialCapabilityBinding:
+    def _make_binding(self, event: VerifiedCredentialAttestationEvent, request: CredentialCapabilityRequest,
+                      canonical: Mapping[str, Any], audit: AuditRecord, evidence: EvidenceRecord) -> RuntimeCredentialCapabilityBinding:
+        if not self.__boundary.accepts_verified_event(event):
+            raise ValueError("attestation_verified_event_mismatch")
+        claims = event.claims
         values: dict[str, Any] = {
             "workspace_identity": self.__context.workspace_identity,
             "attestation_version": claims.attestation_version,
@@ -405,7 +527,7 @@ class RuntimeAttestationOrchestrationService:
             "evidence_digest": claims.evidence_digest, "audit_id": audit.audit_id,
             "audit_digest": audit.audit_digest, "source_verification_digest": claims.source_verification_digest,
             "issued_at": claims.issued_at, "expires_at": claims.expires_at,
-            "verified_at": verified_at.isoformat().replace("+00:00", "Z"),
+            "verified_at": event.verified_at,
         }
         binding_id = "binding-" + hashlib.sha256(canonical_payload({"domain": "delivery-system:runtime-attestation-binding:v1", "binding": self._binding_payload(values)}).encode("utf-8")).hexdigest()
         values["binding_id"] = binding_id
@@ -413,6 +535,36 @@ class RuntimeAttestationOrchestrationService:
         for field, value in values.items():
             object.__setattr__(binding, field, value)
         return binding
+
+    def _accepts_verified_event_binding(
+        self, event: VerifiedCredentialAttestationEvent, binding: RuntimeCredentialCapabilityBinding,
+    ) -> bool:
+        try:
+            with self.__lock:
+                return (
+                    self.__boundary.accepts_verified_event(event)
+                    and self._registered_binding_is_intact(binding)
+                    and self.__binding_events.get(binding) is event
+                )
+        except Exception:
+            return False
+
+    def _accepts_verified_context(self, context: VerifiedRuntimeCredentialContext) -> bool:
+        try:
+            event = object.__getattribute__(context, "_VerifiedRuntimeCredentialContext__event")
+            binding = object.__getattribute__(context, "_VerifiedRuntimeCredentialContext__binding")
+            owner_ref = object.__getattribute__(context, "_VerifiedRuntimeCredentialContext__owner")
+            if owner_ref() is not self:
+                return False
+            with self.__lock:
+                return (
+                    self.__contexts_by_binding.get(binding) is context
+                    and self.__binding_events.get(binding) is event
+                    and self.__boundary.accepts_verified_event(event)
+                    and self._registered_binding_is_intact(binding)
+                )
+        except Exception:
+            return False
 
     def orchestrate(self, preview_id: str, revision: int) -> RuntimeAttestationResult:
         try:
@@ -443,11 +595,11 @@ class RuntimeAttestationOrchestrationService:
                     code = verification.failures[0].code if verification.failures else "attestation_invalid"
                     return _failure(code)
                 try:
-                    claims = self.__boundary.consume_ticket(verification.verified)
+                    event = self.__boundary.consume_verified_event(verification.verified)
                 except Exception:
                     return _failure("attestation_ticket_consume_failed")
                 try:
-                    binding = self._make_binding(claims, request, canonical, audit, evidence, now)
+                    binding = self._make_binding(event, request, canonical, audit, evidence)
                 except Exception:
                     return _failure("attestation_provider_response_invalid")
                 state_key = (
@@ -462,11 +614,17 @@ class RuntimeAttestationOrchestrationService:
                         return _failure("attestation_binding_integrity_failed")
                     if existing.attestation_id != binding.attestation_id or existing.claims_digest != binding.claims_digest:
                         return _failure("attestation_binding_conflict")
-                    return RuntimeAttestationResult(existing, ())
+                    context = self.__contexts_by_binding.get(existing)
+                    if context is None:
+                        return _failure("attestation_binding_integrity_failed")
+                    return RuntimeAttestationResult(existing, (), context)
                 self.__bindings_by_state[state_key] = binding
                 self.__bindings_by_id[binding.binding_id] = binding
                 self.__binding_registry[binding] = self._binding_contract(binding)
-                return RuntimeAttestationResult(binding, ())
+                self.__binding_events[binding] = event
+                context = VerifiedRuntimeCredentialContext._issue(self, event, binding)
+                self.__contexts_by_binding[binding] = context
+                return RuntimeAttestationResult(binding, (), context)
         except Exception:
             return _failure("attestation_provider_response_invalid")
 

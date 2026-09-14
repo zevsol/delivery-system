@@ -69,6 +69,7 @@ class McpSdkContractTests(unittest.TestCase):
                 "delivery_record_approval", "delivery_issue_application_authority",
                 "delivery_apply_approved_work_items",
                 "delivery_get_application_status",
+                "delivery_observe_application_postcondition",
             })
             self.assertFalse(result.is_error)
             self.assertEqual(result.structured_content["provenance_status"], "declared_unverified")

@@ -147,6 +147,22 @@ class ApplySkillContractTests(unittest.TestCase):
             self.assertIn(phrase, status)
         self.assertIn("Do not perform built-in remote reconciliation or remote reobservation", self.skill)
 
+    def test_outcome_unknown_relationship_observation_guidance_is_additive(self):
+        guidance = self.section(self.skill, "OutcomeUnknown relationship observation")
+        for phrase in (
+            "Only an `OutcomeUnknown` `add_sub_issue` or `add_dependency` operation is eligible",
+            "delivery_observe_application_postcondition",
+            "`postcondition_confirmed` means the desired relationship currently exists",
+            "`postcondition_absent` means the desired relationship does not currently exist",
+            "`inconclusive` means the current relationship state cannot be safely classified",
+            "historical causal attribution as `not_established`",
+            "No observation result authorizes automatic retry or resume",
+            "Do not invoke Apply again automatically",
+            "do not mutate GitHub",
+            "durable recovery state as `OutcomeUnknown`",
+        ):
+            self.assertIn(phrase, guidance)
+
     def test_metadata_has_exact_internal_mcp_surface(self):
         entries = re.findall(
             r'- type: "([^"]+)"\n\s+value: "([^"]+)"\n\s+description: "([^"]+)"\n\s+transport: "([^"]+)"',
