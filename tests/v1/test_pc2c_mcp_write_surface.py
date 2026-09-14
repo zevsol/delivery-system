@@ -15,6 +15,7 @@ from mcp.client.stdio import stdio_client
 from pydantic import ValidationError
 
 from delivery_system.applier import ApplyResult
+from delivery_system.canonical import digest
 from delivery_system.drivers.write_contract import WriteObservation, WriteObservationKind
 from delivery_system.execution_store import SQLiteExecutionStore
 from delivery_system.runtime import RuntimeApprovalAuthorityService, RuntimeContext
@@ -58,20 +59,53 @@ class McpWriteSurfaceTests(unittest.TestCase):
     def _success(number=1, numeric_id="1"):
         return ApplierOrchestrationTests._success(number=number, numeric_id=numeric_id)
 
-    def test_seventh_tool_and_exact_annotations(self):
+    def test_eighth_tool_preserves_previous_surface_and_adds_exact_annotations(self):
         async def exercise():
             async with Client(mcp, raise_exceptions=True) as client:
                 return (await client.list_tools()).tools
         tools = self.run_async(exercise())
-        self.assertEqual(len(tools), 7)
-        status_tool = next(tool for tool in tools if tool.name == "delivery_get_application_status")
-        self.assertEqual((status_tool.annotations.read_only_hint,
-                          status_tool.annotations.destructive_hint,
-                          status_tool.annotations.open_world_hint), (True, False, False))
-        apply_tool = next(tool for tool in tools if tool.name == "delivery_apply_approved_work_items")
-        self.assertEqual((apply_tool.annotations.read_only_hint,
-                          apply_tool.annotations.destructive_hint,
-                          apply_tool.annotations.open_world_hint), (False, True, True))
+        self.assertEqual(len(tools), 8)
+        expected_names = [
+            "delivery_plan_preview", "delivery_get_audit_context", "delivery_record_audit",
+            "delivery_record_approval", "delivery_get_application_status",
+            "delivery_issue_application_authority", "delivery_apply_approved_work_items",
+            "delivery_observe_application_postcondition",
+        ]
+        self.assertEqual([tool.name for tool in tools], expected_names)
+        previous_schema_digests = {
+            "delivery_plan_preview": "sha256:9fd77b63e490c722dbe4b3be96cea5ebab052e1f8face278bb11fac8335df589",
+            "delivery_get_audit_context": "sha256:7e5a88fa6cb96c5c3568d34d41eb7ef922003bcd28a04faddceb22230df085cc",
+            "delivery_record_audit": "sha256:ee441336c876fa2e5ebdb6aa1801e47e9b21bb903a4260d1811f8e5e43ff69af",
+            "delivery_record_approval": "sha256:f444ab3177f1608391e8f19dd3bd1da45632c2eae6c7d330b94a642da989adbe",
+            "delivery_get_application_status": "sha256:823be86c44648e883641f2e1ce1a7f5040f0c1c26e5fc6f8ce3fb38549dbd725",
+            "delivery_issue_application_authority": "sha256:82d5af471b70a1912e2a5165de5c6bc0baec40b87a9f26e87dce6102e4b3935e",
+            "delivery_apply_approved_work_items": "sha256:da26f434642b30c6d183762f63f77b53b4bef475d067e06ee651b14dcc3a2dac",
+        }
+        previous_annotations = {
+            "delivery_plan_preview": (False, False, False),
+            "delivery_get_audit_context": (True, False, False),
+            "delivery_record_audit": (False, False, False),
+            "delivery_record_approval": (False, False, False),
+            "delivery_get_application_status": (True, False, False),
+            "delivery_issue_application_authority": (False, False, True),
+            "delivery_apply_approved_work_items": (False, True, True),
+        }
+        for tool in tools:
+            annotations = (tool.annotations.read_only_hint, tool.annotations.destructive_hint,
+                           tool.annotations.open_world_hint)
+            if tool.name in previous_schema_digests:
+                self.assertEqual(digest(tool.input_schema), previous_schema_digests[tool.name])
+                self.assertEqual(annotations, previous_annotations[tool.name])
+            else:
+                self.assertEqual(annotations, (True, False, True))
+
+    def test_observation_input_rejects_extra_fields(self):
+        result = self._call(
+            mcp, "delivery_observe_application_postcondition",
+            {"application_id": "application-" + "a" * 64, "extra": "rejected"},
+        )
+        self.assertTrue(result.is_error)
+        self.assertNotIn("remote_observation", str(result.content))
 
     def test_global_apply_is_unconfigured_and_fails_closed(self):
         result = self._call(mcp, "delivery_apply_approved_work_items",
@@ -350,7 +384,7 @@ class McpWriteSurfaceTests(unittest.TestCase):
                                                         {"payload": {"application_authority_id": "authority"}})
                         return tools, result
             tools, result = self.run_async(exercise())
-            self.assertEqual(len(tools.tools), 7)
+            self.assertEqual(len(tools.tools), 8)
             self.assertTrue(result.is_error)
             self.assertIn("write_execution_boundary_unavailable", str(result.content))
 

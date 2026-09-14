@@ -294,6 +294,51 @@ class ApplicationStatusSurfaceTests(unittest.TestCase):
         finally:
             directory.cleanup()
 
+    def test_historical_attempt_and_receipt_authority_bindings_are_verified(self):
+        directory, context, preview, service, authority, driver, execution_store = self._configured(
+            (mcp_surface.McpWriteSurfaceTests._success(),)
+        )
+        try:
+            server = self._server(context, service, execution_store)
+            applied = mcp_surface.McpWriteSurfaceTests._call(
+                server, "delivery_apply_approved_work_items",
+                {"application_authority_id": authority.authority_id},
+            )
+            application_id = self._app_id(applied)
+            attempt = self._row_payload(execution_store.path, "operation_attempts", application_id)
+            attempt["request_identity"] = "application-request-forged"
+            self._replace_payload(
+                execution_store.path, "operation_attempts", application_id,
+                self._redigest(attempt, "attempt_digest"), attempt["operation_identity"],
+            )
+            result = self._call(server, {"application_id": application_id})
+            self.assertTrue(result.is_error)
+            self.assertIn("attempt_integrity_invalid", str(result.content))
+        finally:
+            directory.cleanup()
+
+        directory, context, preview, service, authority, driver, execution_store = self._configured(
+            (mcp_surface.McpWriteSurfaceTests._success(),)
+        )
+        try:
+            server = self._server(context, service, execution_store)
+            applied = mcp_surface.McpWriteSurfaceTests._call(
+                server, "delivery_apply_approved_work_items",
+                {"application_authority_id": authority.authority_id},
+            )
+            application_id = self._app_id(applied)
+            receipt = self._row_payload(execution_store.path, "operation_receipts", application_id)
+            receipt["authority_binding"]["remote_authority"] = "sha256:" + "0" * 64
+            self._replace_payload(
+                execution_store.path, "operation_receipts", application_id,
+                self._redigest(receipt, "receipt_digest"), receipt["operation_identity"],
+            )
+            result = self._call(server, {"application_id": application_id})
+            self.assertTrue(result.is_error)
+            self.assertIn("receipt_integrity_invalid", str(result.content))
+        finally:
+            directory.cleanup()
+
     def test_missing_receipts_and_side_effect_boundary(self):
         directory, context, preview, service, authority, driver, execution_store = self._configured(
             (mcp_surface.McpWriteSurfaceTests._success(),)
@@ -772,7 +817,7 @@ class ApplicationStatusSurfaceTests(unittest.TestCase):
         payload_schema = schema["$defs"][schema["properties"]["payload"]["$ref"].rsplit("/", 1)[1]]
         properties = payload_schema["properties"]
         self.assertEqual(properties["application_id"]["pattern"], r"^application-[0-9a-f]{64}$")
-        self.assertEqual(len(tools), 7)
+        self.assertEqual(len(tools), 8)
 
 
 if __name__ == "__main__":

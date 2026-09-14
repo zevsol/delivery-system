@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import copy, deepcopy
+import base64
 from datetime import datetime, timezone
 import tempfile
 import unittest
@@ -10,6 +11,9 @@ from unittest.mock import patch
 from delivery_system.application_authority import ApplicationAuthority
 from delivery_system.attestation import AttestationRuntimeBoundary
 from delivery_system.attestation_runtime import RuntimeAttestationOrchestrationService
+from delivery_system.attestation_persistence_store import InMemoryAttestationPersistenceStore
+from delivery_system.authority_binding import AUTHORITY_BINDING_SIGNATURE_ALGORITHM
+from delivery_system.authority_binding_persistence import InMemoryAuthorityBindingPersistenceStore
 from delivery_system.auditor import RuleEvaluationDraft, RuntimeAuditor
 from delivery_system.audit_state import AuditResult, AuditStatus
 from delivery_system.audit_state import ApprovalRecord
@@ -18,6 +22,7 @@ from delivery_system.runtime import (
     InMemoryPreviewStore, RuntimeApprovalAuthorityService, RuntimeContext, RuntimePlanner,
     SQLitePreviewStore,
 )
+from delivery_system.verified_attestation_artifact import VerifiedAttestationArtifactAdapter
 from delivery_system.rules import SemanticOutcome, build_registry_v1
 from tests.attestation_contract.test_attestation_contract import FakeCapabilityPolicy, FakeIssuer
 from tests.attestation_orchestration.test_attestation_orchestration import FakeReadOnlyDriver
@@ -27,6 +32,33 @@ from tests.local_rest_offline.test_repository_aware_runtime import plan as base_
 
 TRUST = DriverTrustContext("fixture-driver", "offline://fixture", "fixture-v1")
 NOW = datetime(2026, 8, 14, 12, 0, tzinfo=timezone.utc)
+
+
+class TestAuthorityBindingSigner:
+    issuer_id = "test-authority-issuer"
+    key_id = "test-authority-key"
+    signature_algorithm = AUTHORITY_BINDING_SIGNATURE_ALGORITHM
+    proof = base64.urlsafe_b64encode(bytes(range(64))).decode("ascii").rstrip("=")
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def sign_authority_binding(self, canonical_payload_bytes: bytes) -> str:
+        self.calls += 1
+        return self.proof
+
+
+def i3b_dependencies(workspace_identity: str):
+    artifact_store = InMemoryAttestationPersistenceStore()
+    artifact_adapter = VerifiedAttestationArtifactAdapter(
+        artifact_store,
+        clock=lambda: NOW.replace(minute=1),
+    )
+    signer = TestAuthorityBindingSigner()
+    binding_store = InMemoryAuthorityBindingPersistenceStore(
+        workspace_identity=workspace_identity,
+    )
+    return artifact_adapter, signer, binding_store
 
 
 def plan() -> dict[str, object]:
@@ -62,7 +94,13 @@ class OperationalApprovalAuthorityTests(unittest.TestCase):
             AttestationRuntimeBoundary(issuer, issuer, issuer, FakeCapabilityPolicy()),
             FakeCredentialCapabilityProvider(), FakeCapabilityResolver(), clock=lambda: NOW,
         )
-        service = RuntimeApprovalAuthorityService(context, store, attestation, clock=lambda: NOW)
+        artifact_adapter, signer, binding_store = i3b_dependencies(context.workspace_identity)
+        service = RuntimeApprovalAuthorityService(
+            context, store, attestation, clock=lambda: NOW,
+            artifact_link_adapter=artifact_adapter,
+            authority_binding_signer=signer,
+            authority_binding_store=binding_store,
+        )
         return directory, context, store, preview, audit, service
 
     def test_exact_approval_is_persisted_and_replayed_with_original_time(self):
@@ -110,9 +148,9 @@ class OperationalApprovalAuthorityTests(unittest.TestCase):
             command = f"批准写入 {preview['preview_id']} 1"
             approval = service.record_approval(preview["preview_id"], 1, command, "human")
             first = service.issue_application_authority(preview["preview_id"], 1, approval.approval_id)
-            second = service.issue_application_authority(preview["preview_id"], 1, approval.approval_id)
-            self.assertIs(first, second)
             self.assertTrue(service.validate_application_authority(first))
+            with self.assertRaisesRegex(ValueError, "^authority_issuance_requires_recovery$"):
+                service.issue_application_authority(preview["preview_id"], 1, approval.approval_id)
             with self.assertRaisesRegex(ValueError, "^application_authority_internal_only$"):
                 ApplicationAuthority()
             with self.assertRaisesRegex(ValueError, "^application_authority_immutable$"):
@@ -324,7 +362,7 @@ class OperationalApprovalAuthorityTests(unittest.TestCase):
                 object.__setattr__(binding, "granted_capabilities", ())
                 return binding
             with patch.object(service.attestation_service, "resolve_registered_binding", side_effect=without_grant):
-                with self.assertRaisesRegex(ValueError, "^credential_capability_insufficient$"):
+                with self.assertRaisesRegex(ValueError, "^verified_attestation_context_unverified$"):
                     service.issue_application_authority(preview["preview_id"], 1, approval.approval_id)
         finally:
             directory.cleanup()

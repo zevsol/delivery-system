@@ -12,8 +12,8 @@ from mcp.types import ToolAnnotations
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, StrictInt, StrictStr
 
 from delivery_system.runtime import (
-    AuditContextService, RuntimeApplicationStatusService, RuntimeApprovalAuthorityService,
-    RuntimeContext, RuntimePlanner, SQLitePreviewStore,
+    ApplicationPostconditionObservation, AuditContextService, RuntimeApplicationStatusService,
+    RuntimeApprovalAuthorityService, RuntimeContext, RuntimePlanner, SQLitePreviewStore,
 )
 from delivery_system.applier import ApplyResult
 from delivery_system.execution_store import SQLiteExecutionStore
@@ -298,6 +298,10 @@ class GetApplicationStatusInput(StrictModel):
     application_id: ApplicationIdInput
 
 
+class ObserveApplicationPostconditionInput(StrictModel):
+    application_id: ApplicationIdInput
+
+
 class ApplicationStatusOutput(StrictModel):
     application_id: StrictStr = Field(min_length=1)
     preview_id: StrictStr = Field(min_length=1)
@@ -315,6 +319,18 @@ class ApplicationStatusOutput(StrictModel):
     started_at: StrictStr = Field(min_length=1)
     updated_at: StrictStr = Field(min_length=1)
     completed_at: StrictStr | None = Field(default=None, min_length=1)
+    integrity_status: Literal["verified"]
+
+
+class ApplicationPostconditionObservationOutput(StrictModel):
+    application_id: StrictStr = Field(min_length=1)
+    operation_index: StrictInt = Field(ge=0)
+    operation_identity: StrictStr = Field(min_length=1)
+    operation_kind: Literal["add_sub_issue", "add_dependency"]
+    postcondition: Literal["postcondition_confirmed", "postcondition_absent", "inconclusive"]
+    causal_attribution: Literal["not_established"]
+    observed_at: StrictStr = Field(min_length=1)
+    state: Literal["OutcomeUnknown"]
     integrity_status: Literal["verified"]
 
 
@@ -486,6 +502,26 @@ def create_server(context: RuntimeContext | None = None, store: Any | None = Non
             "application_receipt_id": result.application_receipt_id,
             "recovery_code": result.recovery_code,
         })
+
+    @mcp.tool(
+        name="delivery_observe_application_postcondition",
+        description=("Read the current relationship postcondition for an OutcomeUnknown application; "
+                      "it never retries, resumes, reconciles durable state, or mutates GitHub."),
+        annotations=ToolAnnotations(read_only_hint=True, destructive_hint=False, open_world_hint=True),
+        structured_output=True,
+    )
+    def delivery_observe_application_postcondition(
+        payload: ObserveApplicationPostconditionInput,
+    ) -> ApplicationPostconditionObservationOutput:
+        if (
+            context is None or store is None or execution_store is None
+            or driver is None or trust_context is None
+        ):
+            raise ValueError("application_reconciliation_boundary_unavailable")
+        observation = ApplicationPostconditionObservation(
+            context, store, execution_store, driver, trust_context,
+        ).observe(payload.application_id)
+        return ApplicationPostconditionObservationOutput.model_validate(observation)
 
     return mcp
 

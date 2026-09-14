@@ -500,6 +500,39 @@ class VerifiedCredentialCapabilityAttestation:
         return "<VerifiedCredentialCapabilityAttestation protected>"
 
 
+class VerifiedCredentialAttestationEvent:
+    """Boundary-owned record for one successful envelope verification."""
+
+    __slots__ = (
+        "__envelope", "__claims", "__verified_at", "__event_id", "__weakref__",
+    )
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        raise AttestationContractError("verified_attestation_event_required")
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttestationContractError("verified_attestation_event_immutable")
+
+    @property
+    def envelope(self) -> "SignedCredentialCapabilityAttestation":
+        return self.__envelope
+
+    @property
+    def claims(self) -> "CredentialCapabilityAttestationClaims":
+        return self.__claims
+
+    @property
+    def verified_at(self) -> str:
+        return self.__verified_at
+
+    @property
+    def event_id(self) -> str:
+        return self.__event_id
+
+    def __repr__(self) -> str:
+        return "<VerifiedCredentialAttestationEvent protected>"
+
+
 @dataclass(frozen=True)
 class AttestationVerificationResult:
     verified: VerifiedCredentialCapabilityAttestation | None
@@ -565,6 +598,11 @@ def _check_capabilities(policy: CredentialCapabilityPolicy | None, capabilities:
 class _TicketRecord:
     claims: CredentialCapabilityAttestationClaims
     owner: "AttestationRuntimeBoundary"
+    envelope: "SignedCredentialCapabilityAttestation"
+    claims_payload: str
+    envelope_proof: str
+    verified_at: str
+    event_id: str
     state: str = "Active"
 
 
@@ -591,6 +629,7 @@ class AttestationRuntimeBoundary:
         self.__requests: weakref.WeakKeyDictionary[CredentialCapabilityRequest, Mapping[str, Any]] = weakref.WeakKeyDictionary()
         self.__challenges: weakref.WeakKeyDictionary[CredentialCapabilityRequest, dict[str, Any]] = weakref.WeakKeyDictionary()
         self.__tickets: weakref.WeakKeyDictionary[VerifiedCredentialCapabilityAttestation, _TicketRecord] = weakref.WeakKeyDictionary()
+        self.__events: weakref.WeakKeyDictionary[VerifiedCredentialAttestationEvent, _TicketRecord] = weakref.WeakKeyDictionary()
 
     def create_request(self, **values: Any) -> CredentialCapabilityRequest:
         normalized = CredentialCapabilityRequest._normalized_values(values)
@@ -630,6 +669,10 @@ class AttestationRuntimeBoundary:
             state["consumed"] = True
 
     def consume_ticket(self, ticket: VerifiedCredentialCapabilityAttestation) -> CredentialCapabilityAttestationClaims:
+        record = self._consume_ticket_record(ticket)
+        return record.claims
+
+    def _consume_ticket_record(self, ticket: VerifiedCredentialCapabilityAttestation) -> _TicketRecord:
         if not isinstance(ticket, VerifiedCredentialCapabilityAttestation):
             raise AttestationContractError("attestation_invalid")
         with self.__lock:
@@ -639,7 +682,40 @@ class AttestationRuntimeBoundary:
             if record.state != "Active":
                 raise AttestationContractError("attestation_replayed")
             object.__setattr__(record, "state", "Consumed")
-            return record.claims
+            return record
+
+    def consume_verified_event(self, ticket: VerifiedCredentialCapabilityAttestation) -> VerifiedCredentialAttestationEvent:
+        """Consume a ticket into a source-owned event carrying exact evidence."""
+        record = self._consume_ticket_record(ticket)
+        event = object.__new__(VerifiedCredentialAttestationEvent)
+        object.__setattr__(event, "_VerifiedCredentialAttestationEvent__envelope", record.envelope)
+        object.__setattr__(event, "_VerifiedCredentialAttestationEvent__claims", record.claims)
+        object.__setattr__(event, "_VerifiedCredentialAttestationEvent__verified_at", record.verified_at)
+        object.__setattr__(event, "_VerifiedCredentialAttestationEvent__event_id", record.event_id)
+        with self.__lock:
+            self.__events[event] = record
+        return event
+
+    def accepts_verified_event(self, event: VerifiedCredentialAttestationEvent) -> bool:
+        """Prove that an event was issued by this boundary and remains intact."""
+        if type(event) is not VerifiedCredentialAttestationEvent:
+            return False
+        try:
+            with self.__lock:
+                record = self.__events.get(event)
+                if record is None or record.owner is not self:
+                    return False
+                return (
+                    object.__getattribute__(event, "_VerifiedCredentialAttestationEvent__envelope") is record.envelope
+                    and object.__getattribute__(event, "_VerifiedCredentialAttestationEvent__claims") is record.claims
+                    and canonical_payload(record.claims.to_payload()) == record.claims_payload
+                    and canonical_payload(record.envelope.claims.to_payload()) == record.claims_payload
+                    and record.envelope.proof == record.envelope_proof
+                    and object.__getattribute__(event, "_VerifiedCredentialAttestationEvent__verified_at") == record.verified_at
+                    and object.__getattribute__(event, "_VerifiedCredentialAttestationEvent__event_id") == record.event_id
+                )
+        except Exception:
+            return False
 
     def verify(
         self,
@@ -734,8 +810,13 @@ class AttestationRuntimeBoundary:
             ticket = object.__new__(VerifiedCredentialCapabilityAttestation)
             object.__setattr__(ticket, "_VerifiedCredentialCapabilityAttestation__attestation_id", claims.attestation_id)
             object.__setattr__(ticket, "_VerifiedCredentialCapabilityAttestation__claims_digest", claims.claims_digest())
+            verified_at = now.isoformat(timespec="microseconds").replace("+00:00", "Z")
+            event_id = "verification-event-" + secrets.token_hex(32)
             with self.__lock:
-                self.__tickets[ticket] = _TicketRecord(claims, self)
+                self.__tickets[ticket] = _TicketRecord(
+                    claims, self, envelope, canonical_payload(claims.to_payload()), envelope.proof,
+                    verified_at, event_id,
+                )
             return AttestationVerificationResult(ticket, ())
         except AttestationContractError as exc:
             code = str(exc)

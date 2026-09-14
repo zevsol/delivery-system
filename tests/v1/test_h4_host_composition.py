@@ -41,6 +41,7 @@ from delivery_system.host_composition import (
     compose_write_enabled_host,
     load_host_configuration,
 )
+from delivery_system.host_revocation import ExternalRevocationError, ExternalRevocationReader
 from delivery_system.runtime import RuntimeApprovalAuthorityService, RuntimeContext
 
 
@@ -145,6 +146,31 @@ class FakeBootstrapTransport:
 
 
 def _environment(rsa_path: Path, ed_private_path: Path, ed_public_path: Path) -> dict[str, str]:
+    authority_private = ed_private_path.parent / "authority-binding-private.pem"
+    authority_public = ed_private_path.parent / "authority-binding-public.pem"
+    authority_key = ed25519.Ed25519PrivateKey.generate()
+    authority_private.write_bytes(_pem_private(authority_key))
+    authority_public.write_bytes(_pem_public(authority_key.public_key()))
+    attestation_bundle = ed_private_path.parent / "attestation-trusted-keys.json"
+    authority_bundle = ed_private_path.parent / "authority-binding-trusted-keys.json"
+    attestation_bundle.write_text(json.dumps({
+        "version": 1,
+        "keys": [{
+            "issuer_id": "host-issuer",
+            "key_id": "host-key",
+            "algorithm": "ed25519",
+            "public_key_path": str(ed_public_path),
+        }],
+    }), encoding="utf-8")
+    authority_bundle.write_text(json.dumps({
+        "version": 1,
+        "keys": [{
+            "issuer_id": "authority-issuer",
+            "key_id": "authority-key",
+            "algorithm": "ed25519",
+            "public_key_path": str(authority_public),
+        }],
+    }), encoding="utf-8")
     return {
         "DELIVERY_SYSTEM_GITHUB_APP_ID": str(APP_ID),
         "DELIVERY_SYSTEM_GITHUB_APP_PRIVATE_KEY_PATH": str(rsa_path),
@@ -154,7 +180,27 @@ def _environment(rsa_path: Path, ed_private_path: Path, ed_public_path: Path) ->
         "DELIVERY_SYSTEM_ATTESTATION_KEY_ID": "host-key",
         "DELIVERY_SYSTEM_ATTESTATION_PRIVATE_KEY_PATH": str(ed_private_path),
         "DELIVERY_SYSTEM_ATTESTATION_PUBLIC_KEY_PATH": str(ed_public_path),
+        "DELIVERY_SYSTEM_ATTESTATION_TRUSTED_KEYS_PATH": str(attestation_bundle),
+        "DELIVERY_SYSTEM_AUTHORITY_BINDING_ISSUER_ID": "authority-issuer",
+        "DELIVERY_SYSTEM_AUTHORITY_BINDING_ACTIVE_KEY_ID": "authority-key",
+        "DELIVERY_SYSTEM_AUTHORITY_BINDING_PRIVATE_KEY_PATH": str(authority_private),
+        "DELIVERY_SYSTEM_AUTHORITY_BINDING_PUBLIC_KEY_PATH": str(authority_public),
+        "DELIVERY_SYSTEM_AUTHORITY_BINDING_TRUSTED_KEYS_PATH": str(authority_bundle),
+        "DELIVERY_SYSTEM_REVOCATION_PROVIDER_URL": "https://revocation.example.invalid/v1/status",
+        "DELIVERY_SYSTEM_REVOCATION_TIMEOUT_MS": "5000",
     }
+
+
+class FakeRevocationTransport:
+    def __init__(self, response: object | None = None) -> None:
+        self.response = {"status": "valid"} if response is None else response
+        self.calls: list[tuple[object, ...]] = []
+
+    def request(self, query, *, timeout_seconds: float, auth_token: str | None):
+        self.calls.append((query, timeout_seconds, auth_token))
+        if isinstance(self.response, BaseException):
+            raise self.response
+        return self.response
 
 
 class KeySourceTests(unittest.TestCase):
@@ -333,6 +379,7 @@ class CompositionTests(unittest.TestCase):
             clock=lambda: NOW,
             credential_instance_id_factory=instance_factory,
             nonce_factory=lambda: "nonce-" + "a" * 32,
+            revocation_transport=FakeRevocationTransport(),
         )
 
     def _composition_rejects_parent_swap(self, role: str, target_bytes: bytes, *, expected_posts: int) -> None:
@@ -498,6 +545,99 @@ class CompositionTests(unittest.TestCase):
             copy.deepcopy(composition)
         with self.assertRaises(HostCompositionError):
             pickle.dumps(composition)
+
+    def test_write_profile_injects_complete_authority_lifecycle(self) -> None:
+        with patch.object(type(self.context), "ensure_store_ready", lambda self, **kwargs: Path(self.state_path).parent.mkdir(parents=True, exist_ok=True)):
+            composition = self._compose(FakeBootstrapTransport(), lambda: str(uuid.uuid4()))
+        try:
+            service = composition.approval_authority_service
+            for name in (
+                "_artifact_link_adapter", "_authority_binding_signer", "_authority_binding_store",
+                "_authority_binding_verifier", "_attestation_persistence_store", "_restart_credential_verifier",
+            ):
+                self.assertIsNotNone(getattr(service, name))
+            self.assertIs(service._artifact_link_adapter, composition.artifact_link_adapter)
+            self.assertIs(service._authority_binding_store, composition.authority_binding_store)
+            self.assertIs(service._restart_credential_verifier, composition.restart_credential_verifier)
+            self.assertIsNotNone(composition.authority_signer)
+            self.assertIsNotNone(composition.authority_registry)
+            self.assertIsNotNone(composition.authority_verifier)
+            self.assertIsNotNone(composition.revocation_reader)
+            self.assertIsNotNone(composition.authority_registry.resolve("authority-issuer", "authority-key", "ed25519"))
+        finally:
+            composition.close()
+
+    def test_trust_bundles_load_multiple_historical_keys(self) -> None:
+        workspace = Path(self.workspace.name)
+        keys = Path(self.keys.name)
+        credential_extra = ed25519.Ed25519PrivateKey.generate()
+        authority_extra = ed25519.Ed25519PrivateKey.generate()
+        credential_extra_path = keys / "credential-extra-public.pem"
+        authority_extra_path = keys / "authority-extra-public.pem"
+        credential_extra_path.write_bytes(_pem_public(credential_extra.public_key()))
+        authority_extra_path.write_bytes(_pem_public(authority_extra.public_key()))
+        candidate = dict(self.environment)
+        Path(candidate["DELIVERY_SYSTEM_ATTESTATION_TRUSTED_KEYS_PATH"]).write_text(json.dumps({
+            "version": 1,
+            "keys": [
+                {"issuer_id": "host-issuer", "key_id": "host-key", "algorithm": "ed25519", "public_key_path": candidate["DELIVERY_SYSTEM_ATTESTATION_PUBLIC_KEY_PATH"]},
+                {"issuer_id": "host-issuer", "key_id": "host-key-old", "algorithm": "ed25519", "public_key_path": str(credential_extra_path)},
+            ],
+        }), encoding="utf-8")
+        Path(candidate["DELIVERY_SYSTEM_AUTHORITY_BINDING_TRUSTED_KEYS_PATH"]).write_text(json.dumps({
+            "version": 1,
+            "keys": [
+                {"issuer_id": "authority-issuer", "key_id": "authority-key", "algorithm": "ed25519", "public_key_path": candidate["DELIVERY_SYSTEM_AUTHORITY_BINDING_PUBLIC_KEY_PATH"]},
+                {"issuer_id": "authority-issuer", "key_id": "authority-key-old", "algorithm": "ed25519", "public_key_path": str(authority_extra_path)},
+            ],
+        }), encoding="utf-8")
+        with patch.object(type(self.context), "ensure_store_ready", lambda self, **kwargs: workspace.joinpath(".delivery-system").mkdir(parents=True, exist_ok=True)):
+            composition = self._compose(FakeBootstrapTransport(), lambda: str(uuid.uuid4()), candidate)
+        try:
+            self.assertIsNotNone(composition.registry.resolve("host-issuer", "host-key-old", "ed25519"))
+            self.assertIsNotNone(composition.authority_registry.resolve("authority-issuer", "authority-key-old", "ed25519"))
+        finally:
+            composition.close()
+
+    def test_trust_bundle_failures_and_untrusted_active_key_fail_closed(self) -> None:
+        bundle_path = Path(self.environment["DELIVERY_SYSTEM_ATTESTATION_TRUSTED_KEYS_PATH"])
+        cases = (
+            {"version": 1, "keys": []},
+            {"version": 1, "keys": [{"issuer_id": "host-issuer", "key_id": "host-key", "algorithm": "rsa", "public_key_path": self.environment["DELIVERY_SYSTEM_ATTESTATION_PUBLIC_KEY_PATH"]}]},
+            {"version": 1, "keys": [{"issuer_id": "host-issuer", "key_id": "host-key", "algorithm": "ed25519", "public_key_path": self.environment["DELIVERY_SYSTEM_ATTESTATION_PUBLIC_KEY_PATH"]}, {"issuer_id": "host-issuer", "key_id": "host-key", "algorithm": "ed25519", "public_key_path": self.environment["DELIVERY_SYSTEM_ATTESTATION_PUBLIC_KEY_PATH"]}]},
+            {"version": 1, "keys": [{"issuer_id": "other-issuer", "key_id": "other-key", "algorithm": "ed25519", "public_key_path": self.environment["DELIVERY_SYSTEM_ATTESTATION_PUBLIC_KEY_PATH"]}]},
+        )
+        for payload in cases:
+            with self.subTest(payload=payload):
+                bundle_path.write_text(json.dumps(payload), encoding="utf-8")
+                with self.assertRaises(HostCompositionError):
+                    self._compose(FakeBootstrapTransport(), lambda: str(uuid.uuid4()))
+
+    def test_physical_active_key_collision_between_roles_fails_closed(self) -> None:
+        authority_private = Path(self.environment["DELIVERY_SYSTEM_AUTHORITY_BINDING_PRIVATE_KEY_PATH"])
+        authority_public = Path(self.environment["DELIVERY_SYSTEM_AUTHORITY_BINDING_PUBLIC_KEY_PATH"])
+        authority_private.write_bytes(Path(self.environment["DELIVERY_SYSTEM_ATTESTATION_PRIVATE_KEY_PATH"]).read_bytes())
+        authority_public.write_bytes(Path(self.environment["DELIVERY_SYSTEM_ATTESTATION_PUBLIC_KEY_PATH"]).read_bytes())
+        with self.assertRaises(HostCompositionError):
+            self._compose(FakeBootstrapTransport(), lambda: str(uuid.uuid4()))
+
+    def test_external_revocation_mapping_is_closed(self) -> None:
+        common = dict(
+            endpoint="https://revocation.example.invalid/v1/status",
+            timeout_ms=2500,
+            repository_identity="owner/repo",
+        )
+        valid = ExternalRevocationReader(**common, transport=FakeRevocationTransport({"status": "valid"}))
+        self.assertEqual(valid.read_status("attestation-1", "credential-1", "issuer", "key", "1").version, "1")
+        revoked = ExternalRevocationReader(**common, transport=FakeRevocationTransport({
+            "status": "revoked", "revoked_at": "2026-09-07T12:00:00Z", "reason": "security-event",
+        }))
+        self.assertTrue(revoked.read_status("attestation-1", "credential-1", "issuer", "key", "1").credential_instance_revoked)
+        for response, code in (({"status": "unknown"}, "revocation_unknown"), ({"status": "unexpected"}, "revocation_unavailable"), ({"status": "revoked"}, "revocation_unavailable")):
+            with self.subTest(response=response), self.assertRaisesRegex(ExternalRevocationError, "^" + code + "$"):
+                ExternalRevocationReader(**common, transport=FakeRevocationTransport(response)).read_status("attestation-1", "credential-1", "issuer", "key", "1")
+        with self.assertRaisesRegex(ExternalRevocationError, "^revocation_unavailable$"):
+            ExternalRevocationReader(**common, transport=FakeRevocationTransport(RuntimeError("provider"))).read_status("attestation-1", "credential-1", "issuer", "key", "1")
 
 
 class ServerProfileTests(unittest.TestCase):

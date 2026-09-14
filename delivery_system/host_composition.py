@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import json
 import os
 from pathlib import Path
 import re
@@ -18,7 +19,7 @@ import uuid
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
-from .attestation import AttestationRuntimeBoundary, RevocationStatus
+from .attestation import AttestationRuntimeBoundary
 from .attestation_github_app import (
     GitHubAppCredentialCapabilityProvider,
     GitHubAppInstallationCapabilityEvidence,
@@ -33,6 +34,8 @@ from .attestation_signing import (
     TrustedEd25519IssuerKeyRegistry,
     TrustedEd25519Key,
 )
+from .authority_binding import Ed25519AuthorityBindingProofVerifier, Ed25519AuthorityBindingSigner
+from .authority_binding_persistence import SQLiteAuthorityBindingPersistenceStore
 from .drivers.contract import DriverTrustContext
 from .drivers.rest import GitHubAppInstallationReadOnlyDriver
 from .github_app_bootstrap import (
@@ -43,8 +46,12 @@ from .github_app_bootstrap import (
     GitHubAppPrivateKeySource,
 )
 from .github_app_credential import GitHubAppInstallationCredentialLease
+from .attestation_persistence_store import SQLiteAttestationPersistenceStore
+from .restart_credential_verification import DefaultRestartCredentialAttestationVerifier
 from .runtime import RuntimeApprovalAuthorityService, RuntimeContext, SQLitePreviewStore
 from .execution_store import SQLiteExecutionStore
+from .verified_attestation_artifact import VerifiedAttestationArtifactAdapter
+from .host_revocation import ExternalRevocationReader, RevocationTransport
 
 
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,127}$\Z")
@@ -96,6 +103,23 @@ def _required_path(values: Mapping[str, str], name: str) -> str:
     return value
 
 
+def _optional_path(values: Mapping[str, str], name: str) -> str | None:
+    value = values.get(name)
+    if value is None or not value.strip():
+        return None
+    return _required_path(values, name)
+
+
+def _required_timeout_ms(values: Mapping[str, str], name: str) -> int:
+    value = _required_text(values, name)
+    if not value.isdecimal():
+        raise _configuration_error()
+    parsed = int(value)
+    if not 1 <= parsed <= 120_000:
+        raise _configuration_error()
+    return parsed
+
+
 @dataclass(frozen=True)
 class HostConfiguration:
     """Non-secret Host inputs for the explicit GitHub App write profile."""
@@ -105,6 +129,15 @@ class HostConfiguration:
     attestation_key_id: str
     attestation_private_key_path: str
     attestation_public_key_path: str
+    attestation_trusted_keys_path: str
+    authority_binding_issuer_id: str
+    authority_binding_active_key_id: str
+    authority_binding_private_key_path: str
+    authority_binding_public_key_path: str
+    authority_binding_trusted_keys_path: str
+    revocation_provider_url: str
+    revocation_timeout_ms: int
+    revocation_auth_token_path: str | None
 
     @classmethod
     def from_environment(cls, environment: Mapping[str, str] | None = None) -> "HostConfiguration":
@@ -121,12 +154,31 @@ class HostConfiguration:
         key_id = _required_text(values, "DELIVERY_SYSTEM_ATTESTATION_KEY_ID")
         if _ID_RE.fullmatch(issuer_id) is None or _ID_RE.fullmatch(key_id) is None:
             raise _configuration_error()
+        authority_issuer_id = _required_text(values, "DELIVERY_SYSTEM_AUTHORITY_BINDING_ISSUER_ID")
+        authority_key_id = _required_text(values, "DELIVERY_SYSTEM_AUTHORITY_BINDING_ACTIVE_KEY_ID")
+        if (_ID_RE.fullmatch(authority_issuer_id) is None or
+                _ID_RE.fullmatch(authority_key_id) is None):
+            raise _configuration_error()
+        provider_url = _required_text(values, "DELIVERY_SYSTEM_REVOCATION_PROVIDER_URL")
+        from urllib.parse import urlparse
+        parsed_url = urlparse(provider_url)
+        if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
+            raise _configuration_error()
         return cls(
             github_app=github_app,
             attestation_issuer_id=issuer_id,
             attestation_key_id=key_id,
             attestation_private_key_path=_required_path(values, "DELIVERY_SYSTEM_ATTESTATION_PRIVATE_KEY_PATH"),
             attestation_public_key_path=_required_path(values, "DELIVERY_SYSTEM_ATTESTATION_PUBLIC_KEY_PATH"),
+            attestation_trusted_keys_path=_required_path(values, "DELIVERY_SYSTEM_ATTESTATION_TRUSTED_KEYS_PATH"),
+            authority_binding_issuer_id=authority_issuer_id,
+            authority_binding_active_key_id=authority_key_id,
+            authority_binding_private_key_path=_required_path(values, "DELIVERY_SYSTEM_AUTHORITY_BINDING_PRIVATE_KEY_PATH"),
+            authority_binding_public_key_path=_required_path(values, "DELIVERY_SYSTEM_AUTHORITY_BINDING_PUBLIC_KEY_PATH"),
+            authority_binding_trusted_keys_path=_required_path(values, "DELIVERY_SYSTEM_AUTHORITY_BINDING_TRUSTED_KEYS_PATH"),
+            revocation_provider_url=provider_url,
+            revocation_timeout_ms=_required_timeout_ms(values, "DELIVERY_SYSTEM_REVOCATION_TIMEOUT_MS"),
+            revocation_auth_token_path=_optional_path(values, "DELIVERY_SYSTEM_REVOCATION_AUTH_TOKEN_PATH"),
         )
 
     def __repr__(self) -> str:
@@ -239,14 +291,126 @@ def _validate_external_key_paths(context: RuntimeContext, config: HostConfigurat
         config.github_app.private_key_path,
         config.attestation_private_key_path,
         config.attestation_public_key_path,
+        config.attestation_trusted_keys_path,
+        config.authority_binding_private_key_path,
+        config.authority_binding_public_key_path,
+        config.authority_binding_trusted_keys_path,
     )
+    if config.revocation_auth_token_path is not None:
+        paths = paths + (config.revocation_auth_token_path,)
     identities = [_path_identities(path) for path in paths]
     for lexical, resolved in identities:
         if _inside(root, lexical) or _inside(root, resolved):
             raise HostCompositionError("host_key_path_workspace_controlled")
-    if (len({lexical for lexical, _ in identities}) != 3 or
-            len({resolved for _, resolved in identities}) != 3):
+    if (len({lexical for lexical, _ in identities}) != len(identities) or
+            len({resolved for _, resolved in identities}) != len(identities)):
         raise HostCompositionError("host_key_role_path_conflict")
+
+
+def _read_external_json(path: str, opened_object_validator: Callable[[int], None]) -> Any:
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
+        try:
+            opened_object_validator(fd)
+            stat = os.fstat(fd)
+            if not os.path.isfile(path) or stat.st_size <= 0 or stat.st_size > 1024 * 1024:
+                raise ValueError
+            data = os.read(fd, stat.st_size + 1)
+        finally:
+            os.close(fd)
+        if len(data) != stat.st_size or len(data) > 1024 * 1024:
+            raise ValueError
+        return json.loads(data.decode("utf-8"), object_pairs_hook=_reject_duplicate_json_keys)
+    except Exception as exc:
+        if isinstance(exc, HostCompositionError):
+            raise
+        raise HostCompositionError("host_trust_bundle_invalid") from None
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate_json_key")
+        result[key] = value
+    return result
+
+
+def _load_trust_bundle(
+    context: RuntimeContext,
+    path: str,
+    opened_object_validator: Callable[[int], None],
+    role: str,
+) -> tuple[TrustedEd25519Key, ...]:
+    try:
+        raw = _read_external_json(path, opened_object_validator)
+        if set(raw) != {"version", "keys"} or raw["version"] != 1:
+            raise ValueError
+        entries = raw["keys"]
+        if type(entries) is not list or not entries:
+            raise ValueError
+        loaded: list[TrustedEd25519Key] = []
+        for entry in entries:
+            if type(entry) is not dict or set(entry) != {"issuer_id", "key_id", "algorithm", "public_key_path"}:
+                raise ValueError
+            issuer_id = entry["issuer_id"]
+            key_id = entry["key_id"]
+            if (type(issuer_id) is not str or _ID_RE.fullmatch(issuer_id) is None or
+                    type(key_id) is not str or _ID_RE.fullmatch(key_id) is None or
+                    entry["algorithm"] != "ed25519"):
+                raise ValueError
+            public_path = entry["public_key_path"]
+            if type(public_path) is not str or not os.path.isabs(public_path):
+                raise ValueError
+            lexical, resolved = _path_identities(public_path)
+            root = os.path.normcase(os.path.abspath(context.normalized_workspace_root))
+            if _inside(root, lexical) or _inside(root, resolved):
+                raise HostCompositionError("host_key_path_workspace_controlled")
+            public_key = FileEd25519PublicKeySource(
+                public_path, opened_file_validator=opened_object_validator,
+            ).load_ed25519_public_key()
+            loaded.append(TrustedEd25519Key(issuer_id, key_id, public_key))
+        registry = TrustedEd25519IssuerKeyRegistry(tuple(loaded))
+        if role == "attestation":
+            return tuple(loaded)
+        return tuple(loaded)
+    except HostCompositionError:
+        raise
+    except Exception:
+        raise HostCompositionError(f"{role}_trust_bundle_invalid") from None
+
+
+def _public_key_bytes(key: Ed25519PublicKey) -> bytes:
+    return key.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+
+
+def _require_active_trusted_key(
+    entries: tuple[TrustedEd25519Key, ...], issuer_id: str, key_id: str,
+    public_key: Ed25519PublicKey, role: str,
+) -> None:
+    matches = [entry for entry in entries if entry.issuer_id == issuer_id and entry.key_id == key_id]
+    if len(matches) != 1 or _public_key_bytes(matches[0].public_key) != _public_key_bytes(public_key):
+        raise HostCompositionError(f"{role}_active_key_not_trusted")
+
+
+def _read_secret_token(path: str | None, opened_object_validator: Callable[[int], None]) -> str | None:
+    if path is None:
+        return None
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
+        try:
+            opened_object_validator(fd)
+            data = os.read(fd, 4097)
+        finally:
+            os.close(fd)
+        token = data.decode("utf-8").strip()
+        if not token or len(data) > 4096:
+            raise ValueError
+        return token
+    except Exception:
+        raise HostCompositionError("host_revocation_auth_invalid") from None
 
 
 class _LeaseReadAuthView:
@@ -323,14 +487,6 @@ class _HostCapabilityPolicy:
         return type(capability) is str and capability == "issues:write"
 
 
-class _HostRevocationReader:
-    __slots__ = ()
-
-    def read_status(self, attestation_id: str, credential_instance_id: str, issuer_id: str,
-                    key_id: str, version: str) -> RevocationStatus:
-        return RevocationStatus()
-
-
 class _HostCapabilityResolver:
     __slots__ = ()
 
@@ -351,13 +507,24 @@ class HostComposition:
 
     __slots__ = (
         "context", "configuration", "lease", "driver", "trust_context", "signer", "registry", "verifier",
-        "provider", "attestation_service", "approval_authority_service", "execution_store", "store",
+        "authority_signer", "authority_registry", "authority_verifier", "revocation_reader",
+        "restart_credential_verifier", "attestation_persistence_store", "authority_binding_store",
+        "artifact_link_adapter", "provider", "attestation_service", "approval_authority_service",
+        "execution_store", "store",
     )
 
     def __init__(self, *, context: RuntimeContext, configuration: HostConfiguration,
                  lease: GitHubAppInstallationCredentialLease, driver: Any,
                  trust_context: DriverTrustContext, signer: Ed25519HostSigner,
                  registry: TrustedEd25519IssuerKeyRegistry, verifier: Ed25519ProofVerifier,
+                 authority_signer: Ed25519AuthorityBindingSigner,
+                 authority_registry: TrustedEd25519IssuerKeyRegistry,
+                 authority_verifier: Ed25519AuthorityBindingProofVerifier,
+                 revocation_reader: ExternalRevocationReader,
+                 restart_credential_verifier: DefaultRestartCredentialAttestationVerifier,
+                 attestation_persistence_store: SQLiteAttestationPersistenceStore,
+                 authority_binding_store: SQLiteAuthorityBindingPersistenceStore,
+                 artifact_link_adapter: VerifiedAttestationArtifactAdapter,
                  provider: GitHubAppCredentialCapabilityProvider,
                  attestation_service: RuntimeAttestationOrchestrationService,
                  approval_authority_service: RuntimeApprovalAuthorityService,
@@ -380,6 +547,18 @@ class HostComposition:
 
     def __reduce_ex__(self, protocol: int) -> Any:
         raise HostCompositionError("host_composition_serialization_forbidden")
+
+    def close(self) -> None:
+        store = getattr(self, "attestation_persistence_store", None)
+        close = getattr(store, "close", None)
+        if callable(close):
+            close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def create_server(self) -> Any:
         from mcp_server.server import create_server
@@ -404,6 +583,7 @@ def _compose_write_enabled_host(
     clock: Callable[[], datetime],
     credential_instance_id_factory: Callable[[], str] | None,
     nonce_factory: Callable[[], str],
+    revocation_transport: RevocationTransport | None,
 ) -> HostComposition:
     configuration = load_host_configuration(environment)
     _validate_external_key_paths(context, configuration)
@@ -437,10 +617,64 @@ def _compose_write_enabled_host(
         raise HostCompositionError("attestation_key_pair_mismatch")
 
     signer = Ed25519HostSigner(configuration.attestation_issuer_id, configuration.attestation_key_id, private_key)
-    trusted_key = TrustedEd25519Key(configuration.attestation_issuer_id, configuration.attestation_key_id, public_key)
-    registry = TrustedEd25519IssuerKeyRegistry((trusted_key,))
+    attestation_entries = _load_trust_bundle(
+        context, configuration.attestation_trusted_keys_path,
+        opened_object_validator, "attestation",
+    )
+    _require_active_trusted_key(
+        attestation_entries, configuration.attestation_issuer_id,
+        configuration.attestation_key_id, public_key, "attestation",
+    )
+    registry = TrustedEd25519IssuerKeyRegistry(attestation_entries)
     verifier = Ed25519ProofVerifier(registry)
-    boundary = AttestationRuntimeBoundary(registry, verifier, _HostRevocationReader(), _HostCapabilityPolicy())
+
+    authority_private_source = FileEd25519PrivateKeySource(
+        configuration.authority_binding_private_key_path,
+        opened_file_validator=opened_object_validator,
+    )
+    authority_public_source = FileEd25519PublicKeySource(
+        configuration.authority_binding_public_key_path,
+        opened_file_validator=opened_object_validator,
+    )
+    authority_private_key = authority_private_source.load_ed25519_private_key()
+    authority_public_key = authority_public_source.load_ed25519_public_key()
+    authority_derived_public = _public_key_bytes(authority_private_key.public_key())
+    if authority_derived_public != _public_key_bytes(authority_public_key):
+        raise HostCompositionError("authority_binding_key_pair_mismatch")
+    if authority_derived_public == _public_key_bytes(public_key):
+        raise HostCompositionError("host_key_role_conflict")
+    authority_signing_delegate = Ed25519HostSigner(
+        configuration.authority_binding_issuer_id,
+        configuration.authority_binding_active_key_id,
+        authority_private_key,
+    )
+    authority_signer = Ed25519AuthorityBindingSigner(authority_signing_delegate)
+    authority_entries = _load_trust_bundle(
+        context, configuration.authority_binding_trusted_keys_path,
+        opened_object_validator, "authority_binding",
+    )
+    _require_active_trusted_key(
+        authority_entries, configuration.authority_binding_issuer_id,
+        configuration.authority_binding_active_key_id, authority_public_key,
+        "authority_binding",
+    )
+    authority_registry = TrustedEd25519IssuerKeyRegistry(authority_entries)
+    authority_verifier = Ed25519AuthorityBindingProofVerifier(
+        Ed25519ProofVerifier(authority_registry),
+    )
+
+    revocation_token = _read_secret_token(
+        configuration.revocation_auth_token_path, opened_object_validator,
+    )
+    revocation_reader = ExternalRevocationReader(
+        endpoint=configuration.revocation_provider_url,
+        timeout_ms=configuration.revocation_timeout_ms,
+        repository_identity=configuration.github_app.repository_identity,
+        transport=revocation_transport,
+        auth_token=revocation_token,
+    )
+    capability_policy = _HostCapabilityPolicy()
+    boundary = AttestationRuntimeBoundary(registry, verifier, revocation_reader, capability_policy)
     evidence_source = _LeaseEvidenceSource(lease)
     provider = GitHubAppCredentialCapabilityProvider(
         evidence_source,
@@ -469,12 +703,33 @@ def _compose_write_enabled_host(
         _HostCapabilityResolver(),
         clock=clock,
     )
+    attestation_persistence_store = SQLiteAttestationPersistenceStore(
+        context.state_path, workspace_identity=context.workspace_identity,
+    )
+    authority_binding_store = SQLiteAuthorityBindingPersistenceStore(
+        context.state_path, workspace_identity=context.workspace_identity,
+    )
+    artifact_link_adapter = VerifiedAttestationArtifactAdapter(
+        attestation_persistence_store, clock=clock,
+    )
+    restart_credential_verifier = DefaultRestartCredentialAttestationVerifier(
+        issuer_policy=registry,
+        proof_verifier=verifier,
+        revocation_reader=revocation_reader,
+        capability_policy=capability_policy,
+    )
     approval_authority_service = RuntimeApprovalAuthorityService(
         context,
         store,
         attestation_service,
         clock=clock,
         host_credential_lease=lease,
+        artifact_link_adapter=artifact_link_adapter,
+        authority_binding_signer=authority_signer,
+        authority_binding_store=authority_binding_store,
+        authority_binding_verifier=authority_verifier,
+        attestation_persistence_store=attestation_persistence_store,
+        restart_credential_verifier=restart_credential_verifier,
     )
     execution_store = SQLiteExecutionStore(context.state_path, context.workspace_identity,
                                             runtime_service=approval_authority_service)
@@ -487,6 +742,14 @@ def _compose_write_enabled_host(
         signer=signer,
         registry=registry,
         verifier=verifier,
+        authority_signer=authority_signer,
+        authority_registry=authority_registry,
+        authority_verifier=authority_verifier,
+        revocation_reader=revocation_reader,
+        restart_credential_verifier=restart_credential_verifier,
+        attestation_persistence_store=attestation_persistence_store,
+        authority_binding_store=authority_binding_store,
+        artifact_link_adapter=artifact_link_adapter,
         provider=provider,
         attestation_service=attestation_service,
         approval_authority_service=approval_authority_service,
@@ -506,6 +769,7 @@ def compose_write_enabled_host(
     clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     credential_instance_id_factory: Callable[[], str] | None = None,
     nonce_factory: Callable[[], str] = lambda: str(uuid.uuid4()),
+    revocation_transport: RevocationTransport | None = None,
 ) -> HostComposition:
     """Acquire and compose one explicit, write-capable Host instance."""
 
@@ -519,6 +783,7 @@ def compose_write_enabled_host(
         clock=clock,
         credential_instance_id_factory=credential_instance_id_factory,
         nonce_factory=nonce_factory,
+        revocation_transport=revocation_transport,
     ))
     if type(result) is not HostComposition:
         raise HostCompositionError() from None

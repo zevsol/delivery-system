@@ -22,6 +22,7 @@ from delivery_system.attestation import (
     SignedCredentialCapabilityAttestation,
     TrustedIssuerPolicy,
     IssuerTrustDecision,
+    VerifiedCredentialAttestationEvent,
     VerifiedCredentialCapabilityAttestation,
     verify_credential_capability_attestation,
 )
@@ -255,6 +256,29 @@ class AttestationContractTests(unittest.TestCase):
             VerifiedCredentialCapabilityAttestation(valid_claims, verified.claims_digest)
         with self.assertRaisesRegex(ValueError, "^attestation_copy_forbidden$"):
             copy(verified)
+
+    def test_verified_event_owns_exact_verified_envelope_and_timestamp(self):
+        fake = FakeIssuer()
+        boundary = AttestationRuntimeBoundary(fake, fake, fake, FakeCapabilityPolicy())
+        envelope = signed(fake)
+        request_value = request(boundary)
+        result = boundary.verify(envelope, request_value, NOW)
+        self.assertTrue(result.success)
+        assert result.verified is not None
+        event = boundary.consume_verified_event(result.verified)
+        self.assertIsInstance(event, VerifiedCredentialAttestationEvent)
+        self.assertEqual(event.envelope, envelope)
+        self.assertEqual(event.envelope.proof, envelope.proof)
+        self.assertEqual(event.claims, envelope.claims)
+        self.assertEqual(event.verified_at, "2026-08-14T12:00:00.000000Z")
+        self.assertTrue(boundary.accepts_verified_event(event))
+
+        forged = object.__new__(VerifiedCredentialAttestationEvent)
+        object.__setattr__(forged, "_VerifiedCredentialAttestationEvent__envelope", envelope)
+        object.__setattr__(forged, "_VerifiedCredentialAttestationEvent__claims", envelope.claims)
+        object.__setattr__(forged, "_VerifiedCredentialAttestationEvent__verified_at", event.verified_at)
+        object.__setattr__(forged, "_VerifiedCredentialAttestationEvent__event_id", event.event_id)
+        self.assertFalse(boundary.accepts_verified_event(forged))
 
     def test_verified_ticket_is_single_use_and_concurrent(self):
         fake = FakeIssuer()

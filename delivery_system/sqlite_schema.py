@@ -21,6 +21,7 @@ _V4_TABLES = _V3_TABLES + (
 _V6_TABLES = _V4_TABLES + (
     "application_execution", "operation_attempts", "operation_receipts", "application_receipts",
 )
+_V7_TABLES = _V6_TABLES + ("authority_bindings", "authority_binding_operations")
 _V6_LAYOUT = {
     "application_execution": (("workspace_identity", "TEXT", 1, None, 1), ("application_id", "TEXT", 1, None, 2), ("payload", "TEXT", 1, None, 0)),
     "operation_attempts": (("workspace_identity", "TEXT", 1, None, 1), ("application_id", "TEXT", 1, None, 2), ("operation_identity", "TEXT", 1, None, 3), ("payload", "TEXT", 1, None, 0)),
@@ -343,7 +344,7 @@ def _expected_index_xinfo(columns: tuple[str, ...]) -> tuple[tuple[Any, ...], ..
 
 
 def _expected_internal_indexes(table: str) -> tuple[tuple[Any, ...], ...]:
-    columns = _V3_COLUMNS.get(table, _V4_LAYOUT.get(table, ()))
+    columns = _V3_COLUMNS.get(table, _V4_LAYOUT.get(table, _V7_LAYOUT.get(table, ())))
     primary_rows = [
         row for row in columns
         if (row[4] if len(row) == 5 else row[3])
@@ -391,6 +392,7 @@ def _check_index_semantics(
             "idx_attestation_artifacts_workspace_digest": ("workspace_identity", "artifact_digest"),
             "idx_attestation_references_workspace_binding": ("workspace_identity", "binding_id"),
             "idx_attestation_events_workspace_artifact_sequence": ("workspace_identity", "artifact_id", "event_sequence"),
+            "idx_authority_binding_operations_parent": ("workspace_identity", "authority_issuance_id", "operation_identity"),
         }[name]
         if xinfo != _expected_index_xinfo(expected_columns):
             return False
@@ -479,6 +481,30 @@ CREATE INDEX idx_operation_receipts_workspace_application ON operation_receipts(
 CREATE INDEX idx_application_receipts_workspace_application ON application_receipts(workspace_identity, application_id);
 """
 
+_V7_DDL = r"""
+CREATE TABLE authority_bindings (
+    workspace_identity TEXT NOT NULL CHECK (length(workspace_identity) > 0),
+    authority_issuance_id TEXT NOT NULL CHECK (length(authority_issuance_id) > 0),
+    canonical_payload BLOB NOT NULL CHECK (length(canonical_payload) > 0),
+    issuer_id TEXT NOT NULL CHECK (length(issuer_id) > 0),
+    key_id TEXT NOT NULL CHECK (length(key_id) > 0),
+    signature_algorithm TEXT NOT NULL CHECK (signature_algorithm = 'ed25519'),
+    detached_proof TEXT NOT NULL CHECK (length(detached_proof) > 0),
+    PRIMARY KEY (workspace_identity, authority_issuance_id)
+);
+CREATE TABLE authority_binding_operations (
+    workspace_identity TEXT NOT NULL CHECK (length(workspace_identity) > 0),
+    operation_identity TEXT NOT NULL CHECK (length(operation_identity) > 0),
+    authority_issuance_id TEXT NOT NULL CHECK (length(authority_issuance_id) > 0),
+    PRIMARY KEY (workspace_identity, operation_identity),
+    FOREIGN KEY (workspace_identity, authority_issuance_id)
+        REFERENCES authority_bindings(workspace_identity, authority_issuance_id)
+        ON DELETE RESTRICT ON UPDATE RESTRICT
+);
+CREATE INDEX idx_authority_binding_operations_parent
+    ON authority_binding_operations(workspace_identity, authority_issuance_id, operation_identity);
+"""
+
 _V4_LAYOUT = {
     "attestation_artifacts": [(name, "INTEGER" if name == "claims_revision" else "TEXT", 1, pk) for name, pk in (
         ("workspace_identity", 1), ("artifact_id", 2), ("artifact_contract_version", 0), ("attestation_id", 0), ("claims_payload_json", 0), ("detached_proof", 0), ("claims_digest", 0), ("artifact_digest", 0), ("original_verified_at", 0), ("created_at", 0), ("claims_attestation_version", 0), ("claims_issuer_id", 0), ("claims_key_id", 0), ("claims_signature_algorithm", 0), ("claims_credential_class", 0), ("claims_credential_instance_id", 0), ("claims_github_subject_identity", 0), ("claims_repository_identity", 0), ("claims_granted_capabilities_json", 0), ("claims_driver_identity", 0), ("claims_remote_authority", 0), ("claims_preview_id", 0), ("claims_revision", 0), ("claims_operation_set_digest", 0), ("claims_remote_snapshot_digest", 0), ("claims_evidence_digest", 0), ("claims_issued_at", 0), ("claims_expires_at", 0), ("claims_nonce", 0), ("claims_source_verification_digest", 0), ("claims_challenge_digest", 0), ("claims_credential_principal_identity", 0), ("canonical_json", 0))],
@@ -488,8 +514,30 @@ _V4_LAYOUT = {
         ("workspace_identity", 1), ("event_id", 2), ("event_identity_version", 0), ("event_payload_version", 0), ("artifact_id", 0), ("artifact_digest", 0), ("revalidation_attempt_id", 0), ("revalidation_context_digest", 0), ("binding_reference_digest", 0), ("outcome", 0), ("revalidated_at", 0), ("failure_code", 0), ("result_digest", 0), ("event_payload_digest", 0), ("event_sequence", 0), ("canonical_json", 0))],
 }
 
+_V7_LAYOUT = {
+    "authority_bindings": (
+        ("workspace_identity", "TEXT", 1, None, 1),
+        ("authority_issuance_id", "TEXT", 1, None, 2),
+        ("canonical_payload", "BLOB", 1, None, 0),
+        ("issuer_id", "TEXT", 1, None, 0),
+        ("key_id", "TEXT", 1, None, 0),
+        ("signature_algorithm", "TEXT", 1, None, 0),
+        ("detached_proof", "TEXT", 1, None, 0),
+    ),
+    "authority_binding_operations": (
+        ("workspace_identity", "TEXT", 1, None, 1),
+        ("operation_identity", "TEXT", 1, None, 2),
+        ("authority_issuance_id", "TEXT", 1, None, 0),
+    ),
+}
 
-def _v4_fingerprint(connection: sqlite3.Connection, *, allow_v6: bool = False) -> bool:
+
+def _v4_fingerprint(
+    connection: sqlite3.Connection,
+    *,
+    allow_v6: bool = False,
+    allow_v7: bool = False,
+) -> bool:
     if _safe_sql(connection, "PRAGMA user_version")[0][0] != 0 or _safe_sql(connection, "PRAGMA application_id")[0][0] != 0:
         return False
     objects = _objects(connection)
@@ -505,6 +553,10 @@ def _v4_fingerprint(connection: sqlite3.Connection, *, allow_v6: bool = False) -
         expected_objects |= {("table", name) for name in _V6_TABLES[len(_V4_TABLES):]} | {("index", name) for name in (
             "idx_application_execution_workspace_state", "idx_operation_attempts_workspace_request",
             "idx_operation_receipts_workspace_application", "idx_application_receipts_workspace_application")}
+    if allow_v7:
+        expected_objects |= {("table", name) for name in _V7_TABLES[len(_V6_TABLES):]} | {
+            ("index", "idx_authority_binding_operations_parent")
+        }
     if {(kind, name) for kind, name, _table_name, _sql in objects} != expected_objects:
         return False
     for table in _V4_TABLES:
@@ -698,12 +750,17 @@ def ensure_schema_v4(connection: sqlite3.Connection, *, expected_workspace_ident
         if not any(name == "store_meta" for _, name, _, _ in objects):
             raise SchemaOwnerError("attestation_persistence_schema_shape_mismatch")
         current_version, current_workspace = _metadata(connection)
+        if current_version == 7:
+            if current_workspace != expected or not _v7_fingerprint(connection):
+                raise SchemaOwnerError("attestation_persistence_schema_shape_mismatch")
+            connection.commit()
+            return
         if current_version == 6:
             if current_workspace != expected or not _v6_fingerprint(connection):
                 raise SchemaOwnerError("attestation_persistence_schema_shape_mismatch")
             connection.commit()
             return
-        if current_version > 6:
+        if current_version > 7:
             raise SchemaOwnerError("attestation_persistence_schema_version_unsupported")
         if _v3_fingerprint(connection):
             version, _ = _metadata(connection)
@@ -764,10 +821,10 @@ def ensure_schema_v4(connection: sqlite3.Connection, *, expected_workspace_ident
         raise SchemaOwnerError("attestation_persistence_sqlite_operational") from exc
 
 
-def _v6_fingerprint(connection: sqlite3.Connection) -> bool:
+def _v6_fingerprint(connection: sqlite3.Connection, *, allow_v7: bool = False) -> bool:
     """Validate the additive execution tables and indexes of schema V6."""
     try:
-        if not _v4_fingerprint(connection, allow_v6=True):
+        if not _v4_fingerprint(connection, allow_v6=True, allow_v7=allow_v7):
             return False
         objects = _objects(connection)
         for table, expected_columns in _V6_LAYOUT.items():
@@ -792,6 +849,42 @@ def _v6_fingerprint(connection: sqlite3.Connection) -> bool:
         return False
 
 
+def _v7_fingerprint(connection: sqlite3.Connection) -> bool:
+    """Validate the additive authority-binding tables and indexes of V7."""
+    try:
+        if not _v6_fingerprint(connection, allow_v7=True):
+            return False
+        objects = _objects(connection)
+        explicit_names = {
+            "authority_bindings": (),
+            "authority_binding_operations": ("idx_authority_binding_operations_parent",),
+        }
+        for table, expected_columns in _V7_LAYOUT.items():
+            columns = _table_xinfo(connection, table)
+            if len(columns) != len(expected_columns):
+                return False
+            for row, wanted in zip(columns, expected_columns):
+                if (row[1], row[2].upper(), row[3], row[4], row[5]) != wanted or row[6] != 0:
+                    return False
+            if _check_expressions(_table_sql(objects, table)) != _check_expressions(
+                _script_table_definition(_V7_DDL, table)
+            ):
+                return False
+            if not _check_index_semantics(connection, table, explicit_names[table]):
+                return False
+        expected_operations_fk = (
+            ("authority_bindings", "RESTRICT", "RESTRICT", "NONE", (
+                ("workspace_identity", "workspace_identity"),
+                ("authority_issuance_id", "authority_issuance_id"),
+            )),
+        )
+        return _foreign_key_signature(connection, "authority_bindings") == () and _foreign_key_signature(
+            connection, "authority_binding_operations"
+        ) == expected_operations_fk
+    except (SchemaOwnerError, sqlite3.Error):
+        return False
+
+
 def ensure_schema_v6(connection: sqlite3.Connection, *, expected_workspace_identity: str) -> None:
     """Atomically add and validate execution persistence on a V5 store."""
     ensure_schema_v4(connection, expected_workspace_identity=expected_workspace_identity)
@@ -801,6 +894,11 @@ def ensure_schema_v6(connection: sqlite3.Connection, *, expected_workspace_ident
         version, workspace = _metadata(connection)
         if workspace != expected:
             raise SchemaOwnerError("attestation_persistence_workspace_mismatch")
+        if version == 7:
+            if not _v7_fingerprint(connection):
+                raise SchemaOwnerError("attestation_persistence_schema_shape_mismatch")
+            connection.commit()
+            return
         if version == 6:
             if not _v6_fingerprint(connection):
                 raise SchemaOwnerError("attestation_persistence_schema_shape_mismatch")
@@ -831,3 +929,40 @@ def ensure_schema_v6(connection: sqlite3.Connection, *, expected_workspace_ident
         except sqlite3.Error:
             pass
         raise SchemaOwnerError("attestation_persistence_sqlite_operational") from exc
+
+
+def ensure_schema_v7(connection: sqlite3.Connection, *, expected_workspace_identity: str) -> None:
+    """Atomically add and validate authority-binding persistence on a V6 store."""
+    ensure_schema_v6(connection, expected_workspace_identity=expected_workspace_identity)
+    expected = _workspace(expected_workspace_identity)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        version, workspace = _metadata(connection)
+        if workspace != expected:
+            raise SchemaOwnerError("attestation_persistence_workspace_mismatch")
+        if version == 7:
+            if not _v7_fingerprint(connection):
+                raise SchemaOwnerError("attestation_persistence_schema_shape_mismatch")
+            connection.commit()
+            return
+        if version != 6 or not _v6_fingerprint(connection):
+            raise SchemaOwnerError("attestation_persistence_schema_version_unsupported")
+        _execute_script(connection, _V7_DDL)
+        connection.execute("UPDATE store_meta SET schema_version = 7")
+        if not _v7_fingerprint(connection):
+            raise SchemaOwnerError("attestation_persistence_migration_failed")
+        connection.commit()
+    except SchemaOwnerError:
+        try:
+            connection.rollback()
+        except sqlite3.Error:
+            pass
+        raise
+    except sqlite3.Error as exc:
+        try:
+            connection.rollback()
+        except sqlite3.Error:
+            pass
+        if _is_busy(exc):
+            raise SchemaOwnerError("attestation_persistence_sqlite_busy") from exc
+        raise SchemaOwnerError("attestation_persistence_migration_failed") from exc

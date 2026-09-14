@@ -30,6 +30,7 @@ from tests.attestation_contract.test_attestation_contract import FakeCapabilityP
 from tests.attestation_orchestration.test_attestation_orchestration import FakeReadOnlyDriver
 from tests.fakes.attestation_provider import FakeCapabilityResolver, FakeCredentialCapabilityProvider
 from tests.local_rest_offline.test_repository_aware_runtime import plan as base_plan
+from tests.v1 import test_operational_approval_authority as approval_fixture
 
 
 TRUST = DriverTrustContext("fixture-driver", "offline://fixture", "fixture-v1")
@@ -85,7 +86,15 @@ class OperationalApprovalMcpTests(unittest.TestCase):
                 AttestationRuntimeBoundary(issuer, issuer, issuer, FakeCapabilityPolicy()),
                 FakeCredentialCapabilityProvider(), FakeCapabilityResolver(), clock=lambda: NOW,
             )
-        service = RuntimeApprovalAuthorityService(context, store, attestation, clock=lambda: NOW)
+        artifact_adapter, signer, binding_store = approval_fixture.i3b_dependencies(
+            context.workspace_identity,
+        )
+        service = RuntimeApprovalAuthorityService(
+            context, store, attestation, clock=lambda: NOW,
+            artifact_link_adapter=artifact_adapter,
+            authority_binding_signer=signer,
+            authority_binding_store=binding_store,
+        )
         return directory, context, store, preview, audit, service
 
     def _call(self, server, tool_name, payload, *, raise_exceptions=False):
@@ -105,6 +114,7 @@ class OperationalApprovalMcpTests(unittest.TestCase):
             "delivery_record_approval", "delivery_issue_application_authority",
             "delivery_apply_approved_work_items",
             "delivery_get_application_status",
+            "delivery_observe_application_postcondition",
         }
         self.assertEqual(set(by_name), expected)
         for name, expected_values in {
@@ -189,9 +199,8 @@ class OperationalApprovalMcpTests(unittest.TestCase):
 
             approval_result, first, second = self.run_async(exercise())
             self.assertFalse(first.is_error)
-            self.assertFalse(second.is_error)
-            self.assertEqual(set(first.structured_content), set(second.structured_content))
-            self.assertEqual(first.structured_content, second.structured_content)
+            self.assertTrue(second.is_error)
+            self.assertIn("authority_issuance_requires_recovery", str(second.content))
             self.assertEqual(len(service._authorities), 1)
             self.assertTrue(service.validate_application_authority(next(iter(service._authorities.values()))))
             self.assertEqual(len(first.structured_content["required_capabilities"]), 1)
@@ -279,10 +288,9 @@ class OperationalApprovalMcpTests(unittest.TestCase):
             first = self._call(server, "delivery_issue_application_authority", authority_payload)
             second = self._call(server, "delivery_issue_application_authority", authority_payload)
             self.assertFalse(first.is_error)
+            self.assertTrue(second.is_error)
+            self.assertIn("authority_issuance_requires_recovery", str(second.content))
             self.assertEqual(set(first.structured_content), AUTHORITY_FIELDS)
-            self.assertEqual(first.structured_content, second.structured_content)
-            for field in ("authority_id", "issued_at", "expires_at", "credential_binding_id"):
-                self.assertEqual(first.structured_content[field], second.structured_content[field])
             self.assertEqual(first.structured_content["required_capabilities"], ["issues:write"])
             self.assertEqual(first.structured_content["granted_capabilities"], ["issues:write"])
             self.assertIsInstance(first.structured_content["required_capabilities"], list)
@@ -338,7 +346,7 @@ class OperationalApprovalMcpTests(unittest.TestCase):
             with patch.object(service.attestation_service, "resolve_registered_binding", side_effect=without_grant):
                 missing_grant = self._call(server, "delivery_issue_application_authority", payload)
             self.assertTrue(missing_grant.is_error)
-            self.assertIn("credential_capability_insufficient", str(missing_grant.content))
+            self.assertIn("verified_attestation_context_unverified", str(missing_grant.content))
         finally:
             directory.cleanup()
 
@@ -427,7 +435,7 @@ class OperationalApprovalMcpTests(unittest.TestCase):
                     return tools, result
 
             tools, result = self.run_async(exercise())
-            self.assertEqual(len(tools.tools), 7)
+            self.assertEqual(len(tools.tools), 8)
             self.assertTrue(result.is_error)
             self.assertIn("attestation_service_unavailable", str(result.content))
 

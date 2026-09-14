@@ -23,7 +23,7 @@ from delivery_system.audit_state import AuditRecord, ApprovalRecord, AuditResult
 from delivery_system.audit_commit_authority import (
     AuditCommitAuthority, _verify_authority_identity, _verify_candidate,
 )
-from delivery_system.application_identity import operation_identity
+from delivery_system.application_identity import LogicalApplicationIdentity, operation_identity, request_identity
 from delivery_system.canonical import canonical_payload, digest, normalize
 from delivery_system.evidence import DeclaredSource, EvidenceRecord, SourcedValue
 from delivery_system.formal_preview import PreviewLevel, SealedPreview
@@ -45,6 +45,12 @@ from delivery_system.remote_snapshot import (
     TypedRemoteSnapshot,
     _is_timezone_aware_timestamp,
 )
+from delivery_system.drivers.contract import (
+    DriverTrustContext,
+    RuntimeEvidenceBinding,
+    normalize_repository_identity,
+)
+from delivery_system.drivers.preflight import bind_validated_facts, validate_driver_facts
 from delivery_system.runtime_authority import _PROMOTION_MARKER, RuntimePromotion, _reload_promotion
 from delivery_system.attestation_github_app import (
     github_app_installation_principal,
@@ -420,6 +426,86 @@ class _ItemRecord:
     item_id: str
     tombstone: bool = False
     revision: int = 1
+
+
+@dataclass(frozen=True, slots=True)
+class _RestartAuthorityValidationProvenance:
+    """In-memory proof that an authority passed the I4 activation boundary."""
+
+    authority_id: str
+    authority_issuance_id: str
+    credential_binding_id: str
+    credential_instance_id: str
+    credential_class: str
+    credential_principal_identity: str
+    github_subject_identity: str
+    repository_identity: str
+    driver_identity: str
+    remote_authority: str
+    evidence_digest: str
+    challenge_digest: str
+    source_verification_digest: str
+    workspace_identity: str
+    application_id: str
+    preview_id: str
+    revision: int
+    required_capabilities: tuple[str, ...]
+    granted_capabilities: tuple[str, ...]
+    expires_at: str
+    authority_semantics_digest: str
+
+    @classmethod
+    def from_authority(cls, authority: Any, issuance_id: str, *, claims: Any) -> "_RestartAuthorityValidationProvenance":
+        values = authority.to_dict()
+        identity = LogicalApplicationIdentity.from_authority(values)
+        return cls(
+            authority_id=values["authority_id"],
+            authority_issuance_id=issuance_id,
+            credential_binding_id=values["credential_binding_id"],
+            credential_instance_id=claims.credential_instance_id,
+            credential_class=claims.credential_class,
+            credential_principal_identity=claims.credential_principal_identity,
+            github_subject_identity=claims.github_subject_identity,
+            repository_identity=claims.repository_identity,
+            driver_identity=claims.driver_identity,
+            remote_authority=claims.remote_authority,
+            evidence_digest=claims.evidence_digest,
+            challenge_digest=claims.challenge_digest,
+            source_verification_digest=claims.source_verification_digest,
+            workspace_identity=values["workspace_identity"],
+            application_id=identity.application_id,
+            preview_id=values["preview_id"],
+            revision=values["revision"],
+            required_capabilities=tuple(values["required_capabilities"]),
+            granted_capabilities=tuple(values["granted_capabilities"]),
+            expires_at=values["expires_at"],
+            authority_semantics_digest=digest(values),
+        )
+
+    def matches_authority(self, authority: Any, issuance_id: str) -> bool:
+        try:
+            values = authority.to_dict()
+            return (
+                self.authority_id == values["authority_id"]
+                and self.authority_issuance_id == issuance_id
+                and self.credential_binding_id == values["credential_binding_id"]
+                and self.credential_instance_id == values["credential_instance_id"]
+                and self.credential_principal_identity == values["credential_principal_identity"]
+                and self.github_subject_identity == values["github_subject_identity"]
+                and self.repository_identity == values["repository_identity"]
+                and self.driver_identity == values["driver_identity"]
+                and self.remote_authority == values["remote_authority"]
+                and self.workspace_identity == values["workspace_identity"]
+                and self.application_id == LogicalApplicationIdentity.from_authority(values).application_id
+                and self.preview_id == values["preview_id"]
+                and self.revision == values["revision"]
+                and self.required_capabilities == tuple(values["required_capabilities"])
+                and self.granted_capabilities == tuple(values["granted_capabilities"])
+                and self.expires_at == values["expires_at"]
+                and self.authority_semantics_digest == digest(values)
+            )
+        except Exception:
+            return False
 
 
 class InMemoryPreviewStore:
@@ -1670,7 +1756,11 @@ class RuntimeApprovalAuthorityService:
     """Runtime-owned bridge from explicit approval to immutable authority."""
 
     def __init__(self, context: RuntimeContext, store: PreviewStore, attestation_service: Any,
-                 *, clock: Callable[[], datetime], host_credential_lease: Any = None) -> None:
+                 *, clock: Callable[[], datetime], host_credential_lease: Any = None,
+                 artifact_link_adapter: Any = None, authority_binding_signer: Any = None,
+                 authority_binding_store: Any = None, authority_binding_verifier: Any = None,
+                 attestation_persistence_store: Any = None,
+                 restart_credential_verifier: Any = None) -> None:
         if not isinstance(context, RuntimeContext) or not callable(clock):
             raise TypeError("approval_runtime_boundary_invalid")
         self.context = context
@@ -1679,8 +1769,17 @@ class RuntimeApprovalAuthorityService:
         self.clock = clock
         self._lock = threading.RLock()
         self._authorities: dict[str, Any] = {}
+        self._authority_issuance_ids: dict[str, str] = {}
+        self._restart_authority_provenance: dict[str, _RestartAuthorityValidationProvenance] = {}
+        self._live_credential_contexts: dict[tuple[str, int], Any] = {}
         self._execution_context_registry: dict[int, tuple[Any, tuple[Any, ...]]] = {}
         self._live_artifact_registry: dict[int, tuple[Any, str, Any, Any]] = {}
+        self._artifact_link_adapter = artifact_link_adapter
+        self._authority_binding_signer = authority_binding_signer
+        self._authority_binding_store = authority_binding_store
+        self._authority_binding_verifier = authority_binding_verifier
+        self._attestation_persistence_store = attestation_persistence_store
+        self._restart_credential_verifier = restart_credential_verifier
         if host_credential_lease is not None:
             if type(host_credential_lease) is not GitHubAppInstallationCredentialLease:
                 raise ValueError("host_credential_capability_invalid")
@@ -1718,8 +1817,58 @@ class RuntimeApprovalAuthorityService:
             raise ValueError("credential_capability_unregistered")
         context._require_current()
         authority = context._authority
-        binding = self.attestation_service.resolve_registered_binding(authority.credential_binding_id)
         lease = self._host_credential_lease
+        restart_provenance = self._restart_authority_provenance.get(authority.authority_id)
+        if restart_provenance is not None:
+            issuance_id = self._authority_issuance_ids.get(authority.authority_id)
+            if not isinstance(issuance_id, str) or not restart_provenance.matches_authority(authority, issuance_id):
+                raise ValueError("credential_currentness_mismatch")
+            try:
+                lease._validate_integrity()
+                evidence = lease._snapshot()
+                if evidence is not self._host_credential_snapshot:
+                    raise ValueError("credential_currentness_mismatch")
+                if lease._credential_class() != restart_provenance.credential_class:
+                    raise ValueError("credential_instance_mismatch")
+                if evidence.credential_instance_id != restart_provenance.credential_instance_id:
+                    raise ValueError("credential_instance_mismatch")
+                if github_app_installation_principal(evidence.app_id, evidence.installation_id) != restart_provenance.credential_principal_identity:
+                    raise ValueError("credential_principal_mismatch")
+                if evidence.repository_identity != restart_provenance.repository_identity:
+                    raise ValueError("credential_repository_mismatch")
+                if evidence.repository_scope != (restart_provenance.repository_identity,):
+                    raise ValueError("credential_scope_mismatch")
+                if dict(evidence.effective_permissions).get("issues") != "write":
+                    raise ValueError("credential_capability_mismatch")
+                if evidence.expires_at != restart_provenance.expires_at:
+                    raise ValueError("credential_currentness_mismatch")
+                if "issues:write" not in restart_provenance.required_capabilities:
+                    raise ValueError("credential_capability_mismatch")
+                now = self.clock().astimezone(timezone.utc)
+                expires = datetime.fromisoformat(evidence.expires_at.replace("Z", "+00:00"))
+                if expires <= now:
+                    raise ValueError("credential_expired")
+                request = {
+                    "repository_identity": restart_provenance.repository_identity,
+                    "required_capabilities": restart_provenance.required_capabilities,
+                    "github_subject_identity": restart_provenance.github_subject_identity,
+                    "driver_identity": restart_provenance.driver_identity,
+                    "remote_authority": restart_provenance.remote_authority,
+                    "preview_id": authority.preview_id,
+                    "revision": authority.revision,
+                    "operation_set_digest": authority.operation_set_digest,
+                    "remote_snapshot_digest": authority.remote_snapshot_digest,
+                    "evidence_digest": restart_provenance.evidence_digest,
+                    "challenge_digest": restart_provenance.challenge_digest,
+                }
+                if github_app_installation_source_verification_digest(evidence, request) != restart_provenance.source_verification_digest:
+                    raise ValueError("credential_currentness_mismatch")
+            except ValueError:
+                raise
+            except (AttributeError, TypeError, ValueError):
+                raise ValueError("credential_currentness_mismatch") from None
+            return
+        binding = self.attestation_service.resolve_registered_binding(authority.credential_binding_id)
         try:
             lease._validate_integrity()
         except ValueError:
@@ -1772,6 +1921,12 @@ class RuntimeApprovalAuthorityService:
         }
         if github_app_installation_source_verification_digest(evidence, request) != binding.source_verification_digest:
             raise ValueError("credential_currentness_mismatch")
+
+    def _has_registered_live_binding(self, binding_id: str) -> bool:
+        try:
+            return self.attestation_service.resolve_registered_binding(binding_id) is not None
+        except Exception:
+            return False
 
     @staticmethod
     def _approval_id(audit: AuditRecord) -> str:
@@ -1850,9 +2005,22 @@ class RuntimeApprovalAuthorityService:
 
     def issue_application_authority(self, preview_id: str, revision: int, approval_id: str) -> Any:
         from delivery_system.application_authority import ApplicationAuthority, _AUTHORITY_MARKER
+        from delivery_system.application_identity import LogicalApplicationIdentity, operation_identity
+        from delivery_system.authority_binding import AuthorityBindingRecord, create_signed_authority_binding
+        from delivery_system.authority_binding_persistence import PersistedAuthorityBinding
+        from delivery_system.attestation_runtime import VerifiedRuntimeCredentialContext
+        from delivery_system.verified_attestation_artifact import VerifiedCredentialArtifactLink
         if not isinstance(approval_id, str) or not approval_id:
             raise ValueError("application_authority_rejected")
         with self._lock:
+            if not all((self._artifact_link_adapter is not None,
+                        callable(getattr(self._artifact_link_adapter, "persist_verified_attestation", None)),
+                        self._authority_binding_signer is not None,
+                        self._authority_binding_store is not None,
+                        callable(getattr(self._authority_binding_store, "save_authority_binding", None)),
+                        callable(getattr(self._authority_binding_store, "resolve_authority_binding_for_operation", None)),
+                        callable(getattr(self._authority_binding_store, "load_authority_binding", None)))):
+                raise ValueError("authority_issuance_dependencies_required")
             preview, audit = self._resolve_audit(preview_id, revision)
             if approval_id != self._approval_id(audit):
                 raise ValueError("approval_binding_mismatch")
@@ -1862,19 +2030,46 @@ class RuntimeApprovalAuthorityService:
                 raise ValueError("approval_not_found") from exc
             if not self.store.validate_approval_current(approval):
                 raise ValueError("approval_stale")
-            result = self.attestation_service.orchestrate(preview_id, revision)
-            if not result.success or result.binding is None:
-                code = result.failures[0].code if result.failures else "credential_binding_mismatch"
-                raise ValueError(code)
-            binding = self.attestation_service.resolve_registered_binding(result.binding.binding_id)
+            if not _validate_approval_against_current_preview(
+                approval, audit, preview, self.context.workspace_identity,
+            ):
+                raise ValueError("approval_stale")
+            context_key = (preview_id, revision)
+            verified_context = self._live_credential_contexts.get(context_key)
+            if (not isinstance(verified_context, VerifiedRuntimeCredentialContext) or
+                    not VerifiedRuntimeCredentialContext.is_source_owned(verified_context)):
+                result = self.attestation_service.orchestrate(preview_id, revision)
+                if (not result.success or result.binding is None or
+                        not isinstance(result.verified_context, VerifiedRuntimeCredentialContext)):
+                    code = result.failures[0].code if result.failures else "credential_binding_mismatch"
+                    raise ValueError(code)
+                verified_context = result.verified_context
+                self._live_credential_contexts[context_key] = verified_context
+            if not VerifiedRuntimeCredentialContext.is_source_owned(verified_context):
+                raise ValueError("credential_binding_mismatch")
+            binding = verified_context.binding
+            registered_binding = self.attestation_service.resolve_registered_binding(binding.binding_id)
+            if registered_binding is not binding:
+                raise ValueError("credential_binding_mismatch")
+            link = self._artifact_link_adapter.persist_verified_attestation(verified_context)
+            if type(link) is not VerifiedCredentialArtifactLink or link.credential_binding_id != binding.binding_id:
+                raise ValueError("verified_attestation_artifact_link_invalid")
+            artifact = link.artifact
+            if (artifact.attestation_id != verified_context.claims.attestation_id or
+                    artifact.claims_payload.to_payload() != verified_context.claims.to_payload() or
+                    artifact.claims_digest != verified_context.claims.claims_digest() or
+                    artifact.detached_proof != verified_context.envelope.proof or
+                    artifact.original_verified_at != verified_context.verified_at):
+                raise ValueError("verified_attestation_artifact_link_invalid")
             canonical = preview.get("canonical_payload")
             if not isinstance(canonical, Mapping):
                 raise ValueError("application_authority_rejected")
             try:
-                if datetime.fromisoformat(binding.expires_at.replace("Z", "+00:00")) <= self.clock().astimezone(timezone.utc):
-                    raise ValueError("credential_binding_mismatch")
-            except AttributeError as exc:
-                raise ValueError("credential_binding_mismatch") from exc
+                operations = tuple(normalize_write_operations(canonical["operation_intents"]))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("operation_set_mismatch") from exc
+            if not operations:
+                raise ValueError("operation_set_mismatch")
             required = tuple(binding.required_capabilities)
             granted = tuple(binding.granted_capabilities)
             if "issues:write" not in required or not set(required).issubset(granted) or "issues:write" not in granted:
@@ -1896,7 +2091,7 @@ class RuntimeApprovalAuthorityService:
                 "github_subject_identity": binding.github_subject_identity,
                 "driver_identity": binding.driver_identity, "remote_authority": binding.remote_authority,
                 "required_capabilities": required, "granted_capabilities": granted,
-                "issued_at": self._utc(self.clock()), "expires_at": binding.expires_at,
+                "issued_at": "", "expires_at": binding.expires_at,
             }
             for field in ("workspace_identity", "repository_identity", "preview_id", "revision", "plan_digest",
                           "sealed_preview_digest", "operation_set_digest", "remote_snapshot_digest"):
@@ -1913,13 +2108,526 @@ class RuntimeApprovalAuthorityService:
                     binding.github_subject_identity != values["github_subject_identity"] or
                     tuple(binding.granted_capabilities) != granted):
                 raise ValueError("credential_binding_mismatch")
+            if not _preview_is_approval_eligible(preview):
+                raise ValueError("approval_stale")
+            identity = LogicalApplicationIdentity.from_authority(values)
+            operation_ids = tuple(
+                operation_identity(identity.application_id, index, operation)
+                for index, operation in enumerate(operations)
+            )
+            for operation_id in operation_ids:
+                if self._authority_binding_store.resolve_authority_binding_for_operation(
+                    self.context.workspace_identity, operation_id,
+                ) is not None:
+                    raise ValueError("authority_issuance_requires_recovery")
             values["authority_id"] = ApplicationAuthority.expected_id(values)
+            if values["authority_id"] in self._authorities:
+                raise ValueError("application_authority_registry_conflict")
+            issued_at = self._utc(self.clock())
+            try:
+                if datetime.fromisoformat(binding.expires_at.replace("Z", "+00:00")) <= datetime.fromisoformat(issued_at.replace("Z", "+00:00")):
+                    raise ValueError("credential_binding_mismatch")
+            except (AttributeError, TypeError, ValueError) as exc:
+                if str(exc) == "credential_binding_mismatch":
+                    raise
+                raise ValueError("credential_binding_mismatch") from exc
+            values["issued_at"] = issued_at
             existing = self._authorities.get(values["authority_id"])
             if existing is not None:
-                return existing
+                raise ValueError("application_authority_registry_conflict")
             authority = ApplicationAuthority._create(values, _marker=_AUTHORITY_MARKER)
+            authority_binding = AuthorityBindingRecord.create(
+                workspace_identity=self.context.workspace_identity,
+                application_id=identity.application_id,
+                credential_binding_id=binding.binding_id,
+                required_capabilities=required,
+                authority_issued_at=issued_at,
+                attestation_artifact_id=link.artifact_id,
+                attestation_artifact_digest=link.artifact_digest,
+                authorized_operation_identities=operation_ids,
+            )
+            signed_binding = create_signed_authority_binding(
+                authority_binding, self._authority_binding_signer,
+            )
+            persisted = self._authority_binding_store.save_authority_binding(signed_binding)
+            if (type(persisted) is not PersistedAuthorityBinding or
+                    persisted.signed != signed_binding or
+                    persisted.canonical_payload != signed_binding.payload.canonical_bytes() or
+                    persisted.authority_issuance_id != signed_binding.payload.authority_issuance_id):
+                raise ValueError("authority_binding_persistence_conflict")
+            issuance_id = persisted.authority_issuance_id
+            associated = self._authority_issuance_ids.get(authority.authority_id)
+            if associated is not None and associated != issuance_id:
+                raise ValueError("application_authority_registry_conflict")
+            if self._authorities.get(authority.authority_id) is not None:
+                raise ValueError("application_authority_registry_conflict")
+            self._authority_issuance_ids[authority.authority_id] = issuance_id
             self._authorities[authority.authority_id] = authority
             return authority
+
+    def recover_application_authority(self, preview_id: str, revision: int, approval_id: str) -> Any:
+        """Recover one already-durable authority issuance using live Runtime evidence."""
+        from delivery_system.application_authority import ApplicationAuthority, _AUTHORITY_MARKER
+        from delivery_system.application_identity import LogicalApplicationIdentity, operation_identity
+        from delivery_system.authority_binding_persistence import PersistedAuthorityBinding
+        from delivery_system.attestation_runtime import VerifiedRuntimeCredentialContext
+        from delivery_system.verified_attestation_artifact import VerifiedCredentialArtifactLink
+
+        if not isinstance(approval_id, str) or not approval_id:
+            raise ValueError("application_authority_rejected")
+        with self._lock:
+            store = self._authority_binding_store
+            verifier = self._authority_binding_verifier
+            if not all((self._artifact_link_adapter is not None,
+                        callable(getattr(self._artifact_link_adapter, "resolve_verified_attestation", None)),
+                        store is not None,
+                        callable(getattr(store, "resolve_authority_binding_for_operation", None)),
+                        callable(getattr(store, "load_authority_binding", None)),
+                        verifier is not None,
+                        callable(getattr(verifier, "verify", None)))):
+                raise ValueError("authority_recovery_dependencies_required")
+            preview, audit = self._resolve_audit(preview_id, revision)
+            if approval_id != self._approval_id(audit):
+                raise ValueError("approval_binding_mismatch")
+            try:
+                approval = self.store.get_approval(self.context.workspace_identity, approval_id)
+            except ValueError as exc:
+                raise ValueError("approval_not_found") from exc
+            if not self.store.validate_approval_current(approval):
+                raise ValueError("approval_stale")
+            if not _validate_approval_against_current_preview(
+                approval, audit, preview, self.context.workspace_identity,
+            ):
+                raise ValueError("approval_stale")
+            context = self._live_credential_contexts.get((preview_id, revision))
+            if (not isinstance(context, VerifiedRuntimeCredentialContext) or
+                    not VerifiedRuntimeCredentialContext.is_source_owned(context)):
+                raise ValueError("authority_recovery_live_context_required")
+            binding = context.binding
+            if self.attestation_service.resolve_registered_binding(binding.binding_id) is not binding:
+                raise ValueError("credential_binding_mismatch")
+            canonical = preview.get("canonical_payload")
+            if not isinstance(canonical, Mapping):
+                raise ValueError("application_authority_rejected")
+            try:
+                operations = tuple(normalize_write_operations(canonical["operation_intents"]))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("operation_set_mismatch") from exc
+            if not operations:
+                raise ValueError("operation_set_mismatch")
+            required = tuple(binding.required_capabilities)
+            granted = tuple(binding.granted_capabilities)
+            if ("issues:write" not in required or not set(required).issubset(granted) or
+                    "issues:write" not in granted):
+                raise ValueError("credential_capability_insufficient")
+            values = {
+                "authority_id": "",
+                "workspace_identity": self.context.workspace_identity,
+                "repository_identity": canonical.get("repository_identity"),
+                "preview_id": preview_id, "revision": revision,
+                "sealed_preview_digest": canonical.get("sealed_preview_digest"),
+                "plan_digest": canonical.get("plan_digest"),
+                "operation_set_digest": canonical.get("operation_set_digest"),
+                "remote_snapshot_digest": canonical.get("remote_snapshot_digest"),
+                "audit_id": audit.audit_id, "audit_digest": audit.audit_digest,
+                "approval_id": approval.approval_id, "approval_digest": self._approval_digest(approval),
+                "credential_binding_id": binding.binding_id,
+                "credential_instance_id": binding.credential_instance_id, "issuer_id": binding.issuer_id,
+                "credential_principal_identity": binding.credential_principal_identity,
+                "github_subject_identity": binding.github_subject_identity,
+                "driver_identity": binding.driver_identity, "remote_authority": binding.remote_authority,
+                "required_capabilities": required, "granted_capabilities": granted,
+                "issued_at": "", "expires_at": binding.expires_at,
+            }
+            for field in ("workspace_identity", "repository_identity", "preview_id", "revision", "plan_digest",
+                          "sealed_preview_digest", "operation_set_digest", "remote_snapshot_digest"):
+                if getattr(binding, field, None) != values[field]:
+                    raise ValueError("credential_binding_mismatch")
+            for field in ("audit_id", "audit_digest"):
+                if getattr(binding, field, None) != values[field]:
+                    raise ValueError("credential_binding_mismatch")
+            if (binding.remote_authority != values["remote_authority"] or
+                    binding.driver_identity != values["driver_identity"] or
+                    binding.credential_instance_id != values["credential_instance_id"] or
+                    binding.issuer_id != values["issuer_id"] or
+                    binding.credential_principal_identity != values["credential_principal_identity"] or
+                    binding.github_subject_identity != values["github_subject_identity"] or
+                    tuple(binding.granted_capabilities) != granted):
+                raise ValueError("credential_binding_mismatch")
+            if not _preview_is_approval_eligible(preview):
+                raise ValueError("approval_stale")
+            identity = LogicalApplicationIdentity.from_authority(values)
+            operation_ids = tuple(
+                operation_identity(identity.application_id, index, operation)
+                for index, operation in enumerate(operations)
+            )
+            assignments = []
+            for operation_id in operation_ids:
+                try:
+                    assigned = store.resolve_authority_binding_for_operation(
+                        self.context.workspace_identity, operation_id,
+                    )
+                except Exception as exc:
+                    raise ValueError("restart_reconstruction_persistence_error") from exc
+                if assigned is None:
+                    raise ValueError("authority_recovery_partial_or_missing")
+                if not isinstance(assigned, PersistedAuthorityBinding):
+                    raise ValueError("authority_binding_persistence_corrupt")
+                assignments.append(assigned.authority_issuance_id)
+            if not assignments or len(set(assignments)) != 1:
+                raise ValueError("authority_recovery_assignment_conflict")
+            issuance_id = assignments[0]
+            try:
+                persisted = store.load_authority_binding(
+                    self.context.workspace_identity, issuance_id,
+                )
+            except Exception as exc:
+                raise ValueError("restart_reconstruction_persistence_error") from exc
+            if (not isinstance(persisted, PersistedAuthorityBinding) or
+                    persisted.authority_issuance_id != issuance_id):
+                raise ValueError("authority_binding_persistence_corrupt")
+            try:
+                verified = verifier.verify(persisted.signed)
+            except Exception as exc:
+                raise ValueError("authority_binding_proof_invalid") from exc
+            if verified is not True:
+                raise ValueError("authority_binding_proof_invalid")
+            link = self._artifact_link_adapter.resolve_verified_attestation(context)
+            if type(link) is not VerifiedCredentialArtifactLink or link.credential_binding_id != binding.binding_id:
+                raise ValueError("verified_attestation_artifact_link_invalid")
+            payload = persisted.payload
+            expected_operations = tuple(sorted(operation_ids))
+            if (payload.workspace_identity != self.context.workspace_identity or
+                    payload.application_id != identity.application_id or
+                    payload.credential_binding_id != binding.binding_id or
+                    payload.required_capabilities != required or
+                    payload.attestation_artifact_id != link.artifact_id or
+                    payload.attestation_artifact_digest != link.artifact_digest or
+                    payload.authorized_operation_identities != expected_operations):
+                raise ValueError("authority_recovery_binding_mismatch")
+            values["issued_at"] = payload.authority_issued_at
+            values["authority_id"] = ApplicationAuthority.expected_id(values)
+            try:
+                now = self.clock().astimezone(timezone.utc)
+                expires = datetime.fromisoformat(binding.expires_at.replace("Z", "+00:00"))
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise ValueError("credential_currentness_mismatch") from exc
+            if expires <= now:
+                raise ValueError("credential_expired")
+            recovered = ApplicationAuthority._create(values, _marker=_AUTHORITY_MARKER)
+            associated = self._authority_issuance_ids.get(recovered.authority_id)
+            if associated is not None and associated != issuance_id:
+                raise ValueError("application_authority_registry_conflict")
+            existing = self._authorities.get(recovered.authority_id)
+            if existing is not None:
+                if type(existing) is not ApplicationAuthority or existing.to_dict() != recovered.to_dict():
+                    raise ValueError("application_authority_registry_conflict")
+                if associated is None:
+                    self._authority_issuance_ids[recovered.authority_id] = issuance_id
+                return existing
+            self._authority_issuance_ids[recovered.authority_id] = issuance_id
+            self._authorities[recovered.authority_id] = recovered
+            return recovered
+
+    def reconstruct_application_authority_after_restart(
+        self, preview_id: str, revision: int, approval_id: str,
+    ) -> Any:
+        """Reconstruct one historical authority without live credential context."""
+        from delivery_system.application_authority import ApplicationAuthority, _AUTHORITY_MARKER
+        from delivery_system.application_identity import LogicalApplicationIdentity, operation_identity
+        from delivery_system.attestation_persistence_store import AttestationArtifactAggregate
+        from delivery_system.authority_binding_persistence import PersistedAuthorityBinding
+        from delivery_system.restart_credential_verification import (
+            RestartVerifiedCredentialEvidence,
+            derive_restart_binding_id,
+        )
+
+        if not isinstance(approval_id, str) or not approval_id:
+            raise ValueError("restart_reconstruction_invalid")
+        with self._lock:
+            store = self._authority_binding_store
+            artifact_store = self._attestation_persistence_store
+            verifier = self._authority_binding_verifier
+            credential_verifier = self._restart_credential_verifier
+            if not all((store is not None,
+                        callable(getattr(store, "resolve_authority_binding_for_operation", None)),
+                        callable(getattr(store, "load_authority_binding", None)),
+                        verifier is not None,
+                        callable(getattr(verifier, "verify", None)),
+                        artifact_store is not None,
+                        callable(getattr(artifact_store, "get_artifact_aggregate", None)),
+                        credential_verifier is not None,
+                        callable(getattr(credential_verifier, "verify", None)))):
+                raise ValueError("restart_reconstruction_dependencies_required")
+            preview, audit = self._resolve_audit(preview_id, revision)
+            if approval_id != self._approval_id(audit):
+                raise ValueError("restart_reconstruction_application_mismatch")
+            try:
+                approval = self.store.get_approval(self.context.workspace_identity, approval_id)
+            except ValueError as exc:
+                raise ValueError("restart_reconstruction_approval_missing") from exc
+            if not self.store.validate_approval_current(approval):
+                raise ValueError("restart_reconstruction_approval_invalid")
+            if not _validate_approval_against_current_preview(
+                approval, audit, preview, self.context.workspace_identity,
+            ):
+                raise ValueError("restart_reconstruction_approval_invalid")
+
+            state = self.attestation_service._load_runtime_state(preview_id, revision)
+            if not isinstance(state, tuple) or len(state) != 4:
+                failures = getattr(state, "failures", ())
+                first_failure = failures[0] if failures else None
+                raise ValueError(getattr(first_failure, "code", "restart_reconstruction_current_state_invalid"))
+            _sealed_context, state_audit, evidence, state_details = state
+            if state_audit != audit or not isinstance(state_details, Mapping):
+                raise ValueError("restart_reconstruction_current_state_invalid")
+            subject = state_details.get("subject")
+            if not isinstance(subject, str) or not subject:
+                raise ValueError("restart_reconstruction_current_state_invalid")
+            canonical = preview.get("canonical_payload")
+            if not isinstance(canonical, Mapping):
+                raise ValueError("restart_reconstruction_current_state_invalid")
+            try:
+                operations = tuple(normalize_write_operations(canonical["operation_intents"]))
+                resolver = getattr(self.attestation_service, "_RuntimeAttestationOrchestrationService__resolver")
+                required = tuple(sorted(resolver.resolve(tuple(dict(item) for item in operations))))
+            except Exception as exc:
+                raise ValueError("restart_reconstruction_capability_mismatch") from exc
+            if not operations or not required:
+                raise ValueError("restart_reconstruction_operation_mismatch")
+            try:
+                identity_values = {
+                    "authority_id": "",
+                    "workspace_identity": self.context.workspace_identity,
+                    "repository_identity": canonical.get("repository_identity"),
+                    "preview_id": preview_id,
+                    "revision": revision,
+                    "sealed_preview_digest": canonical.get("sealed_preview_digest"),
+                    "plan_digest": canonical.get("plan_digest"),
+                    "operation_set_digest": canonical.get("operation_set_digest"),
+                    "remote_snapshot_digest": canonical.get("remote_snapshot_digest"),
+                    "audit_id": audit.audit_id,
+                    "audit_digest": audit.audit_digest,
+                    "approval_id": approval.approval_id,
+                    "approval_digest": self._approval_digest(approval),
+                    "credential_binding_id": "binding-" + "0" * 64,
+                    "credential_instance_id": "credential-instance-placeholder",
+                    "issuer_id": "issuer-placeholder",
+                    "credential_principal_identity": "principal-placeholder",
+                    "github_subject_identity": subject,
+                    "driver_identity": evidence.source_identity,
+                    "remote_authority": canonical.get("remote_authority"),
+                    "required_capabilities": required,
+                }
+                identity = LogicalApplicationIdentity.from_authority(identity_values)
+                operation_ids = tuple(sorted(
+                    operation_identity(identity.application_id, index, operation)
+                    for index, operation in enumerate(operations)
+                ))
+            except Exception as exc:
+                raise ValueError("restart_reconstruction_application_mismatch") from exc
+            assignments = []
+            for operation_id in operation_ids:
+                try:
+                    assigned = store.resolve_authority_binding_for_operation(
+                        self.context.workspace_identity, operation_id,
+                    )
+                except Exception as exc:
+                    raise ValueError("restart_reconstruction_persistence_error") from exc
+                if assigned is None:
+                    raise ValueError("restart_reconstruction_no_historical_issuance")
+                if not isinstance(assigned, PersistedAuthorityBinding):
+                    raise ValueError("restart_reconstruction_persistence_corrupt")
+                assignments.append(assigned.authority_issuance_id)
+            if not assignments:
+                raise ValueError("restart_reconstruction_no_historical_issuance")
+            if len(set(assignments)) != 1:
+                raise ValueError("restart_reconstruction_assignment_conflict")
+            issuance_id = assignments[0]
+            try:
+                persisted = store.load_authority_binding(
+                    self.context.workspace_identity, issuance_id,
+                )
+            except Exception as exc:
+                raise ValueError("restart_reconstruction_persistence_error") from exc
+            if (not isinstance(persisted, PersistedAuthorityBinding) or
+                    persisted.authority_issuance_id != issuance_id):
+                raise ValueError("restart_reconstruction_persistence_corrupt")
+            try:
+                binding_valid = verifier.verify(persisted.signed)
+            except Exception as exc:
+                raise ValueError("restart_reconstruction_authority_binding_invalid") from exc
+            if binding_valid is not True:
+                raise ValueError("restart_reconstruction_authority_binding_invalid")
+            payload = persisted.payload
+            if payload.application_id != identity.application_id:
+                raise ValueError("restart_reconstruction_application_mismatch")
+            if payload.authorized_operation_identities != operation_ids:
+                raise ValueError("restart_reconstruction_operation_mismatch")
+            if payload.required_capabilities != required:
+                raise ValueError("restart_reconstruction_capability_mismatch")
+            try:
+                aggregate = artifact_store.get_artifact_aggregate(
+                    self.context.workspace_identity, payload.attestation_artifact_id,
+                )
+            except Exception as exc:
+                raise ValueError("restart_reconstruction_artifact_unavailable") from exc
+            if aggregate is None:
+                raise ValueError("restart_reconstruction_artifact_missing")
+            if type(aggregate) is not AttestationArtifactAggregate:
+                raise ValueError("restart_reconstruction_artifact_invalid")
+            if (aggregate.artifact.artifact_digest != payload.attestation_artifact_digest or
+                    aggregate.binding_reference.artifact_id != aggregate.artifact.artifact_id or
+                    aggregate.binding_reference.artifact_digest != aggregate.artifact.artifact_digest):
+                raise ValueError("restart_reconstruction_artifact_mismatch")
+            try:
+                now = self.clock().astimezone(timezone.utc)
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise ValueError("restart_reconstruction_clock_invalid") from exc
+            try:
+                verified_evidence = credential_verifier.verify(
+                    aggregate.artifact, current_time=now,
+                )
+            except ValueError:
+                raise
+            except Exception as exc:
+                raise ValueError("restart_reconstruction_credential_proof_invalid") from exc
+            if type(verified_evidence) is not RestartVerifiedCredentialEvidence:
+                raise ValueError("restart_reconstruction_credential_evidence_invalid")
+            if (verified_evidence.workspace_identity != self.context.workspace_identity or
+                    verified_evidence.artifact_id != payload.attestation_artifact_id or
+                    verified_evidence.artifact_digest != payload.attestation_artifact_digest):
+                raise ValueError("restart_reconstruction_artifact_mismatch")
+            claims = verified_evidence.claims
+            reference = aggregate.binding_reference
+            if (claims.repository_identity != canonical.get("repository_identity") or
+                    claims.github_subject_identity != subject or
+                    claims.driver_identity != evidence.source_identity or
+                    claims.remote_authority != canonical.get("remote_authority") or
+                    claims.preview_id != preview_id or claims.revision != revision or
+                    claims.operation_set_digest != canonical.get("operation_set_digest") or
+                    claims.remote_snapshot_digest != canonical.get("remote_snapshot_digest") or
+                    claims.evidence_digest != evidence.evidence_digest or
+                    claims.evidence_digest != canonical.get("evidence_digest", claims.evidence_digest)):
+                raise ValueError("restart_reconstruction_binding_mismatch")
+            if ("issues:write" not in required or
+                    not set(required).issubset(set(claims.granted_capabilities)) or
+                    "issues:write" not in claims.granted_capabilities):
+                raise ValueError("restart_reconstruction_capability_mismatch")
+            if (
+                reference.workspace_identity != self.context.workspace_identity
+                or reference.artifact_id != payload.attestation_artifact_id
+                or reference.artifact_digest != payload.attestation_artifact_digest
+                or reference.repository_identity != claims.repository_identity
+                or reference.github_subject_identity != claims.github_subject_identity
+                or reference.driver_identity != claims.driver_identity
+                or reference.remote_authority != claims.remote_authority
+                or reference.preview_id != preview_id
+                or reference.revision != revision
+                or reference.plan_digest != canonical.get("plan_digest")
+                or reference.sealed_preview_digest != canonical.get("sealed_preview_digest")
+                or reference.operation_set_digest != claims.operation_set_digest
+                or reference.remote_snapshot_digest != claims.remote_snapshot_digest
+                or reference.audit_id != audit.audit_id
+                or reference.audit_digest != audit.audit_digest
+                or reference.evidence_id != evidence.evidence_id
+                or reference.evidence_digest != claims.evidence_digest
+                or reference.original_verified_at != aggregate.artifact.original_verified_at
+                or (
+                    reference.credential_principal_identity
+                    and reference.credential_principal_identity != claims.credential_principal_identity
+                )
+                or (
+                    reference.challenge_digest
+                    and reference.challenge_digest != claims.challenge_digest
+                )
+            ):
+                raise ValueError("restart_reconstruction_artifact_mismatch")
+            binding_values = {
+                "binding_id": payload.credential_binding_id,
+                "workspace_identity": self.context.workspace_identity,
+                "attestation_version": claims.attestation_version,
+                "attestation_id": claims.attestation_id,
+                "claims_digest": claims.claims_digest(),
+                "credential_instance_id": claims.credential_instance_id,
+                "issuer_id": claims.issuer_id,
+                "key_id": claims.key_id,
+                "algorithm": claims.signature_algorithm,
+                "credential_class": claims.credential_class,
+                "credential_principal_identity": claims.credential_principal_identity,
+                "challenge_digest": claims.challenge_digest,
+                "repository_identity": claims.repository_identity,
+                "github_subject_identity": claims.github_subject_identity,
+                "required_capabilities": required,
+                "granted_capabilities": claims.granted_capabilities,
+                "driver_identity": claims.driver_identity,
+                "remote_authority": claims.remote_authority,
+                "preview_id": claims.preview_id,
+                "revision": claims.revision,
+                "plan_digest": canonical.get("plan_digest"),
+                "sealed_preview_digest": canonical.get("sealed_preview_digest"),
+                "operation_set_digest": claims.operation_set_digest,
+                "remote_snapshot_digest": claims.remote_snapshot_digest,
+                "evidence_id": evidence.evidence_id,
+                "evidence_digest": claims.evidence_digest,
+                "audit_id": audit.audit_id,
+                "audit_digest": audit.audit_digest,
+                "source_verification_digest": claims.source_verification_digest,
+                "issued_at": claims.issued_at,
+                "expires_at": claims.expires_at,
+                "verified_at": "",
+            }
+            if derive_restart_binding_id(binding_values) != payload.credential_binding_id:
+                raise ValueError("restart_reconstruction_binding_mismatch")
+            if (reference.binding_id != payload.credential_binding_id or
+                    reference.artifact_id != payload.attestation_artifact_id or
+                    reference.artifact_digest != payload.attestation_artifact_digest):
+                raise ValueError("restart_reconstruction_artifact_mismatch")
+            if (payload.workspace_identity != self.context.workspace_identity or
+                    payload.credential_binding_id != derive_restart_binding_id(binding_values)):
+                raise ValueError("restart_reconstruction_binding_mismatch")
+            values = dict(identity_values)
+            values.update({
+                "credential_binding_id": payload.credential_binding_id,
+                "credential_instance_id": claims.credential_instance_id,
+                "issuer_id": claims.issuer_id,
+                "credential_principal_identity": claims.credential_principal_identity,
+                "github_subject_identity": claims.github_subject_identity,
+                "driver_identity": claims.driver_identity,
+                "remote_authority": claims.remote_authority,
+                "granted_capabilities": claims.granted_capabilities,
+                "issued_at": payload.authority_issued_at,
+                "expires_at": claims.expires_at,
+            })
+            values["authority_id"] = ApplicationAuthority.expected_id(values)
+            recovered = ApplicationAuthority._create(values, _marker=_AUTHORITY_MARKER)
+            associated = self._authority_issuance_ids.get(recovered.authority_id)
+            if associated is not None and associated != issuance_id:
+                raise ValueError("restart_reconstruction_registry_conflict")
+            existing = self._authorities.get(recovered.authority_id)
+            provenance = _RestartAuthorityValidationProvenance.from_authority(
+                recovered, issuance_id, claims=claims,
+            )
+            if existing is not None:
+                if type(existing) is not ApplicationAuthority or existing.to_dict() != recovered.to_dict():
+                    raise ValueError("restart_reconstruction_registry_conflict")
+                if (self._live_credential_contexts.get((recovered.preview_id, recovered.revision)) is not None or
+                        self._has_registered_live_binding(recovered.credential_binding_id)):
+                    raise ValueError("restart_reconstruction_registry_conflict")
+                existing_provenance = self._restart_authority_provenance.get(recovered.authority_id)
+                if existing_provenance is not None and existing_provenance != provenance:
+                    raise ValueError("restart_reconstruction_registry_conflict")
+                if associated is None:
+                    self._authority_issuance_ids[recovered.authority_id] = issuance_id
+                self._restart_authority_provenance[recovered.authority_id] = provenance
+                return existing
+            if (self._live_credential_contexts.get((recovered.preview_id, recovered.revision)) is not None or
+                    self._has_registered_live_binding(recovered.credential_binding_id)):
+                raise ValueError("restart_reconstruction_registry_conflict")
+            self._authority_issuance_ids[recovered.authority_id] = issuance_id
+            self._restart_authority_provenance[recovered.authority_id] = provenance
+            self._authorities[recovered.authority_id] = recovered
+            return recovered
 
     def validate_application_authority(self, authority: Any) -> bool:
         from delivery_system.application_authority import ApplicationAuthority
@@ -1932,20 +2640,45 @@ class RuntimeApprovalAuthorityService:
                     return False
                 if self._authorities.get(values["authority_id"]) is not authority:
                     return False
+                issuance_id = self._authority_issuance_ids.get(values["authority_id"])
+                if not isinstance(issuance_id, str):
+                    return False
+                restart_provenance = self._restart_authority_provenance.get(values["authority_id"])
+                if restart_provenance is not None:
+                    if (self._live_credential_contexts.get((values["preview_id"], values["revision"])) is not None or
+                            self._has_registered_live_binding(values["credential_binding_id"])):
+                        return False
+                    if not restart_provenance.matches_authority(authority, issuance_id):
+                        return False
+                    persisted = None
+                else:
+                    persisted = self._authority_binding_store.load_authority_binding(
+                        self.context.workspace_identity, issuance_id,
+                    ) if self._authority_binding_store is not None else None
+                    if persisted is None or persisted.authority_issuance_id != issuance_id:
+                        return False
                 preview, audit = self._resolve_audit(values["preview_id"], values["revision"])
                 approval = self.store.get_approval(self.context.workspace_identity, values["approval_id"])
                 if not self.store.validate_approval_current(approval):
                     return False
                 if values["approval_digest"] != self._approval_digest(approval):
                     return False
-                binding = self.attestation_service.resolve_registered_binding(values["credential_binding_id"])
                 if values["audit_id"] != audit.audit_id or values["audit_digest"] != audit.audit_digest:
                     return False
-                if values["required_capabilities"] != tuple(binding.required_capabilities):
-                    return False
-                if values["granted_capabilities"] != tuple(binding.granted_capabilities):
-                    return False
-                if not set(values["required_capabilities"]).issubset(tuple(binding.granted_capabilities)):
+                if restart_provenance is not None:
+                    if (values["required_capabilities"] != restart_provenance.required_capabilities or
+                            values["granted_capabilities"] != restart_provenance.granted_capabilities or
+                            values["credential_binding_id"] != restart_provenance.credential_binding_id):
+                        return False
+                    granted_capabilities = restart_provenance.granted_capabilities
+                else:
+                    binding = self.attestation_service.resolve_registered_binding(values["credential_binding_id"])
+                    if values["required_capabilities"] != tuple(binding.required_capabilities):
+                        return False
+                    if values["granted_capabilities"] != tuple(binding.granted_capabilities):
+                        return False
+                    granted_capabilities = tuple(binding.granted_capabilities)
+                if not set(values["required_capabilities"]).issubset(granted_capabilities):
                     return False
                 if "issues:write" not in values["required_capabilities"]:
                     return False
@@ -1953,14 +2686,31 @@ class RuntimeApprovalAuthorityService:
                 if expiry <= self.clock().astimezone(timezone.utc):
                     return False
                 canonical = preview["canonical_payload"]
-                if any(values[field] != getattr(binding, field, None) for field in (
-                    "workspace_identity", "repository_identity", "preview_id", "revision", "plan_digest",
-                    "sealed_preview_digest", "operation_set_digest", "remote_snapshot_digest",
-                    "audit_id", "audit_digest", "credential_instance_id", "issuer_id",
-                    "credential_principal_identity", "github_subject_identity", "driver_identity",
-                    "remote_authority", "expires_at",
-                )):
-                    return False
+                if restart_provenance is None:
+                    if any(values[field] != getattr(binding, field, None) for field in (
+                        "workspace_identity", "repository_identity", "preview_id", "revision", "plan_digest",
+                        "sealed_preview_digest", "operation_set_digest", "remote_snapshot_digest",
+                        "audit_id", "audit_digest", "credential_instance_id", "issuer_id",
+                        "credential_principal_identity", "github_subject_identity", "driver_identity",
+                        "remote_authority", "expires_at",
+                    )):
+                        return False
+                identity = LogicalApplicationIdentity.from_authority(values)
+                canonical_operations = tuple(normalize_write_operations(canonical["operation_intents"]))
+                expected_operations = tuple(
+                    operation_identity(identity.application_id, index, operation)
+                    for index, operation in enumerate(canonical_operations)
+                )
+                expected_operations = tuple(sorted(expected_operations))
+                if restart_provenance is None:
+                    payload = persisted.payload
+                    if (payload.workspace_identity != self.context.workspace_identity or
+                            payload.application_id != identity.application_id or
+                            payload.credential_binding_id != values["credential_binding_id"] or
+                            payload.required_capabilities != tuple(values["required_capabilities"]) or
+                            payload.authority_issued_at != values["issued_at"] or
+                            payload.authorized_operation_identities != expected_operations):
+                        return False
                 return all(values[field] == canonical.get(field) for field in (
                     "workspace_identity", "repository_identity", "preview_id", "revision",
                     "sealed_preview_digest", "plan_digest", "operation_set_digest", "remote_snapshot_digest",
@@ -2402,6 +3152,30 @@ class RuntimeApplicationStatusService:
         return value
 
     @staticmethod
+    def _authority_binding_matches_execution(binding: Any, identity: Any,
+                                             continuity_anchor: Any, application_id: str) -> bool:
+        """Validate the authority semantics retained by the execution record."""
+        try:
+            values = identity.values()
+            if (
+                binding.application_id != application_id
+                or binding.github_subject_identity != values["github_subject_identity"]
+                or binding.driver_identity != values["driver_identity"]
+                or binding.remote_authority != values["remote_authority"]
+            ):
+                return False
+            if continuity_anchor.mode == "PRINCIPAL":
+                return binding.credential_principal_identity == continuity_anchor.values[0]
+            if continuity_anchor.mode == "LEGACY_INSTANCE":
+                return (
+                    binding.issuer_id == continuity_anchor.values[0]
+                    and binding.credential_instance_id == continuity_anchor.values[1]
+                )
+            return False
+        except (AttributeError, IndexError, KeyError, TypeError):
+            return False
+
+    @staticmethod
     def _validate_execution_state_invariants(state: Any, operations: tuple[dict[str, Any], ...]) -> None:
         try:
             from delivery_system.execution_store import _execution_timestamp
@@ -2490,7 +3264,13 @@ class RuntimeApplicationStatusService:
             if (index > completed or attempt.application_id != application_id or
                     attempt.identity.to_dict() != state.identity.to_dict() or
                     attempt.operation_identity != operation_id or
-                    self._plain(attempt.operation) != self._plain(operation)):
+                    self._plain(attempt.operation) != self._plain(operation) or
+                    attempt.request_identity != request_identity(operation_id) or
+                    attempt.driver_identity != state.identity.values()["driver_identity"] or
+                    attempt.remote_authority != state.identity.values()["remote_authority"] or
+                    not self._authority_binding_matches_execution(
+                        attempt.authority_binding, state.identity, state.continuity_anchor, application_id,
+                    )):
                 raise ValueError("attempt_integrity_invalid")
             if state.state == "Pending":
                 raise ValueError("state_integrity_invalid")
@@ -2543,8 +3323,12 @@ class RuntimeApplicationStatusService:
                     receipt.operation_identity != operation_id or
                     self._plain(receipt.canonical_operation) != self._plain(operations[index]) or
                     receipt.operation_index != index or
-                    receipt.operation_receipt_id != state.operation_receipt_refs[index]):
-                raise ValueError("state_integrity_invalid")
+                    receipt.operation_receipt_id != state.operation_receipt_refs[index] or
+                    receipt.request_identity != request_identity(operation_id) or
+                    not self._authority_binding_matches_execution(
+                        receipt.authority_binding, state.identity, state.continuity_anchor, application_id,
+                    )):
+                raise ValueError("receipt_integrity_invalid")
             try:
                 from delivery_system.execution_store import _execution_timestamp
                 receipt_started = _execution_timestamp(receipt.started_at)
@@ -2562,6 +3346,19 @@ class RuntimeApplicationStatusService:
                 "started_at": receipt.started_at,
                 "completed_at": receipt.completed_at,
             })
+        for index in range(state.next_operation_index, len(operations)):
+            operation_id = operation_identity(application_id, index, operations[index])
+            try:
+                self.execution_store.get_operation_receipt(application_id, operation_id)
+            except ValueError as exc:
+                code = str(exc)
+                if code == "operation_receipt_not_found":
+                    continue
+                if code in {"operation_receipt_invalid", "operation_receipt_binding_invalid",
+                            "receipt_binding_conflict", "workspace_mismatch", "receipt_integrity_invalid"}:
+                    raise ValueError("receipt_integrity_invalid") from None
+                raise ValueError("receipt_integrity_invalid") from None
+            raise ValueError("receipt_integrity_invalid")
         return receipts
 
     @staticmethod
@@ -2631,3 +3428,306 @@ class RuntimeApplicationStatusService:
             "completed_at": state.completed_at,
             "integrity_status": "verified",
         }
+
+
+class ApplicationPostconditionObservation:
+    """Runtime-owned, read-only observation of an OutcomeUnknown relationship."""
+
+    _RELATIONSHIP_KINDS = {
+        "add_sub_issue": "existing_parent",
+        "add_dependency": "existing_dependency",
+    }
+    _DEFAULT_QUERY_SCOPE = {
+        "api_origin": "https://api.github.com",
+        "api_version": "2026-03-10",
+        "issue_state": "all",
+        "pull_request_filter": "pull_request_field_excluded",
+        "relationships": ["sub_issues", "parent", "blocked_by", "blocking"],
+        "pagination_protocol": "link-header",
+        "budget_profile": "github-rest-offline-v1",
+    }
+    _REPOSITORY_FAILURES = frozenset({
+        "repository_identity_mismatch", "requested_repository_mismatch", "remote_identity_unknown",
+    })
+
+    def __init__(self, context: RuntimeContext, store: Any, execution_store: Any,
+                 driver: Any, trust_context: DriverTrustContext) -> None:
+        if (
+            not isinstance(context, RuntimeContext)
+            or store is None
+            or execution_store is None
+            or driver is None
+            or not isinstance(trust_context, DriverTrustContext)
+            or getattr(execution_store, "workspace_identity", None) != context.workspace_identity
+            or not callable(getattr(execution_store, "get_execution_bootstrap", None))
+            or not callable(getattr(execution_store, "get_execution", None))
+            or not callable(getattr(execution_store, "get_attempt", None))
+            or not callable(getattr(execution_store, "get_operation_receipt", None))
+            or not callable(getattr(execution_store, "get_application_receipt", None))
+            or not callable(getattr(store, "_read_preview_revision_for_status", None))
+            or not callable(getattr(driver, "read_repository", None))
+        ):
+            raise ValueError("application_reconciliation_boundary_unavailable")
+        store_trust = getattr(store, "trust_context", None)
+        if store_trust is not None and store_trust != trust_context:
+            raise ValueError("application_reconciliation_boundary_unavailable")
+        self.context = context
+        self.store = store
+        self.execution_store = execution_store
+        self.driver = driver
+        self.trust_context = trust_context
+        self._status = RuntimeApplicationStatusService(context, store, execution_store)
+
+    @staticmethod
+    def _raise_remote_failure(failures: Sequence[Any]) -> None:
+        if any(getattr(failure, "code", None) in ApplicationPostconditionObservation._REPOSITORY_FAILURES
+               for failure in failures):
+            raise ValueError("repository_identity_mismatch")
+        raise ValueError("remote_observation_unavailable")
+
+    def _query_scope(self) -> dict[str, object]:
+        candidate = getattr(self.driver, "fixed_query_scope", None)
+        if candidate is None:
+            candidate = self._DEFAULT_QUERY_SCOPE
+        if not isinstance(candidate, Mapping) or not candidate:
+            raise ValueError("application_reconciliation_boundary_unavailable")
+        try:
+            return deepcopy(dict(candidate))
+        except (TypeError, ValueError):
+            raise ValueError("application_reconciliation_boundary_unavailable") from None
+
+    @staticmethod
+    def _load_operation_receipt(execution_store: Any, application_id: str, operation_id: str) -> Any:
+        try:
+            return execution_store.get_operation_receipt(application_id, operation_id)
+        except ValueError as exc:
+            code = str(exc)
+            if code == "operation_receipt_not_found":
+                raise ValueError("operation_receipt_not_found") from None
+            if code in {
+                "receipt_integrity_invalid", "operation_receipt_invalid",
+                "operation_receipt_binding_invalid", "workspace_mismatch",
+            }:
+                raise ValueError("receipt_integrity_invalid") from None
+            if code in {"receipt_binding_conflict", "application_binding_conflict"}:
+                raise ValueError("reconciliation_correlation_invalid") from None
+            raise ValueError("receipt_integrity_invalid") from None
+        except (TypeError, KeyError, json.JSONDecodeError):
+            raise ValueError("receipt_integrity_invalid") from None
+
+    @staticmethod
+    def _receipt_operand(receipt: Any, application_id: str, identity: Any,
+                         operation_id: str, operation_index: int,
+                         operation: Mapping[str, Any], repository: str) -> Any:
+        if (
+            receipt.application_id != application_id
+            or receipt.identity.to_dict() != identity.to_dict()
+            or receipt.operation_identity != operation_id
+            or receipt.operation_index != operation_index
+            or RuntimeApplicationStatusService._plain(receipt.canonical_operation) != dict(operation)
+            or receipt.authority_binding.application_id != application_id
+            or receipt.authority_binding.driver_identity != identity.values()["driver_identity"]
+            or receipt.authority_binding.remote_authority != identity.values()["remote_authority"]
+        ):
+            raise ValueError("reconciliation_correlation_invalid")
+        remote = receipt.remote_result
+        if not isinstance(remote, Mapping) or set(remote) != {"result_kind", "result_identity", "result_digest", "result_payload"}:
+            raise ValueError("receipt_integrity_invalid")
+        payload = remote.get("result_payload")
+        if isinstance(payload, Mapping) and payload.get("repository_identity") != repository:
+            raise ValueError("repository_identity_mismatch")
+        if remote.get("result_kind") != "github.create_issue.v1":
+            raise ValueError("reconciliation_correlation_invalid")
+        if (
+            not isinstance(payload, Mapping)
+            or set(payload) != {
+                "repository_identity", "issue_number", "numeric_issue_id", "node_id",
+                "executor_identity", "contract_version", "response_status",
+            }
+            or type(payload.get("issue_number")) is not int
+            or payload["issue_number"] < 1
+            or type(payload.get("numeric_issue_id")) is not str
+            or not re.fullmatch(r"[1-9][0-9]{0,19}", payload["numeric_issue_id"])
+            or type(payload.get("node_id")) is not str
+            or not payload["node_id"].strip()
+            or payload.get("executor_identity") != "delivery-system:github-rest-write-v1"
+            or type(payload.get("contract_version")) is not str
+            or payload.get("response_status") != 201
+            or remote.get("result_identity") != "github-issue:" + payload["node_id"]
+            or remote.get("result_digest") != digest(dict(payload))
+        ):
+            raise ValueError("receipt_integrity_invalid")
+        from delivery_system.drivers.write_contract import RemoteIssueReference
+        try:
+            return RemoteIssueReference(
+                payload["repository_identity"], payload["issue_number"],
+                payload["numeric_issue_id"], payload["node_id"],
+            )
+        except (TypeError, ValueError, KeyError):
+            raise ValueError("receipt_integrity_invalid") from None
+
+    def _resolve_operands(self, identity: Any, operations: tuple[dict[str, Any], ...],
+                          operation_index: int, operation: Mapping[str, Any]) -> tuple[Any, Any]:
+        refs = operation.get("client_refs")
+        if (
+            operation.get("operation_kind") not in self._RELATIONSHIP_KINDS
+            or not isinstance(refs, list)
+            or len(refs) != 2
+            or refs[0] == refs[1]
+        ):
+            raise ValueError("reconciliation_correlation_invalid")
+        resolved = []
+        for client_ref in refs:
+            matches = [
+                (index, candidate)
+                for index, candidate in enumerate(operations[:operation_index])
+                if candidate.get("operation_kind") == "create_issue"
+                and candidate.get("client_refs") == [client_ref]
+            ]
+            if not matches:
+                raise ValueError("operation_receipt_not_found")
+            if len(matches) != 1:
+                raise ValueError("reconciliation_correlation_invalid")
+            create_index, create_operation = matches[0]
+            create_id = operation_identity(identity.application_id, create_index, create_operation)
+            receipt = self._load_operation_receipt(self.execution_store, identity.application_id, create_id)
+            resolved.append(self._receipt_operand(
+                receipt, identity.application_id, identity, create_id, create_index,
+                create_operation, identity.values()["repository_identity"],
+            ))
+        if resolved[0] == resolved[1]:
+            raise ValueError("reconciliation_correlation_invalid")
+        return resolved[0], resolved[1]
+
+    def _read_observation(self, repository: str, binding: RuntimeEvidenceBinding) -> Any:
+        query_scope = self._query_scope()
+        try:
+            facts, failures = validate_driver_facts(
+                self.driver, repository, query_scope,
+                self.trust_context.trusted_driver_identity,
+            )
+        except Exception:
+            raise ValueError("remote_observation_unavailable") from None
+        if failures or facts is None:
+            self._raise_remote_failure(failures)
+        response = facts.response
+        try:
+            canonical = normalize_repository_identity(response.canonical_repository)
+        except (TypeError, ValueError):
+            raise ValueError("repository_identity_mismatch") from None
+        if canonical != repository:
+            raise ValueError("repository_identity_mismatch")
+        for record in response.issue_records:
+            if not isinstance(record, Mapping):
+                raise ValueError("remote_observation_unavailable")
+            try:
+                if normalize_repository_identity(record.get("repository_identity")) != repository:
+                    raise ValueError("repository_identity_mismatch")
+            except (TypeError, ValueError) as exc:
+                if str(exc) == "repository_identity_mismatch":
+                    raise
+                raise ValueError("repository_identity_mismatch") from None
+        try:
+            bound = bind_validated_facts(facts, binding, self.trust_context)
+        except ValueError as exc:
+            if str(exc) in {"remote_issue_repository_identity_mismatch", "repository_identity_mismatch"}:
+                raise ValueError("repository_identity_mismatch") from None
+            raise ValueError("remote_observation_unavailable") from None
+        except (TypeError, KeyError):
+            raise ValueError("remote_observation_unavailable") from None
+        return bound.snapshot
+
+    def _observe(self, application_id: str) -> dict[str, Any]:
+        self._status._validate_application_id(application_id)
+        identity = self._status._load_initial_records(application_id)
+        if identity.application_id != application_id:
+            raise ValueError("application_binding_conflict")
+        values = identity.values()
+        if values.get("remote_authority") != self.trust_context.remote_authority:
+            raise ValueError("application_reconciliation_boundary_unavailable")
+        operations = self._status._load_preview_operations(identity)
+        state = self._status._load_execution(application_id, operations)
+        if state.application_id != application_id or state.identity.to_dict() != identity.to_dict():
+            raise ValueError("application_binding_conflict")
+        self._status._validate_execution_state_invariants(state, operations)
+        if state.state != "OutcomeUnknown":
+            raise ValueError("application_reconciliation_state_invalid")
+        if self._status._load_application_receipt(application_id) is not None:
+            raise ValueError("application_receipt_integrity_invalid")
+        self._status._project_attempts(application_id, state, operations)
+
+        index = state.next_operation_index
+        operation = operations[index]
+        operation_id = operation_identity(application_id, index, operation)
+        if state.current_attempt_id != operation_id:
+            raise ValueError("attempt_integrity_invalid")
+        try:
+            attempt = self.execution_store.get_attempt(application_id, state.current_attempt_id)
+        except ValueError as exc:
+            code = str(exc)
+            if code == "operation_attempt_not_found":
+                raise ValueError("operation_attempt_not_found") from None
+            raise ValueError("attempt_integrity_invalid") from None
+        except (TypeError, KeyError, json.JSONDecodeError):
+            raise ValueError("attempt_integrity_invalid") from None
+        if (
+            attempt.application_id != application_id
+            or attempt.identity.to_dict() != identity.to_dict()
+            or attempt.operation_index != index
+            or attempt.operation_identity != operation_id
+            or RuntimeApplicationStatusService._plain(attempt.operation) != operation
+            or attempt.request_identity != request_identity(operation_id)
+            or attempt.state != "OutcomeUnknown"
+            or attempt.authority_binding.application_id != application_id
+            or attempt.authority_binding.driver_identity != values["driver_identity"]
+            or attempt.authority_binding.remote_authority != values["remote_authority"]
+        ):
+            raise ValueError("attempt_integrity_invalid")
+        if operation["operation_kind"] == "create_issue":
+            raise ValueError("reconciliation_operation_unsupported")
+        self._status._project_operation_receipts(application_id, state, operations)
+        first, second = self._resolve_operands(identity, operations, index, operation)
+        repository = normalize_repository_identity(values["repository_identity"])
+        snapshot = self._read_observation(
+            repository,
+            RuntimeEvidenceBinding(values["workspace_identity"], values["preview_id"], values["revision"]),
+        )
+        expected_kind = self._RELATIONSHIP_KINDS[operation["operation_kind"]]
+        relationships = [
+            (record.relationship_type, record.source_issue_id, record.target_issue_id)
+            for record in snapshot.relationship_records
+        ]
+        if len(relationships) != len(set(relationships)):
+            raise ValueError("remote_evidence_contradictory")
+        expected = (expected_kind, first.node_id, second.node_id)
+        relevant = [
+            record for record in relationships
+            if {record[1], record[2]} == {first.node_id, second.node_id}
+        ]
+        if any(record != expected for record in relevant):
+            raise ValueError("remote_evidence_contradictory")
+        issue_ids = {issue.issue_id for issue in snapshot.issue_records if issue.item_type == "issue"}
+        if first.node_id not in issue_ids or second.node_id not in issue_ids:
+            postcondition = "inconclusive"
+        else:
+            postcondition = "postcondition_confirmed" if expected in relevant else "postcondition_absent"
+        observed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        return {
+            "application_id": application_id,
+            "operation_index": index,
+            "operation_identity": operation_id,
+            "operation_kind": operation["operation_kind"],
+            "postcondition": postcondition,
+            "causal_attribution": "not_established",
+            "observed_at": observed_at,
+            "state": "OutcomeUnknown",
+            "integrity_status": "verified",
+        }
+
+    def observe(self, application_id: str) -> dict[str, Any]:
+        try:
+            return self._observe(application_id)
+        except ValueError:
+            raise
+        except Exception:
+            raise ValueError("state_integrity_invalid") from None
