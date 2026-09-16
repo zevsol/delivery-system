@@ -334,6 +334,17 @@ class ApplicationPostconditionObservationOutput(StrictModel):
     integrity_status: Literal["verified"]
 
 
+def _runtime_plan_payload(payload: PreviewRequestInput) -> dict[str, Any]:
+    """Project MCP input into the Runtime plan shape without optional null claims."""
+    plan = payload.plan.model_dump()
+    repository_claim = plan.get("repository_claim")
+    if isinstance(repository_claim, dict) and repository_claim.get("url") is None:
+        normalized_claim = dict(repository_claim)
+        normalized_claim.pop("url", None)
+        plan["repository_claim"] = normalized_claim
+    return plan
+
+
 def _production_clock() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -383,7 +394,7 @@ def create_server(context: RuntimeContext | None = None, store: Any | None = Non
         service = RuntimePlanner(context, store, driver, trust_context)
         if store is None:
             raise ValueError("store_unavailable")
-        return PreviewOutput.model_validate(service.preview(payload.plan.model_dump(), payload.previous_preview_id))
+        return PreviewOutput.model_validate(service.preview(_runtime_plan_payload(payload), payload.previous_preview_id))
 
     @mcp.tool(
         name="delivery_get_audit_context",

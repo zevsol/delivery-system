@@ -40,6 +40,62 @@ def plan_payload(repository_claim=None):
     return {"repository_claim": repository_claim, "work_items": [item]}
 
 
+def v1_plan_payload(repository_claim=None):
+    sourced_fields = {
+        "role": sourced("Integration Evidence"),
+        "title": sourced("[Integration Evidence] V1-INT1 first live approved write"),
+        "context_problem": sourced("The Delivery System V1 GitHub Issue write path has not yet been validated against a real personal repository."),
+        "outcome": sourced("Validate one approved production-native create_issue mutation, durable receipts, and an independent remote postcondition."),
+        "scope": sourced(["zevsol/delivery-system-integration-test"]),
+        "non_goals": sourced([
+            "Modify any existing Issue",
+            "Create a second Issue",
+            "Create sub-issue or dependency relationships",
+            "Write to any other repository",
+            "Automatic retry",
+            "Automatic reconciliation",
+            "Automatic cleanup",
+        ]),
+        "acceptance_criteria": sourced([
+            "Exactly one create_issue operation is dispatched.",
+            "The application reaches Applied.",
+            "One immutable operation receipt and one immutable application receipt are persisted.",
+            "An authenticated post-write read observes the returned Issue number with the exact approved title.",
+            "No existing Issue or relationship is modified.",
+            "The resulting Issue is retained as durable integration evidence.",
+        ]),
+        "verification": sourced([
+            "ApplyResult.state is Applied and next_operation_index is 1.",
+            "Operation and application receipt integrity validation succeeds.",
+            "The returned Issue identity matches the definitive write observation.",
+            "The post-write Issue set equals the pre-write set plus exactly one new Issue.",
+        ]),
+        "required_capabilities": sourced(["issues"]),
+        "write_metadata": sourced({
+            "automatic_cleanup": "PROHIBITED",
+            "automatic_reconciliation": "PROHIBITED",
+            "automatic_retry": "PROHIBITED",
+            "delivery_system_source_head": "114e5e6d1a17b8000f406ba7b1677b9fcc076178",
+            "maximum_github_mutations": 1,
+            "operation": "create_issue",
+            "relationship_operations": 0,
+            "retention": "Retain the resulting Issue as durable integration evidence.",
+            "target_repository": "zevsol/delivery-system-integration-test",
+            "target_repository_id": "1333027111",
+        }),
+    }
+    return {
+        "repository_claim": repository_claim,
+        "work_items": [{"client_ref": "h9-first-live-issue", **sourced_fields}],
+        "planned_relationships": [],
+        "operation_intents": [{
+            "operation_kind": "create_issue",
+            "client_refs": ["h9-first-live-issue"],
+            "depends_on": [],
+        }],
+    }
+
+
 class McpSdkContractTests(unittest.TestCase):
     def run_async(self, coroutine):
         return asyncio.run(coroutine)
@@ -86,6 +142,62 @@ class McpSdkContractTests(unittest.TestCase):
 
             result = self.run_async(exercise())
             self.assertIn("driver_unavailable", result.structured_content["blockers"])
+
+    def _preview_via_mcp(self, repository_claim, payload_factory=plan_payload):
+        with tempfile.TemporaryDirectory() as directory:
+            context = RuntimeContext.from_workspace_root(directory)
+            server = create_server(context, InMemoryPreviewStore())
+
+            async def exercise():
+                async with Client(server, raise_exceptions=True) as client:
+                    return await client.call_tool(
+                        "delivery_plan_preview",
+                        {"payload": {"plan": payload_factory(repository_claim)}},
+                    )
+
+            result = self.run_async(exercise())
+            self.assertFalse(result.is_error)
+            return result.structured_content
+
+    def test_repository_claim_optional_url_matches_direct_runtime_semantics(self):
+        repository_claim = {"owner": "o", "name": "r"}
+        with tempfile.TemporaryDirectory() as directory:
+            context = RuntimeContext.from_workspace_root(directory)
+            direct = RuntimePlanner(context, InMemoryPreviewStore()).preview(plan_payload(repository_claim))
+        mcp_preview = self._preview_via_mcp(repository_claim)
+        self.assertEqual(mcp_preview["plan_digest"], direct["plan_digest"])
+        self.assertEqual(mcp_preview["semantic_payload"]["repository_claim"], repository_claim)
+        self.assertNotIn("url", mcp_preview["semantic_payload"]["repository_claim"])
+
+    def test_omitted_and_explicit_null_repository_url_are_semantically_equal(self):
+        omitted = self._preview_via_mcp({"owner": "o", "name": "r"})
+        explicit_null = self._preview_via_mcp({"owner": "o", "name": "r", "url": None})
+        self.assertEqual(
+            omitted["semantic_payload"]["repository_claim"],
+            explicit_null["semantic_payload"]["repository_claim"],
+        )
+        self.assertEqual(omitted["plan_digest"], explicit_null["plan_digest"])
+        self.assertEqual(omitted["operation_set_digest"], explicit_null["operation_set_digest"])
+
+    def test_non_null_repository_url_is_preserved_in_runtime_semantics(self):
+        url = "https://example.test/repository"
+        preview = self._preview_via_mcp({"owner": "o", "name": "r", "url": url})
+        self.assertEqual(preview["semantic_payload"]["repository_claim"]["url"], url)
+
+    def test_historical_v1_plan_digest_excludes_omitted_repository_url(self):
+        repository_claim = {"owner": "zevsol", "name": "delivery-system-integration-test"}
+        with tempfile.TemporaryDirectory() as directory:
+            context = RuntimeContext.from_workspace_root(directory)
+            direct = RuntimePlanner(context, InMemoryPreviewStore()).preview(v1_plan_payload(repository_claim))
+            legacy_mcp_shape = PreviewRequestInput.model_validate({"plan": v1_plan_payload(repository_claim)}).plan.model_dump()
+            legacy = RuntimePlanner(context, InMemoryPreviewStore()).preview(legacy_mcp_shape)
+        mcp_preview = self._preview_via_mcp(repository_claim, v1_plan_payload)
+        self.assertEqual(direct["plan_digest"], "sha256:b41bb0da51873a284e61457c6eb3233bd57bed269095b8167b9bb58713f4bf80")
+        self.assertEqual(mcp_preview["plan_digest"], direct["plan_digest"])
+        self.assertEqual(legacy["plan_digest"], "sha256:d45f3d7ffa43625441faf863862d17c53f5bc1d97adffff54f301125643dba1f")
+        self.assertEqual(direct["operation_set_digest"], "sha256:7fe09348ecc9d2f3354cb0ce8af48714d47e30a031d83b2ba3c8cc41127f815a")
+        self.assertEqual(mcp_preview["operation_set_digest"], direct["operation_set_digest"])
+        self.assertEqual(legacy["operation_set_digest"], direct["operation_set_digest"])
 
     def test_preview_lineage_inherits_request_and_item_id_from_store(self):
         with tempfile.TemporaryDirectory() as directory:
