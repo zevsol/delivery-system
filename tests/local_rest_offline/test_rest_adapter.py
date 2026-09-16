@@ -37,7 +37,7 @@ class LocalRestOfflineTests(unittest.TestCase):
 
     def test_fixed_read_only_endpoints_and_node_id_relationships(self):
         repo = {"id": 9, "node_id": "R9", "full_name": "Owner/Repo", "visibility": "private", "permissions": {"pull": True}}
-        issue = {"id": 1, "node_id": "I1", "number": 1, "title": "Existing", "updated_at": "2026-08-13T00:00:00+00:00", "repository_url": "https://api.github.com/repos/Owner/Repo"}
+        issue = {"id": 1, "node_id": "I1", "number": 1, "title": "Existing", "updated_at": "2026-08-13T00:00:00+00:00", "repository_url": "https://api.github.com/repos/Owner/Repo", "body": "Existing body"}
         responses = {
             "/user": {"id": 7, "node_id": "U7", "login": "owner"},
             "/repos/owner/repo": repo,
@@ -55,9 +55,26 @@ class LocalRestOfflineTests(unittest.TestCase):
             "pagination_protocol": "link-header", "budget_profile": "github-rest-offline-v1",
         })
         self.assertEqual(result.issue_records[0]["issue_id"], "I1")
+        self.assertEqual(result.issue_records[0]["body"], "Existing body")
         self.assertEqual([call[0] for call in transport.calls], ["GET"] * len(transport.calls))
         self.assertEqual(result.authenticated_user_node_id, "U7")
         self.assertEqual(result.remote_repository_node_id, "R9")
+
+    def test_issue_body_optional_projection_and_type_validation(self):
+        issue = {
+            "id": 1, "node_id": "I1", "number": 1, "title": "Existing",
+            "updated_at": "2026-08-13T00:00:00+00:00",
+            "repository_url": "https://api.github.com/repos/Owner/Repo",
+        }
+        self.assertEqual(
+            LocalRestReadOnlyDriver._issue("Owner/Repo", {**issue, "body": "Markdown **body**"})["body"],
+            "Markdown **body**",
+        )
+        self.assertIn("body", LocalRestReadOnlyDriver._issue("Owner/Repo", {**issue, "body": None}))
+        self.assertIsNone(LocalRestReadOnlyDriver._issue("Owner/Repo", {**issue, "body": None})["body"])
+        self.assertNotIn("body", LocalRestReadOnlyDriver._issue("Owner/Repo", issue))
+        with self.assertRaisesRegex(RestDriverError, "driver_response_invalid"):
+            LocalRestReadOnlyDriver._issue("Owner/Repo", {**issue, "body": {"not": "text"}})
 
     def test_pull_requests_are_filtered_at_adapter_boundary(self):
         issue = {"id": 1, "node_id": "I1", "number": 1, "title": "Existing", "updated_at": "2026-08-13T00:00:00+00:00", "repository_url": "https://api.github.com/repos/Owner/Repo"}

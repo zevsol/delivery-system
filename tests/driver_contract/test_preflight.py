@@ -100,6 +100,21 @@ class DriverContractTests(unittest.TestCase):
         self.assertEqual(result.evidence_records[0].source_identity, TRUSTED_IDENTITY)
         self.assertEqual(result.snapshot.evidence_ids, (result.evidence_records[0].evidence_id,))
 
+    def test_verified_driver_evidence_preserves_issue_body(self):
+        issue = dict(response().issue_records[0], body="Evidence body")
+        candidate = response(
+            issue_records=(issue,),
+            evidence_material=(material((issue,), ()),),
+        )
+        result = run(PreflightFakeDriver(candidate))
+        self.assertTrue(result.passed)
+        evidence_issue = result.evidence_records[0].payload["issue_records"][0]
+        self.assertEqual(evidence_issue["body"], "Evidence body")
+        self.assertNotIn("Authorization", evidence_issue)
+        self.assertNotIn("token", evidence_issue)
+        round_tripped = EvidenceRecord.from_dict(result.evidence_records[0].to_dict())
+        self.assertEqual(round_tripped.payload["issue_records"][0]["body"], "Evidence body")
+
     def test_same_input_is_deterministic(self):
         first = run(PreflightFakeDriver(response())).to_dict()
         second = run(PreflightFakeDriver(response())).to_dict()

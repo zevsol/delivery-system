@@ -269,6 +269,10 @@ class LocalRestReadOnlyDriver(ReadOnlyDriver):
         required = ("id", "node_id", "number", "title", "updated_at", "repository_url")
         if any(key not in raw for key in required) or not all(raw.get(key) is not None for key in required):
             raise RestDriverError("driver_response_invalid")
+        body_present = "body" in raw
+        body = raw.get("body")
+        if body_present and body is not None and not isinstance(body, str):
+            raise RestDriverError("driver_response_invalid")
         try:
             number = int(raw["number"])
         except (TypeError, ValueError) as exc:
@@ -278,12 +282,15 @@ class LocalRestReadOnlyDriver(ReadOnlyDriver):
         expected_url = API_ORIGIN + "/repos/" + repository
         if str(raw["repository_url"]).rstrip("/").lower() != expected_url.lower():
             raise RestDriverError("relationship_scope_invalid")
-        return {
+        normalized = {
             "issue_id": str(raw["node_id"]), "numeric_id": str(raw["id"]), "node_id": str(raw["node_id"]),
             "number": number, "item_type": "issue", "title": raw["title"],
             "updated_at": str(raw["updated_at"]), "repository_identity": repository,
             "repository_url": str(raw["repository_url"]),
         }
+        if body_present:
+            normalized["body"] = body
+        return normalized
 
     def _read_repository_after_auth(
         self,

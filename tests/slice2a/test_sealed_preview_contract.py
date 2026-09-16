@@ -252,6 +252,20 @@ class Slice2ASealedPreviewTests(unittest.TestCase):
         changed = TypedRemoteSnapshot.from_records(**{**kwargs, "permissions": {"issues:read": False}}, observed_at="2026-01-02T00:00:00+00:00")
         self.assertNotEqual(first.digest(), changed.digest())
 
+    def test_remote_snapshot_v1_ignores_driver_issue_body(self):
+        issue = {"issue_id": "1", "item_type": "issue", "title": "Issue", "updated_at": "2026-01-01T00:00:00+00:00", "repository_identity": "owner/repo"}
+        kwargs: dict[str, Any] = dict(
+            repository_identity="owner/repo", query_scope={"state": "open"},
+            query_complete=True, pagination_complete=True,
+            permissions={"issues:read": True}, capabilities=["issues"],
+            relationship_records=[],
+        )
+        bodyless = TypedRemoteSnapshot.from_records(**kwargs, issue_records=[issue])
+        bodyful = TypedRemoteSnapshot.from_records(**kwargs, issue_records=[{**issue, "body": "Evidence body"}])
+        self.assertEqual(bodyless.schema_version, "remote-snapshot-v1")
+        self.assertEqual(bodyful.to_dict(), bodyless.to_dict())
+        self.assertEqual(bodyful.digest(), bodyless.digest())
+
     def test_sqlite_persists_canonical_payload_and_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             context = RuntimeContext.from_workspace_root(directory)
