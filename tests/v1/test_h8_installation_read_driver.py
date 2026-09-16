@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 import inspect
 import json
@@ -12,6 +13,7 @@ from unittest.mock import patch
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519, rsa
+from mcp import Client
 
 from delivery_system.attestation_runtime import _subject_from_payload
 from delivery_system.drivers.contract import DriverTrustContext, RuntimeEvidenceBinding
@@ -26,7 +28,8 @@ from delivery_system.host_composition import (
     _LeaseReadAuthView,
     compose_write_enabled_host,
 )
-from delivery_system.runtime import RuntimeContext
+from delivery_system.runtime import InMemoryPreviewStore, RuntimeContext
+from mcp_server.server import create_server
 
 from tests.v1.test_h4_host_composition import (
     APP_ID,
@@ -179,6 +182,47 @@ class InstallationDriverTests(unittest.TestCase):
         self.assertIsNone(result.authenticated_user_node_id)
         self.assertIsNone(result.authenticated_login)
         self.assertTrue(all(method == "GET" for method, _, _ in transport.calls))
+
+    def test_issue_body_flows_through_mcp_audit_context_without_extra_read(self) -> None:
+        responses = self._responses()
+        responses["/repos/owner/repo/issues?state=all&per_page=100"][0]["body"] = "Evidence body"
+        transport = FakeTransport(responses)
+        driver = GitHubAppInstallationReadOnlyDriver(FakeAuthProvider(), REPOSITORY_ID, transport=transport)
+        trust = DriverTrustContext(driver.trusted_driver_identity, driver.origin, driver.contract_version)
+
+        def sourced(value):
+            return {"value": value, "declared_source": "user_asserted"}
+
+        plan = {
+            "repository_claim": {"owner": "Owner", "name": "Repo"},
+            "work_items": [{
+                "client_ref": "item", "role": sourced("Evidence"), "title": sourced("Existing"),
+                "context_problem": sourced("Problem"), "outcome": sourced("Outcome"),
+                "scope": sourced(["repo"]), "non_goals": sourced([]),
+                "acceptance_criteria": sourced(["Works"]), "verification": sourced(["Test"]),
+                "required_capabilities": sourced(["issues"]), "write_metadata": sourced({}),
+            }],
+            "planned_relationships": [], "operation_intents": [],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            context = RuntimeContext.from_workspace_root(directory)
+            store = InMemoryPreviewStore(context.workspace_identity, trust)
+            server = create_server(context, store, driver, trust)
+
+            async def exercise():
+                async with Client(server, raise_exceptions=True) as client:
+                    preview = await client.call_tool("delivery_plan_preview", {"payload": {"plan": plan}})
+                    audit_context = await client.call_tool("delivery_get_audit_context", {"payload": {
+                        "preview_id": preview.structured_content["preview_id"], "revision": 1,
+                    }})
+                    return audit_context
+
+            result = asyncio.run(exercise())
+        self.assertFalse(result.is_error)
+        driver_evidence = next(item for item in result.structured_content["evidence_records"] if item["source_kind"] == "driver")
+        self.assertEqual(driver_evidence["payload"]["issue_records"][0]["body"], "Evidence body")
+        self.assertEqual(len(transport.calls), 7)
+        self.assertNotIn("/issues/1/body", [path for _, path, _ in transport.calls])
 
     def test_unusable_installation_tokens_fail_before_transport(self) -> None:
         for label, token in (("none", None), ("empty", ""), ("spaces", "   "), ("padded", " token ")):
