@@ -4,6 +4,11 @@ Delivery System is a governed software-delivery control system for AI-assisted d
 
 V1 is intentionally bounded to GitHub Issues and their relationships through an explicit Plan → Audit → Approve → Apply workflow.
 
+## Maintainer references
+
+- [Architecture and lifecycle](docs/architecture-and-lifecycle.md)
+- [Debt register](docs/debt-register.md)
+
 It provides a structured planning protocol with:
 
 - explicit User-asserted, model-proposed, and model-assumption values;
