@@ -56,6 +56,10 @@ A roadmap item, TODO, old Finding, design idea, or historical next action is not
 * Explicit current user instructions override the brief. When an approved decision or checkpoint changes, update the brief in the same work unit when that update is authorized and useful.
 * The brief informs development but is not a public artifact, Runtime input, remote fact source, executable contract, or substitute for tests.
 
+## Deferred work
+
+Material deferred work affecting security, compatibility, lifecycle, release readiness, operator behavior, or future design constraints must have a durable debt record. It may not exist only in chat history, old Findings, TODO prose, or “later”. Recording debt does not authorize implementation.
+
 ## Baseline gate
 
 Before any work unit that may modify project files, dependencies, Git state, databases, or external systems:
@@ -139,6 +143,8 @@ Never fabricate or guess:
 * Git history;
 * approval state.
 
+Before authoring or implementing exact work that depends on an existing internal API, data model, persisted schema, payload, identity, DB path, Runtime service, Host/MCP composition, or execution lifecycle, inspect the current locked implementation. Historical notes, memory, naming similarity, and old runner code are not sufficient evidence of the current contract.
+
 Do not turn an inability to prove correctness into a permissive fallback.
 
 When temporary exploratory changes are necessary, do not leave knowingly invalid or half-completed tracked state at the end of the work unit. Preserve unrelated user changes and never use broad reset or clean operations to achieve this.
@@ -166,6 +172,8 @@ Environment, build, dependency, lock, and tooling failures must not be “fixed�
 
 If the responsible layer cannot yet be proven, perform bounded diagnosis before repair.
 
+For a diagnostic, migration, integration runner, or test that claims to exercise the current checkout, prove that loaded project modules originate from that checkout when execution source could be ambiguous. Interpreter path, cwd, and Git HEAD alone are insufficient. Ordinary repository-local unit tests do not require ceremonial provenance logging unless execution source is ambiguous.
+
 ## Vertical work units
 
 Every implementation work unit must define:
@@ -176,6 +184,8 @@ Every implementation work unit must define:
 * explicit non-goals and side-effect boundaries;
 * deterministic completion evidence;
 * the next user-visible validation level.
+
+When a work unit creates durable intermediate state or authority for a later phase, prove that the next required phase remains legally and technically reachable after the proposed boundary. If it depends on a live Host, session, or capability and no recovery path exists, keep dependent phases within that lifecycle or stop for authorization.
 
 A work unit must not exist solely to introduce another abstraction layer, schema family, placeholder module, or future architecture.
 
@@ -237,6 +247,8 @@ Invalidate and rerun affected evidence when relevant code, tests, dependencies, 
 
 Do not reuse evidence merely because a test passed somewhere in historical project records.
 
+Evidence needed to support an integration or diagnostic claim must survive generation, required local persistence, interpretation, and report handoff before cleanup. If safe retained evidence survives a failed handoff, reuse it instead of rerunning an expensive or remote operation.
+
 ## Validation strategy
 
 Use the smallest applicable validation set while preserving confidence:
@@ -251,6 +263,8 @@ Do not rerun a full suite when still-valid full-suite evidence already covers th
 
 Do not manufacture test layers that the current work cannot honestly execute.
 
+Prefer existing production contracts, native counters, status surfaces, and telemetry when sufficient to establish diagnostic evidence. Do not wrap, monkey-patch, replace, or reimplement a production boundary solely for observation or accounting when doing so can alter the behavior measured. When external instrumentation is necessary, keep it behavior-preserving, bounded to the authorized diagnostic scope, and independently validate the instrumentation path before relying on its evidence.
+
 Do not describe a suite as clean when collection errors, skipped required validators, environment failures, or unexecuted required paths prevent that claim.
 
 ## Review discipline
@@ -263,9 +277,14 @@ Do not describe a suite as clean when collection errors, skipped required valida
 * A Finding marked Closed, Superseded, Deferred, or Misattributed must not be reopened without new evidence.
 * A closure review proves only its named contract and evidence level.
 
+After a material Blocked outcome, repeated failure, escaped assumption, integration anomaly, architecture discovery, or milestone/closure review, consider why process did not catch it earlier, where the failure class could recur, and whether a rule, check, documentation owner, operator procedure, test, or automation is warranted. This assessment does not expand the active work unit.
+
+When a durable improvement is warranted outside authorization, surface a Governance Finding using the smallest applicable category: execution mistake, missing project knowledge, architecture/documentation ownership gap, missing verification, missing operator procedure, governance/process gap, automation/tooling opportunity, deferred product debt, or deferred architecture debt.
+
 ## Environment and build discipline
 
 * Keep project behavior, dependency contracts, build tooling, installer behavior, and host environment concerns distinct.
+* Production/operator configuration assumptions necessary to reproduce a Host must have a durable owner. They must not exist solely in disposable runner scripts or ambient shell state. The owner may define a configuration format only when that format is separately authorized.
 * Do not install or mutate global or user-level tools or packages unless explicitly authorized.
 * Prefer temporary isolated environments for dependency, build, installation, and compatibility verification.
 * `[build-system].requires` is a build-time contract and must not be silently promoted into Runtime dependencies.
@@ -312,6 +331,8 @@ Do not rewrite branch history, rebase, cherry-pick, merge, delete the branch, or
 ## Checkpoint and handoff discipline
 
 A checkpoint records where the project is now, not the full story of how it arrived there.
+
+Diagnostic evidence required for a claimed result follows the same handoff discipline: retain it through generation, persistence, interpretation, and report handoff; clean it only after durable handoff or under separate authorization.
 
 At an approved checkpoint, retain enough state to recover:
 
