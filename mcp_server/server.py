@@ -544,8 +544,9 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     context = RuntimeContext.from_workspace_root(args.workspace_root)
     if args.host_profile == "github-app-write":
-        from delivery_system.host_composition import compose_write_enabled_host
-        compose_write_enabled_host(context).create_server().run()
+        from delivery_system.host_composition import compose_write_enabled_host, load_host_configuration
+        configuration = load_host_configuration()
+        compose_write_enabled_host(context, configuration=configuration).create_server().run()
         return
     store = SQLitePreviewStore(context)
     create_server(context, store).run()

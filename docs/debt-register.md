@@ -26,15 +26,6 @@ Every entry has Category, Status, Risk, Why deferred / rationale, Constraints pr
 
 ## Open and deferred entries
 
-### GOV-HOSTCFG-01 — Durable Host configuration contract
-- Category: Operator; Status: Open; Risk: High
-- Why deferred / rationale: Composition validates supplied inputs, but no durable operator-facing configuration/start mechanism owns reproducibility.
-- Constraints preserved: Do not expose secrets or prescribe a format before authorization.
-- Evidence/reference: `delivery_system/host_composition.py`; V1-INT1 retained evidence family.
-- Reconsideration trigger: Next live Host workflow.
-- Review point: Before next feature requiring production Host operation.
-- Decision/owner state: Architecture/operator decision required.
-
 ### GOV-DIAG-TELEMETRY-01 — Standard diagnostic telemetry protocol
 - Category: Governance; Status: Deferred; Risk: Medium
 - Why deferred / rationale: Sanitized telemetry was demonstrated; a reusable protocol is not yet justified as an implemented subsystem.
@@ -111,7 +102,7 @@ Every entry has Category, Status, Risk, Why deferred / rationale, Constraints pr
 - Category: Operator; Status: Open; Risk: High
 - Why deferred / rationale: Composition exists; durable startup, shutdown, configuration, and recovery procedure does not.
 - Constraints preserved: Do not prescribe final configuration format.
-- Evidence/reference: `delivery_system/host_composition.py`; GOV-HOSTCFG-01.
+- Evidence/reference: `delivery_system/host_composition.py`; `docs/architecture-and-lifecycle.md`.
 - Reconsideration trigger: Next live Host workflow.
 - Review point: Before next live Host workflow.
 - Decision/owner state: Architecture/operator decision required.
@@ -225,6 +216,15 @@ Every entry has Category, Status, Risk, Why deferred / rationale, Constraints pr
 - Decision/owner state: Product/UX decision required.
 
 ## Resolved and superseded entries
+
+### GOV-HOSTCFG-01 — Durable Host configuration contract
+- Category: Operator; Status: Resolved; Risk: High
+- Why deferred / rationale: Resolved by an explicit code-owned `HostConfiguration` contract, a canonical environment inventory consumed by the environment adapter, explicit Host composition input, durable operator documentation, and focused drift/reproducibility verification.
+- Constraints preserved: Protected credential and token material remains external to tracked configuration and Runtime state. This resolution does not define a configuration-file format, secret manager, daemon, service manager, deployment architecture, shutdown lifecycle, or recovery lifecycle.
+- Evidence/reference: `delivery_system/host_composition.py`; `mcp_server/server.py`; `docs/host-configuration.md`; `tests/v1/test_h4_host_composition.py`; `tests/v1/test_host_configuration_contract.py`.
+- Reconsideration trigger: Host configuration fields, configuration ownership, environment adapter behavior, or the production Host startup boundary changes.
+- Review point: Before changing the Host configuration contract or before introducing a different operator configuration mechanism.
+- Decision/owner state: Configuration ownership is resolved by the code-owned `HostConfiguration` contract plus operator documentation. Broader Host lifecycle remains owned by `ARC-HOST-LIFECYCLE-01`.
 
 ### GOV-CURRENT-HEAD-DATAMODEL-01 — Current implementation inspection
 - Category: Governance; Status: Resolved; Risk: Medium

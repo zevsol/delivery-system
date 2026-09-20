@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from delivery_system.auditor import RuleEvaluationDraft, RuntimeAuditor
 from delivery_system.drivers.contract import DriverReadResponse
-from delivery_system.host_composition import compose_write_enabled_host
+from delivery_system.host_composition import compose_write_enabled_host, load_host_configuration
 from delivery_system.protocol import digest
 from delivery_system.rules import SemanticOutcome, build_registry_v1
 from delivery_system.runtime import RuntimeContext, RuntimePlanner
@@ -88,7 +88,7 @@ class HostRestartIntegrationTests(unittest.TestCase):
     def _compose(self, *, environment=None):
         return compose_write_enabled_host(
             self.context,
-            environment=environment or self.environment,
+            configuration=load_host_configuration(environment or self.environment),
             bootstrap_transport=host_fixture.FakeBootstrapTransport(),
             clock=lambda: NOW,
             credential_instance_id_factory=lambda: INSTANCE_ID,

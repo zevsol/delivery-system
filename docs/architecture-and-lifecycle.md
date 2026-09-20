@@ -30,7 +30,7 @@ GitHub App, attestation, and authority-binding private keys serve separate roles
 
 ## Host and operator lifecycle
 
-Host composition receives and validates required configuration and protected material before composing services. A durable operator-facing startup, configuration, shutdown, and recovery contract does not yet exist. No CLI, configuration-file format, secret-manager, or service-manager design is implied here. See `GOV-HOSTCFG-01` and `ARC-HOST-LIFECYCLE-01`.
+Host composition receives and validates required configuration and protected material before composing services. The existing `github-app-write` profile now has a durable operator-facing configuration contract implemented by `HostConfiguration` and documented in [`docs/host-configuration.md`](host-configuration.md). A complete startup, shutdown, and recovery lifecycle contract does not yet exist. No CLI, configuration-file format, secret-manager, or service-manager design is implied here. See `GOV-HOSTCFG-01` and `ARC-HOST-LIFECYCLE-01`.
 
 ## Application execution lifecycle
 
