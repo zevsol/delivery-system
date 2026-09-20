@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import copy
 import json
+import os
 import pickle
 from pathlib import Path
 import tempfile
@@ -371,10 +372,12 @@ class CompositionTests(unittest.TestCase):
         self.keys.cleanup()
         self.workspace.cleanup()
 
-    def _compose(self, transport=None, instance_factory=None, environment=None):
+    def _compose(self, transport=None, instance_factory=None, environment=None, configuration=None):
+        if configuration is None:
+            configuration = load_host_configuration(environment or self.environment)
         return compose_write_enabled_host(
             self.context,
-            environment=environment or self.environment,
+            configuration=configuration,
             bootstrap_transport=transport or FakeBootstrapTransport(),
             clock=lambda: NOW,
             credential_instance_id_factory=instance_factory,
@@ -439,9 +442,16 @@ class CompositionTests(unittest.TestCase):
     def test_explicit_profile_composes_actual_h3_lease_attestation_and_runtime(self) -> None:
         transport = FakeBootstrapTransport()
         instance = str(uuid.uuid4())
+        configuration = load_host_configuration(self.environment)
         with patch.object(type(self.context), "ensure_store_ready", lambda self, **kwargs: Path(self.state_path).parent.mkdir(parents=True, exist_ok=True)):
-            composition = self._compose(transport, lambda: instance)
+            with patch(
+                "delivery_system.host_composition.load_host_configuration",
+                side_effect=AssertionError("composition reloaded Host environment"),
+            ):
+                with patch.dict(os.environ, {"DELIVERY_SYSTEM_GITHUB_APP_ID": "ambient-value"}, clear=False):
+                    composition = self._compose(transport, lambda: instance, configuration=configuration)
         self.assertIs(type(composition), HostComposition)
+        self.assertIs(composition.configuration, configuration)
         self.assertIs(type(composition.lease), GitHubAppInstallationCredentialLease)
         self.assertIs(type(composition.signer), Ed25519HostSigner)
         self.assertIs(type(composition.verifier), Ed25519ProofVerifier)
@@ -515,7 +525,7 @@ class CompositionTests(unittest.TestCase):
 
     def test_failed_explicit_composition_does_not_fallback_to_disabled_server(self) -> None:
         with self.assertRaises(HostCompositionError):
-            compose_write_enabled_host(self.context, environment={})
+            compose_write_enabled_host(self.context, configuration=load_host_configuration({}))
 
     def test_environment_token_names_are_ignored(self) -> None:
         candidate = dict(self.environment)
@@ -533,7 +543,11 @@ class CompositionTests(unittest.TestCase):
                 raise ValueError(COMPOSITION_SENTINEL)
 
         with self.assertRaises(HostCompositionError) as raised:
-            compose_write_enabled_host(self.context, environment=self.environment, private_key_source=BrokenSource())
+            compose_write_enabled_host(
+                self.context,
+                configuration=load_host_configuration(self.environment),
+                private_key_source=BrokenSource(),
+            )
         _assert_secret_free_exception(self, raised.exception, COMPOSITION_SENTINEL)
 
     def test_composition_bundle_cannot_be_copied_or_serialized(self) -> None:
@@ -668,11 +682,14 @@ class ServerProfileTests(unittest.TestCase):
 
     def test_explicit_profile_requires_configuration_and_does_not_fallback(self) -> None:
         import mcp_server.server as server_module
+        configuration = object()
         with patch.object(server_module.RuntimeContext, "from_workspace_root", return_value=object()):
-            with patch("delivery_system.host_composition.compose_write_enabled_host", side_effect=HostCompositionError("host_composition_failed")) as compose:
-                with self.assertRaises(HostCompositionError):
-                    server_module.main(["--workspace-root", "C:\\workspace", "--host-profile", "github-app-write"])
+            with patch("delivery_system.host_composition.load_host_configuration", return_value=configuration):
+                with patch("delivery_system.host_composition.compose_write_enabled_host", side_effect=HostCompositionError("host_composition_failed")) as compose:
+                    with self.assertRaises(HostCompositionError):
+                        server_module.main(["--workspace-root", "C:\\workspace", "--host-profile", "github-app-write"])
         compose.assert_called_once()
+        self.assertIs(compose.call_args.kwargs["configuration"], configuration)
 
     def test_explicit_profile_without_workspace_fails_before_composition(self) -> None:
         import mcp_server.server as server_module

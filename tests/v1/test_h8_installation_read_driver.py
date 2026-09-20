@@ -27,6 +27,7 @@ from delivery_system.host_composition import (
     HostCompositionError,
     _LeaseReadAuthView,
     compose_write_enabled_host,
+    load_host_configuration,
 )
 from delivery_system.runtime import InMemoryPreviewStore, RuntimeContext
 from mcp_server.server import create_server
@@ -566,7 +567,7 @@ class HostReadAuthCompositionTests(unittest.TestCase):
         with patch.object(type(self.context), "ensure_store_ready", lambda self, **kwargs: Path(self.state_path).parent.mkdir(parents=True, exist_ok=True)):
             composition = compose_write_enabled_host(
                 self.context,
-                environment=self.environment,
+                configuration=load_host_configuration(self.environment),
                 bootstrap_transport=transport,
                 clock=lambda: NOW,
                 credential_instance_id_factory=lambda: "00000000-0000-4000-8000-000000000008",
@@ -594,7 +595,7 @@ class HostReadAuthCompositionTests(unittest.TestCase):
         with patch.object(type(self.context), "ensure_store_ready", lambda self, **kwargs: Path(self.state_path).parent.mkdir(parents=True, exist_ok=True)):
             composition = compose_write_enabled_host(
                 self.context,
-                environment=self.environment,
+                configuration=load_host_configuration(self.environment),
                 bootstrap_transport=FakeBootstrapTransport(),
                 clock=lambda: NOW,
                 credential_instance_id_factory=lambda: "00000000-0000-4000-8000-000000000009",

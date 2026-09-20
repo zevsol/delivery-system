@@ -121,6 +121,42 @@ def _required_timeout_ms(values: Mapping[str, str], name: str) -> int:
 
 
 @dataclass(frozen=True)
+class _HostEnvironmentField:
+    name: str
+    semantic_key: str
+    state: str
+    classification: str
+
+
+_HOST_ENVIRONMENT_FIELDS = (
+    _HostEnvironmentField("DELIVERY_SYSTEM_GITHUB_APP_ID", "github_app_id", "required", "non-secret"),
+    _HostEnvironmentField("DELIVERY_SYSTEM_GITHUB_REPOSITORY", "github_repository", "required", "non-secret"),
+    _HostEnvironmentField("DELIVERY_SYSTEM_GITHUB_REPOSITORY_ID", "github_repository_id", "required", "non-secret"),
+    _HostEnvironmentField("DELIVERY_SYSTEM_GITHUB_APP_PRIVATE_KEY_PATH", "github_app_private_key_path", "required", "protected-reference"),
+    _HostEnvironmentField("DELIVERY_SYSTEM_ATTESTATION_ISSUER_ID", "attestation_issuer_id", "required", "non-secret"),
+    _HostEnvironmentField("DELIVERY_SYSTEM_ATTESTATION_KEY_ID", "attestation_key_id", "required", "non-secret"),
+    _HostEnvironmentField("DELIVERY_SYSTEM_ATTESTATION_PRIVATE_KEY_PATH", "attestation_private_key_path", "required", "protected-reference"),
+    _HostEnvironmentField("DELIVERY_SYSTEM_ATTESTATION_PUBLIC_KEY_PATH", "attestation_public_key_path", "required", "public-trust-material-reference"),
+    _HostEnvironmentField("DELIVERY_SYSTEM_ATTESTATION_TRUSTED_KEYS_PATH", "attestation_trusted_keys_path", "required", "public-trust-material-reference"),
+    _HostEnvironmentField("DELIVERY_SYSTEM_AUTHORITY_BINDING_ISSUER_ID", "authority_binding_issuer_id", "required", "non-secret"),
+    _HostEnvironmentField("DELIVERY_SYSTEM_AUTHORITY_BINDING_ACTIVE_KEY_ID", "authority_binding_active_key_id", "required", "non-secret"),
+    _HostEnvironmentField("DELIVERY_SYSTEM_AUTHORITY_BINDING_PRIVATE_KEY_PATH", "authority_binding_private_key_path", "required", "protected-reference"),
+    _HostEnvironmentField("DELIVERY_SYSTEM_AUTHORITY_BINDING_PUBLIC_KEY_PATH", "authority_binding_public_key_path", "required", "public-trust-material-reference"),
+    _HostEnvironmentField("DELIVERY_SYSTEM_AUTHORITY_BINDING_TRUSTED_KEYS_PATH", "authority_binding_trusted_keys_path", "required", "public-trust-material-reference"),
+    _HostEnvironmentField("DELIVERY_SYSTEM_REVOCATION_PROVIDER_URL", "revocation_provider_url", "required", "non-secret"),
+    _HostEnvironmentField("DELIVERY_SYSTEM_REVOCATION_TIMEOUT_MS", "revocation_timeout_ms", "required", "non-secret"),
+    _HostEnvironmentField("DELIVERY_SYSTEM_REVOCATION_AUTH_TOKEN_PATH", "revocation_auth_token_path", "optional", "protected-reference"),
+    _HostEnvironmentField("DELIVERY_SYSTEM_GITHUB_INSTALLATION_ID", "github_installation_id", "forbidden", "forbidden"),
+)
+_REQUIRED_ENVIRONMENT_FIELDS = tuple(field.name for field in _HOST_ENVIRONMENT_FIELDS if field.state == "required")
+_OPTIONAL_ENVIRONMENT_FIELDS = tuple(field.name for field in _HOST_ENVIRONMENT_FIELDS if field.state == "optional")
+_FORBIDDEN_ENVIRONMENT_FIELDS = tuple(field.name for field in _HOST_ENVIRONMENT_FIELDS if field.state == "forbidden")
+_PROTECTED_REFERENCE_FIELDS = tuple(field.name for field in _HOST_ENVIRONMENT_FIELDS if field.classification == "protected-reference")
+_PUBLIC_REFERENCE_FIELDS = tuple(field.name for field in _HOST_ENVIRONMENT_FIELDS if field.classification == "public-trust-material-reference")
+_NON_SECRET_FIELDS = tuple(field.name for field in _HOST_ENVIRONMENT_FIELDS if field.classification == "non-secret")
+
+
+@dataclass(frozen=True)
 class HostConfiguration:
     """Non-secret Host inputs for the explicit GitHub App write profile."""
 
@@ -139,27 +175,80 @@ class HostConfiguration:
     revocation_timeout_ms: int
     revocation_auth_token_path: str | None
 
+    ENVIRONMENT_FIELDS = _HOST_ENVIRONMENT_FIELDS
+    REQUIRED_ENVIRONMENT_FIELDS = _REQUIRED_ENVIRONMENT_FIELDS
+    OPTIONAL_ENVIRONMENT_FIELDS = _OPTIONAL_ENVIRONMENT_FIELDS
+    FORBIDDEN_ENVIRONMENT_FIELDS = _FORBIDDEN_ENVIRONMENT_FIELDS
+    PROTECTED_REFERENCE_FIELDS = _PROTECTED_REFERENCE_FIELDS
+    PUBLIC_REFERENCE_FIELDS = _PUBLIC_REFERENCE_FIELDS
+    NON_SECRET_FIELDS = _NON_SECRET_FIELDS
+
+    def __post_init__(self) -> None:
+        if type(self.github_app) is not GitHubAppBootstrapConfig:
+            raise _configuration_error()
+        for name in (
+            "attestation_issuer_id", "attestation_key_id",
+            "authority_binding_issuer_id", "authority_binding_active_key_id",
+        ):
+            value = getattr(self, name)
+            if type(value) is not str or _ID_RE.fullmatch(value) is None:
+                raise _configuration_error()
+        for name in (
+            "attestation_private_key_path", "attestation_public_key_path",
+            "attestation_trusted_keys_path", "authority_binding_private_key_path",
+            "authority_binding_public_key_path", "authority_binding_trusted_keys_path",
+        ):
+            value = getattr(self, name)
+            if type(value) is not str or not value.strip() or not os.path.isabs(value):
+                raise _configuration_error()
+        if type(self.revocation_provider_url) is not str or not self.revocation_provider_url.strip():
+            raise _configuration_error()
+        from urllib.parse import urlparse
+        parsed_url = urlparse(self.revocation_provider_url)
+        if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
+            raise _configuration_error()
+        if (
+            type(self.revocation_timeout_ms) is not int
+            or isinstance(self.revocation_timeout_ms, bool)
+            or not 1 <= self.revocation_timeout_ms <= 120_000
+        ):
+            raise _configuration_error()
+        if self.revocation_auth_token_path is not None and (
+            type(self.revocation_auth_token_path) is not str
+            or not self.revocation_auth_token_path.strip()
+            or not os.path.isabs(self.revocation_auth_token_path)
+        ):
+            raise _configuration_error()
+
     @classmethod
     def from_environment(cls, environment: Mapping[str, str] | None = None) -> "HostConfiguration":
-        values = dict(os.environ if environment is None else environment)
-        if "DELIVERY_SYSTEM_GITHUB_INSTALLATION_ID" in values:
+        raw_values = dict(os.environ if environment is None else environment)
+        if any(
+            field.state == "forbidden" and field.name in raw_values
+            for field in cls.ENVIRONMENT_FIELDS
+        ):
             raise _configuration_error()
+        values = {
+            field.semantic_key: raw_values[field.name]
+            for field in cls.ENVIRONMENT_FIELDS
+            if field.state != "forbidden" and field.name in raw_values
+        }
         github_app = GitHubAppBootstrapConfig(
-            app_id=_required_id(values, "DELIVERY_SYSTEM_GITHUB_APP_ID"),
-            repository_identity=_required_text(values, "DELIVERY_SYSTEM_GITHUB_REPOSITORY"),
-            repository_id=_required_id(values, "DELIVERY_SYSTEM_GITHUB_REPOSITORY_ID"),
-            private_key_path=_required_path(values, "DELIVERY_SYSTEM_GITHUB_APP_PRIVATE_KEY_PATH"),
+            app_id=_required_id(values, "github_app_id"),
+            repository_identity=_required_text(values, "github_repository"),
+            repository_id=_required_id(values, "github_repository_id"),
+            private_key_path=_required_path(values, "github_app_private_key_path"),
         )
-        issuer_id = _required_text(values, "DELIVERY_SYSTEM_ATTESTATION_ISSUER_ID")
-        key_id = _required_text(values, "DELIVERY_SYSTEM_ATTESTATION_KEY_ID")
+        issuer_id = _required_text(values, "attestation_issuer_id")
+        key_id = _required_text(values, "attestation_key_id")
         if _ID_RE.fullmatch(issuer_id) is None or _ID_RE.fullmatch(key_id) is None:
             raise _configuration_error()
-        authority_issuer_id = _required_text(values, "DELIVERY_SYSTEM_AUTHORITY_BINDING_ISSUER_ID")
-        authority_key_id = _required_text(values, "DELIVERY_SYSTEM_AUTHORITY_BINDING_ACTIVE_KEY_ID")
+        authority_issuer_id = _required_text(values, "authority_binding_issuer_id")
+        authority_key_id = _required_text(values, "authority_binding_active_key_id")
         if (_ID_RE.fullmatch(authority_issuer_id) is None or
                 _ID_RE.fullmatch(authority_key_id) is None):
             raise _configuration_error()
-        provider_url = _required_text(values, "DELIVERY_SYSTEM_REVOCATION_PROVIDER_URL")
+        provider_url = _required_text(values, "revocation_provider_url")
         from urllib.parse import urlparse
         parsed_url = urlparse(provider_url)
         if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
@@ -168,17 +257,17 @@ class HostConfiguration:
             github_app=github_app,
             attestation_issuer_id=issuer_id,
             attestation_key_id=key_id,
-            attestation_private_key_path=_required_path(values, "DELIVERY_SYSTEM_ATTESTATION_PRIVATE_KEY_PATH"),
-            attestation_public_key_path=_required_path(values, "DELIVERY_SYSTEM_ATTESTATION_PUBLIC_KEY_PATH"),
-            attestation_trusted_keys_path=_required_path(values, "DELIVERY_SYSTEM_ATTESTATION_TRUSTED_KEYS_PATH"),
+            attestation_private_key_path=_required_path(values, "attestation_private_key_path"),
+            attestation_public_key_path=_required_path(values, "attestation_public_key_path"),
+            attestation_trusted_keys_path=_required_path(values, "attestation_trusted_keys_path"),
             authority_binding_issuer_id=authority_issuer_id,
             authority_binding_active_key_id=authority_key_id,
-            authority_binding_private_key_path=_required_path(values, "DELIVERY_SYSTEM_AUTHORITY_BINDING_PRIVATE_KEY_PATH"),
-            authority_binding_public_key_path=_required_path(values, "DELIVERY_SYSTEM_AUTHORITY_BINDING_PUBLIC_KEY_PATH"),
-            authority_binding_trusted_keys_path=_required_path(values, "DELIVERY_SYSTEM_AUTHORITY_BINDING_TRUSTED_KEYS_PATH"),
+            authority_binding_private_key_path=_required_path(values, "authority_binding_private_key_path"),
+            authority_binding_public_key_path=_required_path(values, "authority_binding_public_key_path"),
+            authority_binding_trusted_keys_path=_required_path(values, "authority_binding_trusted_keys_path"),
             revocation_provider_url=provider_url,
-            revocation_timeout_ms=_required_timeout_ms(values, "DELIVERY_SYSTEM_REVOCATION_TIMEOUT_MS"),
-            revocation_auth_token_path=_optional_path(values, "DELIVERY_SYSTEM_REVOCATION_AUTH_TOKEN_PATH"),
+            revocation_timeout_ms=_required_timeout_ms(values, "revocation_timeout_ms"),
+            revocation_auth_token_path=_optional_path(values, "revocation_auth_token_path"),
         )
 
     def __repr__(self) -> str:
@@ -575,7 +664,7 @@ class HostComposition:
 def _compose_write_enabled_host(
     context: RuntimeContext,
     *,
-    environment: Mapping[str, str] | None,
+    configuration: HostConfiguration,
     bootstrap_transport: GitHubAppBootstrapTransport | None,
     private_key_source: GitHubAppPrivateKeySource | None,
     ed_private_source: FileEd25519PrivateKeySource | None,
@@ -585,7 +674,8 @@ def _compose_write_enabled_host(
     nonce_factory: Callable[[], str],
     revocation_transport: RevocationTransport | None,
 ) -> HostComposition:
-    configuration = load_host_configuration(environment)
+    if type(configuration) is not HostConfiguration:
+        raise _configuration_error()
     _validate_external_key_paths(context, configuration)
     opened_object_validator = _workspace_opened_object_validator(context)
     rsa_source = private_key_source or FileGitHubAppPrivateKeySource(
@@ -761,7 +851,7 @@ def _compose_write_enabled_host(
 def compose_write_enabled_host(
     context: RuntimeContext,
     *,
-    environment: Mapping[str, str] | None = None,
+    configuration: HostConfiguration,
     bootstrap_transport: GitHubAppBootstrapTransport | None = None,
     private_key_source: GitHubAppPrivateKeySource | None = None,
     ed_private_source: FileEd25519PrivateKeySource | None = None,
@@ -775,7 +865,7 @@ def compose_write_enabled_host(
 
     result = _attempt(lambda: _compose_write_enabled_host(
         context,
-        environment=environment,
+        configuration=configuration,
         bootstrap_transport=bootstrap_transport,
         private_key_source=private_key_source,
         ed_private_source=ed_private_source,
