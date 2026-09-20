@@ -98,15 +98,6 @@ Every entry has Category, Status, Risk, Why deferred / rationale, Constraints pr
 - Review point: Before production rollout.
 - Decision/owner state: Security/operator decision required.
 
-### ARC-HOST-LIFECYCLE-01 — Host lifecycle contract
-- Category: Operator; Status: Open; Risk: High
-- Why deferred / rationale: Composition exists; durable startup, shutdown, configuration, and recovery procedure does not.
-- Constraints preserved: Do not prescribe final configuration format.
-- Evidence/reference: `delivery_system/host_composition.py`; `docs/architecture-and-lifecycle.md`.
-- Reconsideration trigger: Next live Host workflow.
-- Review point: Before next live Host workflow.
-- Decision/owner state: Architecture/operator decision required.
-
 ### ARC-INSTALL-LIFECYCLE-01 — Install, upgrade, uninstall
 - Category: Release/CI; Status: Deferred; Risk: Medium
 - Why deferred / rationale: Packaging is not a complete operator lifecycle.
@@ -224,7 +215,16 @@ Every entry has Category, Status, Risk, Why deferred / rationale, Constraints pr
 - Evidence/reference: `delivery_system/host_composition.py`; `mcp_server/server.py`; `docs/host-configuration.md`; `tests/v1/test_h4_host_composition.py`; `tests/v1/test_host_configuration_contract.py`.
 - Reconsideration trigger: Host configuration fields, configuration ownership, environment adapter behavior, or the production Host startup boundary changes.
 - Review point: Before changing the Host configuration contract or before introducing a different operator configuration mechanism.
-- Decision/owner state: Configuration ownership is resolved by the code-owned `HostConfiguration` contract plus operator documentation. Broader Host lifecycle remains owned by `ARC-HOST-LIFECYCLE-01`.
+- Decision/owner state: Configuration ownership remains resolved by the code-owned `HostConfiguration` contract plus operator documentation. The bounded Host lifecycle contract is resolved separately by `ARC-HOST-LIFECYCLE-01`; deployment, installation, observability, key, and SQLite disaster-recovery concerns remain with their respective debt owners.
+
+### ARC-HOST-LIFECYCLE-01 — Host lifecycle contract
+- Category: Operator; Status: Resolved; Risk: High
+- Why deferred / rationale: Resolved by explicit production startup ordering, retained `HostComposition` ownership for the write-profile server lifetime, deterministic cleanup after normal and exceptional server unwind, preservation of primary execution or control-flow failure when ordinary cleanup also fails, documented fresh-process restart and Runtime-recovery boundaries, and focused lifecycle regression coverage.
+- Constraints preserved: Resolution does not define daemon or service-manager behavior, deployment architecture, installation lifecycle, automatic execution resume, SQLite backup/restore/corruption recovery, key rotation/recovery, or long-lived observability/recovery tooling. Configuration remains owned by the resolved `GOV-HOSTCFG-01` contract.
+- Evidence/reference: `mcp_server/server.py`; `tests/v1/test_h4_host_composition.py`; `delivery_system/host_composition.py`; `docs/architecture-and-lifecycle.md`; `docs/host-configuration.md`.
+- Reconsideration trigger: Changes to production Host startup/run/shutdown ownership, composition resource lifetime, restart semantics, or the server execution boundary.
+- Review point: Before changing those lifecycle boundaries.
+- Decision/owner state: The bounded Host process lifecycle contract is resolved. Remaining deployment/install, observability, key, SQLite disaster-recovery, reusable harness, and diagnostic telemetry concerns remain with their existing debt owners.
 
 ### GOV-CURRENT-HEAD-DATAMODEL-01 — Current implementation inspection
 - Category: Governance; Status: Resolved; Risk: Medium

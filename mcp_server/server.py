@@ -546,7 +546,17 @@ def main(argv: list[str] | None = None) -> None:
     if args.host_profile == "github-app-write":
         from delivery_system.host_composition import compose_write_enabled_host, load_host_configuration
         configuration = load_host_configuration()
-        compose_write_enabled_host(context, configuration=configuration).create_server().run()
+        composition = compose_write_enabled_host(context, configuration=configuration)
+        try:
+            composition.create_server().run()
+        except BaseException:
+            try:
+                composition.close()
+            except Exception:
+                pass
+            raise
+        else:
+            composition.close()
         return
     store = SQLitePreviewStore(context)
     create_server(context, store).run()
