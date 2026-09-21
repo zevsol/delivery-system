@@ -281,6 +281,13 @@ class AuditorContractTests(unittest.TestCase):
         self.assertEqual(context["rule_registry_digest"], self.registry.registry_digest)
         self.assertTrue(context["semantic_rule_contexts"])
         self.assertEqual(context["audit_scope"], "Conceptual")
+        rules = {rule.rule_id: rule for rule in self.registry.semantic_rules}
+        self.assertEqual(rules["SEM-WORK-ITEM-DECOMPOSITION"].rule_version, "1.1")
+        self.assertIn("coherent, bounded, independently meaningful", rules["SEM-WORK-ITEM-DECOMPOSITION"].evaluation_contract)
+        self.assertIn("implementation fragments", rules["SEM-WORK-ITEM-DECOMPOSITION"].evaluation_contract)
+        self.assertEqual(rules["SEM-PARENT-SUBISSUE"].rule_version, "1.1")
+        self.assertIn("tracking-only container", rules["SEM-PARENT-SUBISSUE"].evaluation_contract)
+        self.assertEqual(rules["SEM-DEPENDENCY"].rule_version, "1.0")
 
     def test_runtime_gate_failure_does_not_create_audit(self):
         with self.assertRaisesRegex(ValueError, "^invalid_input$"):

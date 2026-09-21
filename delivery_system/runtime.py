@@ -36,6 +36,7 @@ from delivery_system.write_operations import (
     WriteOperationEvaluation, evaluate_write_operations, normalize_write_operations,
     operation_set_digest_payload,
 )
+from delivery_system.rules import RuleRegistry, build_registry_v1
 from delivery_system.remote_snapshot import (
     RemoteCapabilitySet,
     RemoteIssueRecord,
@@ -1760,12 +1761,18 @@ class RuntimeApprovalAuthorityService:
                  artifact_link_adapter: Any = None, authority_binding_signer: Any = None,
                  authority_binding_store: Any = None, authority_binding_verifier: Any = None,
                  attestation_persistence_store: Any = None,
-                 restart_credential_verifier: Any = None) -> None:
+                 restart_credential_verifier: Any = None,
+                 rule_registry: RuleRegistry | None = None) -> None:
         if not isinstance(context, RuntimeContext) or not callable(clock):
             raise TypeError("approval_runtime_boundary_invalid")
+        if rule_registry is None:
+            rule_registry = build_registry_v1()
+        if not isinstance(rule_registry, RuleRegistry):
+            raise ValueError("approval_runtime_boundary_invalid")
         self.context = context
         self.store = store
         self.attestation_service = attestation_service
+        self._rule_registry = rule_registry
         self.clock = clock
         self._lock = threading.RLock()
         self._authorities: dict[str, Any] = {}
@@ -1991,6 +1998,9 @@ class RuntimeApprovalAuthorityService:
             except ValueError as exc:
                 if str(exc) != "approval_not_found":
                     raise
+                if (audit.rule_registry_version != self._rule_registry.registry_version or
+                        audit.rule_registry_digest != self._rule_registry.registry_digest):
+                    raise ValueError("audit_stale")
                 self.store.record_approval(candidate)
                 return self.store.get_approval(self.context.workspace_identity, candidate.approval_id)
             if not self.store.validate_approval_current(existing):

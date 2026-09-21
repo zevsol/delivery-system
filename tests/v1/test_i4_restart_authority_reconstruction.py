@@ -22,6 +22,7 @@ from delivery_system.attestation_persistence import PersistedAttestationArtifact
 from delivery_system.authority_binding import SignedAuthorityBinding
 from delivery_system.authority_binding_persistence import PersistedAuthorityBinding
 from delivery_system.protocol import canonical_payload
+from delivery_system.rules import RuleRegistry, build_registry_v1
 from delivery_system.restart_credential_verification import (
     DefaultRestartCredentialAttestationVerifier,
     RestartVerifiedCredentialEvidence,
@@ -184,6 +185,26 @@ class I4RestartAuthorityReconstructionTests(unittest.TestCase):
             self.assertEqual(artifact_store.get_artifact_aggregate(
                 context.workspace_identity, persisted.payload.attestation_artifact_id
             ).artifact.artifact_digest, persisted.payload.attestation_artifact_digest)
+        finally:
+            directory.cleanup()
+
+    def test_existing_authority_survives_registry_policy_evolution(self):
+        data = self._setup()
+        directory, context, store, preview, approval, service, original, persisted, artifact_store, authority_verifier, credential_verifier, issuer = data
+        try:
+            current = build_registry_v1()
+            evolved = RuleRegistry(
+                current.registry_version,
+                tuple(
+                    replace(rule, rule_version="1.2")
+                    if rule.rule_id == "SEM-WORK-ITEM-DECOMPOSITION"
+                    else rule
+                    for rule in current.rules
+                ),
+            )
+            service._rule_registry = evolved
+            recovered = self._reconstruct(service, preview, approval)
+            self.assertEqual(recovered.to_dict(), original.to_dict())
         finally:
             directory.cleanup()
 
