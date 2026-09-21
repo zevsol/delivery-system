@@ -10,7 +10,7 @@ import pickle
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import uuid
 
 from cryptography.hazmat.primitives import serialization
@@ -655,6 +655,19 @@ class CompositionTests(unittest.TestCase):
 
 
 class ServerProfileTests(unittest.TestCase):
+    def _run_explicit_profile(self, composition: object, compose_side_effect=None) -> None:
+        import mcp_server.server as server_module
+        with patch.object(server_module.RuntimeContext, "from_workspace_root", return_value=object()):
+            with patch("delivery_system.host_composition.load_host_configuration", return_value=object()):
+                with patch("delivery_system.host_composition.compose_write_enabled_host") as compose:
+                    if compose_side_effect is None:
+                        compose.return_value = composition
+                    else:
+                        compose.side_effect = compose_side_effect
+                    server_module.main([
+                        "--workspace-root", "C:\\workspace", "--host-profile", "github-app-write",
+                    ])
+
     def test_cli_has_explicit_profile_and_no_secret_value_options(self) -> None:
         import mcp_server.server as server_module
         with patch.object(server_module, "create_server") as create_server:
@@ -697,6 +710,75 @@ class ServerProfileTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 server_module.main(["--host-profile", "github-app-write"])
         compose.assert_not_called()
+
+    def test_explicit_profile_normal_return_closes_composition_once(self) -> None:
+        events = []
+        composition = MagicMock()
+        server = MagicMock()
+        composition.create_server.side_effect = lambda: events.append("create_server") or server
+        server.run.side_effect = lambda: events.append("run")
+        composition.close.side_effect = lambda: events.append("close")
+        self._run_explicit_profile(
+            composition,
+            lambda *_args, **_kwargs: events.append("compose") or composition,
+        )
+        self.assertEqual(events, ["compose", "create_server", "run", "close"])
+        composition.close.assert_called_once_with()
+
+    def test_explicit_profile_run_exception_closes_and_preserves_primary(self) -> None:
+        composition = MagicMock()
+        server = MagicMock()
+        run_error = RuntimeError("run failed")
+        composition.create_server.return_value = server
+        server.run.side_effect = run_error
+        with self.assertRaises(RuntimeError) as raised:
+            self._run_explicit_profile(composition)
+        self.assertIs(raised.exception, run_error)
+        composition.close.assert_called_once_with()
+
+    def test_explicit_profile_run_exception_wins_over_cleanup_exception(self) -> None:
+        composition = MagicMock()
+        server = MagicMock()
+        run_error = RuntimeError("run failed")
+        cleanup_error = RuntimeError("cleanup failed")
+        composition.create_server.return_value = server
+        server.run.side_effect = run_error
+        composition.close.side_effect = cleanup_error
+        with self.assertRaises(RuntimeError) as raised:
+            self._run_explicit_profile(composition)
+        self.assertIs(raised.exception, run_error)
+        composition.close.assert_called_once_with()
+
+    def test_explicit_profile_normal_return_exposes_cleanup_exception(self) -> None:
+        composition = MagicMock()
+        server = MagicMock()
+        cleanup_error = RuntimeError("cleanup failed")
+        composition.create_server.return_value = server
+        composition.close.side_effect = cleanup_error
+        with self.assertRaises(RuntimeError) as raised:
+            self._run_explicit_profile(composition)
+        self.assertIs(raised.exception, cleanup_error)
+        composition.close.assert_called_once_with()
+
+    def test_explicit_profile_create_server_exception_closes_and_preserves_primary(self) -> None:
+        composition = MagicMock()
+        create_error = RuntimeError("create failed")
+        composition.create_server.side_effect = create_error
+        with self.assertRaises(RuntimeError) as raised:
+            self._run_explicit_profile(composition)
+        self.assertIs(raised.exception, create_error)
+        composition.close.assert_called_once_with()
+
+    def test_explicit_profile_keyboard_interrupt_closes_and_preserves_primary(self) -> None:
+        composition = MagicMock()
+        server = MagicMock()
+        interrupt = KeyboardInterrupt()
+        composition.create_server.return_value = server
+        server.run.side_effect = interrupt
+        with self.assertRaises(KeyboardInterrupt) as raised:
+            self._run_explicit_profile(composition)
+        self.assertIs(raised.exception, interrupt)
+        composition.close.assert_called_once_with()
 
 
 if __name__ == "__main__":
