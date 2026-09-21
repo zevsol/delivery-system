@@ -23,7 +23,7 @@ from delivery_system.runtime import (
     SQLitePreviewStore,
 )
 from delivery_system.verified_attestation_artifact import VerifiedAttestationArtifactAdapter
-from delivery_system.rules import SemanticOutcome, build_registry_v1
+from delivery_system.rules import RuleRegistry, SemanticOutcome, build_registry_v1
 from tests.attestation_contract.test_attestation_contract import FakeCapabilityPolicy, FakeIssuer
 from tests.attestation_orchestration.test_attestation_orchestration import FakeReadOnlyDriver
 from tests.fakes.attestation_provider import FakeCapabilityResolver, FakeCredentialCapabilityProvider
@@ -69,8 +69,17 @@ def plan() -> dict[str, object]:
     return result
 
 
+def legacy_registry() -> RuleRegistry:
+    current = build_registry_v1()
+    return RuleRegistry(current.registry_version, tuple(
+        replace(rule, rule_version="1.0") if rule.rule_id in {
+            "SEM-WORK-ITEM-DECOMPOSITION", "SEM-PARENT-SUBISSUE"
+        } else rule for rule in current.rules
+    ))
+
+
 class OperationalApprovalAuthorityTests(unittest.TestCase):
-    def _setup(self, kind: str):
+    def _setup(self, kind: str, *, audit_registry=None, service_registry=None):
         directory = tempfile.TemporaryDirectory()
         context = RuntimeContext.from_workspace_root(directory.name)
         if kind == "memory":
@@ -81,7 +90,9 @@ class OperationalApprovalAuthorityTests(unittest.TestCase):
                 tracked_checker=lambda path: False, trust_context=TRUST,
             )
         preview = RuntimePlanner(context, store, FakeReadOnlyDriver(node_id="node-1"), TRUST).preview(plan())
-        auditor = RuntimeAuditor(context, store, build_registry_v1(), TRUST)
+        audit_registry = audit_registry or build_registry_v1()
+        service_registry = service_registry or build_registry_v1()
+        auditor = RuntimeAuditor(context, store, audit_registry, TRUST)
         audit_context = auditor.get_context(preview["preview_id"], 1)
         evaluations = [
             RuleEvaluationDraft(rule["rule_id"], rule["rule_version"], SemanticOutcome.PASSED, "verified")
@@ -100,8 +111,53 @@ class OperationalApprovalAuthorityTests(unittest.TestCase):
             artifact_link_adapter=artifact_adapter,
             authority_binding_signer=signer,
             authority_binding_store=binding_store,
+            rule_registry=service_registry,
         )
         return directory, context, store, preview, audit, service
+
+    @staticmethod
+    def _with_registry(service, registry):
+        return RuntimeApprovalAuthorityService(
+            service.context, service.store, service.attestation_service,
+            clock=service.clock,
+            artifact_link_adapter=service._artifact_link_adapter,
+            authority_binding_signer=service._authority_binding_signer,
+            authority_binding_store=service._authority_binding_store,
+            rule_registry=registry,
+        )
+
+    def test_old_policy_audit_is_historical_but_cannot_create_new_approval(self):
+        directory, context, store, preview, audit, service = self._setup(
+            "memory", audit_registry=legacy_registry(), service_registry=build_registry_v1(),
+        )
+        try:
+            self.assertTrue(audit.verify_digest())
+            with self.assertRaisesRegex(ValueError, "^audit_stale$"):
+                service.record_approval(
+                    preview["preview_id"], 1,
+                    f"批准写入 {preview['preview_id']} 1", "human",
+                )
+            self.assertTrue(audit.verify_digest())
+            self.assertEqual(store.list_active_audits(context.workspace_identity, preview["preview_id"], 1)[0], audit)
+        finally:
+            directory.cleanup()
+
+    def test_existing_old_policy_approval_replays_under_new_registry(self):
+        directory, context, store, preview, audit, old_service = self._setup(
+            "memory", audit_registry=legacy_registry(), service_registry=legacy_registry(),
+        )
+        try:
+            command = f"批准写入 {preview['preview_id']} 1"
+            approval = old_service.record_approval(preview["preview_id"], 1, command, "human")
+            new_service = self._with_registry(old_service, build_registry_v1())
+            replayed = new_service.record_approval(preview["preview_id"], 1, command, "human")
+            self.assertEqual(replayed, approval)
+            authority = new_service.issue_application_authority(
+                preview["preview_id"], 1, replayed.approval_id,
+            )
+            self.assertEqual(authority.approval_id, approval.approval_id)
+        finally:
+            directory.cleanup()
 
     def test_exact_approval_is_persisted_and_replayed_with_original_time(self):
         for kind in ("memory", "sqlite"):

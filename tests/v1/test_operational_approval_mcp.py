@@ -103,6 +103,35 @@ class OperationalApprovalMcpTests(unittest.TestCase):
                 return await client.call_tool(tool_name, {"payload": payload})
         return self.run_async(exercise())
 
+    def test_server_binds_supplied_approval_registry_identity(self):
+        directory, context, store, preview, audit, service = self._setup(with_attestation=False)
+        try:
+            create_server(context, store, approval_authority_service=service)
+            mismatched = RuntimeApprovalAuthorityService(
+                context, store, service.attestation_service, clock=lambda: NOW,
+                rule_registry=approval_fixture.legacy_registry(),
+            )
+            with self.assertRaisesRegex(ValueError, "^approval_runtime_boundary_invalid$"):
+                create_server(context, store, approval_authority_service=mismatched)
+        finally:
+            directory.cleanup()
+
+    def test_default_server_approves_audit_from_current_registry(self):
+        directory, context, store, preview, audit, service = self._setup(with_attestation=False)
+        try:
+            server = create_server(context, store)
+            result = self._call(server, "delivery_record_approval", {
+                "preview_id": preview["preview_id"],
+                "revision": 1,
+                "approval_command": f"批准写入 {preview['preview_id']} 1",
+                "approver_claim": "human",
+            }, raise_exceptions=True)
+            self.assertFalse(result.is_error)
+            self.assertEqual(result.structured_content["audit_digest"], audit.audit_digest)
+            self.assertEqual(result.structured_content["status"], "valid")
+        finally:
+            directory.cleanup()
+
     def test_discovery_has_exact_six_tools_and_annotations(self):
         async def exercise():
             async with Client(mcp, raise_exceptions=True) as client:

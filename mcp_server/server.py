@@ -353,6 +353,7 @@ def create_server(context: RuntimeContext | None = None, store: Any | None = Non
                   trust_context: DriverTrustContext | None = None,
                   approval_authority_service: RuntimeApprovalAuthorityService | None = None,
                   execution_store: SQLiteExecutionStore | None = None) -> MCPServer:
+    registry = build_registry_v1()
     if (driver is None) != (trust_context is None):
         raise ValueError("driver_trust_context_required")
     if store is not None and trust_context is not None:
@@ -365,9 +366,14 @@ def create_server(context: RuntimeContext | None = None, store: Any | None = Non
         if ((context is not None and approval_authority_service.context != context) or
                 (store is not None and approval_authority_service.store is not store)):
             raise ValueError("approval_runtime_boundary_invalid")
+        bound_registry = getattr(approval_authority_service, "_rule_registry", None)
+        if (not isinstance(bound_registry, RuleRegistry) or
+                bound_registry.registry_version != registry.registry_version or
+                bound_registry.registry_digest != registry.registry_digest):
+            raise ValueError("approval_runtime_boundary_invalid")
     elif context is not None and store is not None:
         approval_authority_service = RuntimeApprovalAuthorityService(
-            context, store, None, clock=_production_clock,
+            context, store, None, clock=_production_clock, rule_registry=registry,
         )
     if execution_store is not None:
         if (context is None or store is None or approval_authority_service is None or
@@ -380,7 +386,6 @@ def create_server(context: RuntimeContext | None = None, store: Any | None = Non
                 execution_store.runtime_service is not approval_authority_service):
             raise ValueError("write_execution_boundary_invalid")
     mcp = MCPServer(SERVER_NAME)
-    registry = build_registry_v1()
 
     @mcp.tool(
         name=TOOL_NAME,

@@ -143,6 +143,22 @@ class AuditorSkillContractTests(unittest.TestCase):
         self.assertIn("Passed Evaluation has no Finding", skill)
         self.assertIn("Failed`, `Unknown`, or `Blocked`", skill)
 
+    def test_decomposition_rubric_is_independent_and_rule_separated(self):
+        skill = self.read_skill()
+        for phrase in (
+            "Evaluate the sealed graph independently of Planner suggestions",
+            "under-decomposition",
+            "over-decomposition",
+            "implementation fragments",
+            "bounded technical outcomes",
+            "shared-capability Work Items",
+            "tracking-only containers fail",
+            "reject implementation-order-only links and dependency cycles",
+            "material uncertainty about boundaries",
+            "remote evidence for duplicate or partial-overlap judgment",
+        ):
+            self.assertIn(phrase, skill)
+
     def test_openai_metadata_matches_skill(self):
         metadata = OPENAI_PATH.read_text(encoding="utf-8")
         interface_start = metadata.index("interface:")

@@ -71,9 +71,10 @@ RUNTIME_RULE_IDS = (
 )
 
 
-def _semantic(rule_id: str, contract: str, input_scope: str, failed: str, *, applicability: str = "Applicable") -> RuleDefinition:
+def _semantic(rule_id: str, contract: str, input_scope: str, failed: str, *,
+              applicability: str = "Applicable", rule_version: str = "1.0") -> RuleDefinition:
     return RuleDefinition(
-        rule_id, "1.0", RuleCategory.SEMANTIC, True, applicability,
+        rule_id, rule_version, RuleCategory.SEMANTIC, True, applicability,
         ("Passed", "Failed", "Unknown", "Blocked"), input_scope, contract,
         failed, ResultClass.MISSING_INFORMATION.value, ResultClass.SEMANTIC_BLOCKER.value,
     )
@@ -85,10 +86,10 @@ def build_registry_v1() -> "RuleRegistry":
                   for rule_id in RUNTIME_RULE_IDS)
     semantic = (
         _semantic("SEM-WORK-ITEM-COMPLETENESS", "Checks that each Work Item satisfies its role-specific content contract, with explicit Context/Problem, Outcome, Scope, Acceptance Criteria, and Verification; undeclared inference is not treated as a user fact.", "Work Item fields and provenance", ResultClass.WORK_ITEM_CONTENT_GAP.value),
-        _semantic("SEM-WORK-ITEM-DECOMPOSITION", "Checks that Work Items are independently understandable and deliverable, that Scope and Outcome agree, and that oversized items, resultless technical tasks, or missing shared capabilities are identified.", "Work Item collection, Scope, and Outcome", ResultClass.DECOMPOSITION_RISK.value),
+        _semantic("SEM-WORK-ITEM-DECOMPOSITION", "Checks that each Work Item represents one coherent, bounded, independently meaningful, and verifiable governed outcome; one coherent outcome is not split merely across implementation layers, files, modules, steps, or commits; independent governed outcomes are not collapsed; decomposition stops before implementation fragments; bounded technical outcomes are valid; and a shared capability is separate only when it is itself an independently governable and verifiable outcome.", "Work Item collection, Scope, and Outcome", ResultClass.DECOMPOSITION_RISK.value, rule_version="1.1"),
         _semantic("SEM-ACCEPTANCE-CRITERIA", "Checks that Acceptance Criteria are observable, verifiable, and bounded, and that Verification can prove the result rather than merely describe implementation steps.", "Acceptance Criteria and Verification", ResultClass.ACCEPTANCE_CRITERIA_GAP.value),
         _semantic("SEM-ASSUMPTION-CLARITY", "Checks that User Asserted, Model Proposed, and Model Assumption values remain distinct; unconfirmed facts affecting scope, acceptance, or relationships must request clarification.", "Provenance and assumptions", ResultClass.ASSUMPTION_CLARITY_GAP.value),
-        _semantic("SEM-PARENT-SUBISSUE", "Checks that a child genuinely serves the parent Outcome, that hierarchy is necessary, and that there is no semantic inversion, orphan child, or unreasonable depth.", "Parent/Sub-issue candidates and relationships", ResultClass.RELATIONSHIP_RISK.value, applicability="Runtime"),
+        _semantic("SEM-PARENT-SUBISSUE", "Checks that a child genuinely serves a distinct parent integration/system outcome, that hierarchy is necessary, that parent acceptance is not merely child completion, and that there is no tracking-only container, semantic inversion, orphan child, or unreasonable depth.", "Parent/Sub-issue candidates and relationships", ResultClass.RELATIONSHIP_RISK.value, applicability="Runtime", rule_version="1.1"),
         _semantic("SEM-DEPENDENCY", "Checks that dependency direction, blocking cause, and necessity have evidence; implementation-order proximity alone is insufficient.", "Dependency candidates and relationships", ResultClass.DEPENDENCY_RISK.value, applicability="Runtime"),
         _semantic("SEM-DUPLICATE-OVERLAP", "Uses current Remote Evidence to assess Duplicate, Partial Overlap, Related, or other relationships; title, keyword overlap, or similarity alone cannot establish duplication.", "Remote Evidence and Work Items", ResultClass.DUPLICATE_OVERLAP_RISK.value, applicability="Runtime"),
     )
