@@ -42,10 +42,109 @@ from delivery_system.runtime import (
     StorePreflightError,
     SQLitePreviewStore,
     _ItemRecord,
+    _canonical_workspace_relative_path,
+    _default_ignored,
+    _default_tracked,
 )
 
 
 class Revision22RuntimeTests(unittest.TestCase):
+    def test_store_preflight_git_helpers_use_workspace_relative_posix_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            child = root / ".delivery-system" / "state.sqlite3-journal"
+            for helper, command in (
+                (_default_ignored, "check-ignore"),
+                (_default_tracked, "ls-files"),
+            ):
+                with self.subTest(helper=helper.__name__):
+                    with patch("delivery_system.runtime.subprocess.run") as run:
+                        run.return_value.returncode = 0
+                        self.assertTrue(helper(child, root))
+                        command_args = run.call_args.args[0]
+                        self.assertEqual(command_args[1], command)
+                        self.assertEqual(command_args[-1], ".delivery-system/state.sqlite3-journal")
+
+    def test_workspace_relative_path_rejects_escape_and_sibling_prefix(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "workspace"
+            root.mkdir()
+            self.assertEqual(
+                _canonical_workspace_relative_path(root / "child", root),
+                "child",
+            )
+            with self.assertRaises(StorePreflightError):
+                _canonical_workspace_relative_path(root.parent / "workspace2" / "child", root)
+            with self.assertRaises(StorePreflightError):
+                _canonical_workspace_relative_path(root / ".." / "outside", root)
+
+    @unittest.skipUnless(os.name == "nt", "Windows namespace contract")
+    def test_extended_drive_namespace_variants_share_relative_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            child = root / ".delivery-system" / "state.sqlite3-journal"
+            extended_root = Path("\\\\?\\" + str(root))
+            extended_child = Path("\\\\?\\" + str(child))
+            for candidate_root, candidate in (
+                (root, child),
+                (root, extended_child),
+                (extended_root, child),
+                (extended_root, extended_child),
+            ):
+                with self.subTest(root=str(candidate_root), candidate=str(candidate)):
+                    self.assertEqual(
+                        _canonical_workspace_relative_path(candidate, candidate_root),
+                        ".delivery-system/state.sqlite3-journal",
+                    )
+
+    @unittest.skipUnless(os.name == "nt", "Windows namespace contract")
+    def test_extended_drive_namespace_is_supported_by_both_git_helpers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            child = root / ".delivery-system" / "state.sqlite3-journal"
+            extended_root = Path("\\\\?\\" + str(root))
+            extended_child = Path("\\\\?\\" + str(child))
+            for helper in (_default_ignored, _default_tracked):
+                for candidate_root, candidate in (
+                    (root, extended_child),
+                    (extended_root, child),
+                ):
+                    with self.subTest(helper=helper.__name__, root=str(candidate_root)):
+                        with patch("delivery_system.runtime.subprocess.run") as run:
+                            run.return_value.returncode = 0
+                            self.assertTrue(helper(candidate, candidate_root))
+                            self.assertEqual(run.call_args.args[0][-1], ".delivery-system/state.sqlite3-journal")
+
+    @unittest.skipUnless(os.name == "nt", "Windows namespace contract")
+    def test_store_preflight_accepts_equivalent_extended_drive_state_paths(self):
+        for state_root_is_extended in (False, True):
+            with self.subTest(state_root_is_extended=state_root_is_extended):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    extended_root = Path("\\\\?\\" + str(root))
+                    normalized_root = extended_root if state_root_is_extended else root
+                    state_root = root if state_root_is_extended else extended_root
+                    context = RuntimeContext(
+                        workspace_root=str(root),
+                        normalized_workspace_root=str(normalized_root),
+                        workspace_identity="ws_v1_test",
+                        state_path=str(state_root / ".delivery-system" / "state.sqlite3"),
+                    )
+                    context.ensure_store_ready(
+                        ignore_checker=lambda _: True,
+                        tracked_checker=lambda _: False,
+                    )
+                    self.assertTrue((root / ".delivery-system").is_dir())
+
+    @unittest.skipUnless(os.name == "nt", "Windows namespace contract")
+    def test_unsupported_namespace_mismatch_fails_closed(self):
+        root = Path("C:\\workspace")
+        device_child = Path("\\\\?\\UNC\\server\\share\\workspace\\child")
+        with self.assertRaises(StorePreflightError):
+            _canonical_workspace_relative_path(device_child, root)
+        with self.assertRaises(StorePreflightError):
+            _canonical_workspace_relative_path(Path("D:\\workspace\\child"), root)
+
     def test_runtime_context_is_explicit_and_normalized(self):
         with tempfile.TemporaryDirectory() as directory:
             context = RuntimeContext.from_workspace_root(directory)
