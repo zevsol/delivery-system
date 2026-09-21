@@ -37,6 +37,33 @@ class PC2BWriteFoundationTests(unittest.TestCase):
         self.assertNotIn("verify_relationship", methods)
         self.assertEqual({item.value for item in WriteObservationKind}, {"DefinitiveSuccess", "DefinitiveRejected", "Ambiguous"})
 
+    def test_v1_application_receipt_create_preserves_historical_binding(self):
+        directory, context = self._context()
+        try:
+            result_payload = {"repository_identity": context.repository_identity, "issue_number": 1}
+            result = {
+                "result_kind": "issue",
+                "result_identity": "issue-1",
+                "result_digest": digest(result_payload),
+                "result_payload": result_payload,
+            }
+            operation = context.expected_operations[0]
+            receipt = OperationReceipt.create(
+                context.identity, 0, operation, context, result,
+                "2026-09-04T00:00:00Z", "2026-09-04T00:00:01Z",
+            )
+            application_receipt = ApplicationReceipt.create(
+                context.identity,
+                context.operation_set_digest,
+                context.expected_operations,
+                (receipt,),
+                "2026-09-04T00:00:00Z",
+                "2026-09-04T00:00:01Z",
+            )
+            self.assertTrue(application_receipt.verify_integrity())
+        finally:
+            directory.cleanup()
+
     def test_direction_marker_and_deterministic_fake_trace(self):
         repository = "owner/repo"
         child = RemoteIssueReference(repository, 2, "202", "I_child")

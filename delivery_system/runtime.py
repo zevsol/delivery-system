@@ -34,7 +34,12 @@ from delivery_system.preview_validation import (
 )
 from delivery_system.write_operations import (
     WriteOperationEvaluation, evaluate_write_operations, normalize_write_operations,
-    operation_set_digest_payload,
+    operation_set_digest_payload, evaluate_write_operations_v2, normalize_write_operations_v2,
+    operation_set_digest_payload_v2,
+)
+from delivery_system.existing_endpoints import (
+    SealedExistingEndpoint, selector_digest, semantic_digest, identity_digest,
+    validate_issue_selector_url, write_address_digest,
 )
 from delivery_system.rules import RuleRegistry, build_registry_v1
 from delivery_system.remote_snapshot import (
@@ -44,6 +49,7 @@ from delivery_system.remote_snapshot import (
     RemoteQueryScope,
     RemoteRelationshipRecord,
     TypedRemoteSnapshot,
+    TypedRemoteSnapshotV2,
     _is_timezone_aware_timestamp,
 )
 from delivery_system.drivers.contract import (
@@ -52,7 +58,7 @@ from delivery_system.drivers.contract import (
     normalize_repository_identity,
 )
 from delivery_system.drivers.preflight import bind_validated_facts, validate_driver_facts
-from delivery_system.runtime_authority import _PROMOTION_MARKER, RuntimePromotion, _reload_promotion
+from delivery_system.runtime_authority import _PROMOTION_MARKER, RuntimePromotion, _reload_promotion as _reload_promotion_v1
 from delivery_system.attestation_github_app import (
     github_app_installation_principal,
     github_app_installation_source_verification_digest,
@@ -68,6 +74,64 @@ from delivery_system.store_reads import (
     read_sqlite_preview_latest,
     read_sqlite_preview_revision,
 )
+
+
+def _normalize_canonical_operations(canonical: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
+    if canonical.get("canonical_version") == "2":
+        return tuple(normalize_write_operations_v2(canonical.get("operation_intents", [])))
+    return tuple(normalize_write_operations(canonical.get("operation_intents", [])))
+
+
+def _execution_operations(canonical: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
+    """Encode V2 operands into the legacy receipt-safe operation envelope.
+
+    The public Preview remains typed V2; durable execution artifacts retain the
+    existing operation schema and use tagged refs so old receipt validators stay
+    unchanged while preserving endpoint provenance in operation identities.
+    """
+    operations = _normalize_canonical_operations(canonical)
+    if canonical.get("canonical_version") != "2":
+        return operations
+    encoded = []
+    for operation in operations:
+        if operation["operation_kind"] == "create_issue":
+            encoded.append({"operation_kind": "create_issue", "client_refs": [operation["endpoint"]["client_ref"]], "depends_on": []})
+        else:
+            refs = []
+            for operand in operation["operands"]:
+                prefix = "work_item:" if operand["endpoint_type"] == "work_item" else "existing_issue:"
+                key = "client_ref" if operand["endpoint_type"] == "work_item" else "endpoint_ref"
+                refs.append(prefix + operand[key])
+            encoded.append({"operation_kind": operation["operation_kind"], "client_refs": refs, "depends_on": []})
+    return tuple(encoded)
+
+
+def _reload_promotion(store: Any, canonical: Mapping[str, Any], evidence: Sequence[Mapping[str, Any]]) -> RuntimePromotion | None:
+    if canonical.get("canonical_version") != "2":
+        return _reload_promotion_v1(store, canonical, evidence)
+    if canonical.get("preview_level") not in {PreviewLevel.REPOSITORY_AWARE.value, PreviewLevel.WRITE_ELIGIBLE.value}:
+        return None
+    trust = getattr(store, "trust_context", None)
+    driver_records = [record for record in evidence if record.get("source_kind") == "driver"]
+    if trust is None or len(driver_records) != 1:
+        raise ValueError("repository_aware_promotion_required")
+    record = EvidenceRecord.from_dict(driver_records[0])
+    if record.source_identity != trust.trusted_driver_identity:
+        raise ValueError("driver_trust_context_mismatch")
+    remote = canonical.get("remote_snapshot")
+    if not isinstance(remote, Mapping):
+        raise ValueError("remote_snapshot_invalid")
+    snapshot = TypedRemoteSnapshotV2.from_records(
+        str(remote.get("repository_identity")), remote.get("query_scope", {}), remote.get("query_complete"), remote.get("pagination_complete"),
+        remote.get("issue_records", []), remote.get("permissions", {}), remote.get("capabilities", []), remote.get("relationship_records", []),
+        remote.get("evidence_ids", []), remote.get("observed_at"),
+    )
+    if tuple(sorted(snapshot.evidence_ids)) != (record.evidence_id,):
+        raise ValueError("snapshot_evidence_mismatch")
+    promotion = RuntimePromotion._create(trust, record, snapshot, digest(record.payload), snapshot.digest())
+    if canonical.get("remote_authority") != trust.remote_authority or canonical.get("remote_snapshot_digest") != promotion.remote_snapshot_digest:
+        raise ValueError("driver_trust_context_mismatch")
+    return promotion
 
 
 class StorePreflightError(RuntimeError):
@@ -217,13 +281,19 @@ def _preview_is_approval_eligible(preview: Mapping[str, Any]) -> bool:
             canonical.get("blockers") != []):
         return False
     try:
-        evaluation = evaluate_write_operations(
-            canonical["operation_intents"], canonical["items"], canonical["semantic_payload"],
-        )
+        if canonical.get("canonical_version") == "2":
+            remote = canonical.get("remote_snapshot") or {}
+            evaluation = evaluate_write_operations_v2(canonical["operation_intents"], canonical["items"], canonical["semantic_payload"], canonical.get("existing_endpoint_bindings", []), remote.get("relationship_records", []))
+            operation_digest = digest(operation_set_digest_payload_v2(evaluation.operations))
+            plan_digest = digest({"canonical_version": "2", "semantic_payload": canonical["semantic_payload"]})
+        else:
+            evaluation = evaluate_write_operations(canonical["operation_intents"], canonical["items"], canonical["semantic_payload"])
+            operation_digest = digest(operation_set_digest_payload(evaluation.operations))
+            plan_digest = digest(canonical["semantic_payload"])
         return (
             evaluation.eligible
-            and canonical.get("operation_set_digest") == digest(operation_set_digest_payload(evaluation.operations))
-            and canonical.get("plan_digest") == digest(canonical["semantic_payload"])
+            and canonical.get("operation_set_digest") == operation_digest
+            and canonical.get("plan_digest") == plan_digest
             and canonical.get("sealed_preview_digest") == digest({
                 key: value for key, value in canonical.items() if key != "sealed_preview_digest"
             })
@@ -1425,7 +1495,139 @@ class RuntimePlanner:
         })
         return result
 
+    @staticmethod
+    def _is_v2_plan(plan: Mapping[str, Any]) -> bool:
+        return bool(plan.get("existing_issue_endpoints")) or any(
+            isinstance(rel, Mapping) and (rel.get("from_endpoint") is not None or rel.get("to_endpoint") is not None)
+            for rel in plan.get("planned_relationships", ())
+        )
+
+    def _preview_v2(self, plan: Mapping[str, Any], previous_preview_id: str | None = None) -> dict[str, Any]:
+        """Plan the explicit mixed-endpoint V2 contract without changing V1 code paths."""
+        work_items = list(plan.get("work_items", ()))
+        item_refs = [item.get("client_ref") for item in work_items]
+        if not item_refs or any(not isinstance(ref, str) or not ref for ref in item_refs) or len(item_refs) != len(set(item_refs)):
+            raise ValueError("client_ref must be unique within a Draft")
+        endpoint_declarations = list(plan.get("existing_issue_endpoints", ()))
+        endpoint_refs = [entry.get("endpoint_ref") for entry in endpoint_declarations if isinstance(entry, Mapping)]
+        if (len(endpoint_refs) != len(endpoint_declarations) or any(not isinstance(ref, str) or not ref for ref in endpoint_refs)
+                or len(endpoint_refs) != len(set(endpoint_refs))):
+            raise ValueError("existing_endpoint_ref_invalid")
+        if set(item_refs) & set(endpoint_refs):
+            raise ValueError("write_operation_reference_namespace_collision")
+        semantic = {
+            "repository_claim": plan.get("repository_claim"),
+            "existing_issue_claims": list(plan.get("existing_issue_claims", ())),
+            "existing_issue_endpoints": endpoint_declarations,
+            "work_items": [{
+                "client_ref": item["client_ref"],
+                "previous_client_ref": item.get("previous_client_ref"),
+                **{field: self._sourced(item[field]) for field in (
+                    "role", "title", "context_problem", "outcome", "scope", "non_goals",
+                    "acceptance_criteria", "verification", "required_capabilities", "write_metadata",
+                )},
+            } for item in work_items],
+            "planned_relationships": list(plan.get("planned_relationships", ())),
+        }
+        operation_intents = [dict(operation) for operation in plan.get("operation_intents", ())]
+        repository_claim = plan.get("repository_claim")
+        repository_name = None
+        if isinstance(repository_claim, Mapping):
+            owner, name = repository_claim.get("owner"), repository_claim.get("name")
+            if isinstance(owner, str) and isinstance(name, str) and owner.strip() and name.strip():
+                repository_name = f"{owner.strip()}/{name.strip()}"
+        plan_digest = digest({"canonical_version": "2", "semantic_payload": semantic})
+        operation_set_digest = digest(operation_set_digest_payload_v2(operation_intents))
+        request_id = self._id("request"); preview_id = self._id("preview"); revision = 1
+        validated_facts = None; failures: tuple[Any, ...] = (); promotion = None
+        query_scope = {
+            "api_origin": getattr(self.trust_context, "origin", "offline://driver"), "api_version": "2026-03-10",
+            "issue_state": "all", "pull_request_filter": "pull_request_field_excluded",
+            "relationships": ["sub_issues", "parent", "blocked_by", "blocking"],
+            "pagination_protocol": "link-header", "budget_profile": "github-rest-offline-v1",
+        }
+        if repository_name is not None and self.driver is not None:
+            validated_facts, failures = validate_driver_facts(self.driver, repository_name, query_scope, self.trust_context.trusted_driver_identity)
+        blockers = [failure.code for failure in failures]
+        sealed_items = [{"client_ref": item["client_ref"], "previous_client_ref": item.get("previous_client_ref"), "item_id": self._id("item")} for item in work_items]
+        snapshot_payload = None; snapshot_digest = None; repository_identity = None; remote_authority = None
+        endpoint_bindings: list[dict[str, Any]] = []
+        if validated_facts is not None:
+            bound = bind_validated_facts(
+                validated_facts, RuntimeEvidenceBinding(self.context.workspace_identity, preview_id, revision), self.trust_context,
+                snapshot_schema_version="remote-snapshot-v2",
+            )
+            promotion = bound.promotion; snapshot_payload = bound.snapshot.to_dict(); snapshot_digest = bound.remote_snapshot_digest
+            repository_identity = validated_facts.response.canonical_repository; remote_authority = self.trust_context.remote_authority
+            records = list(snapshot_payload.get("issue_records", []))
+            for declaration in endpoint_declarations:
+                selector = {key: declaration.get(key) for key in ("number", "url") if declaration.get(key) is not None}
+                if not selector:
+                    blockers.append("existing_endpoint_selector_invalid"); continue
+                matches = []
+                for record in records:
+                    number_match = selector.get("number") is None or record.get("issue_number") == selector.get("number")
+                    url = selector.get("url")
+                    url_match = True
+                    if url is not None:
+                        try:
+                            url_number = validate_issue_selector_url(url, repository_name)
+                            url_match = url_number == record.get("issue_number")
+                        except ValueError as exc:
+                            if str(exc) == "existing_endpoint_repository_mismatch":
+                                blockers.append(str(exc))
+                            url_match = False
+                    if number_match and url_match:
+                        matches.append(record)
+                if len(matches) != 1:
+                    blockers.append("existing_endpoint_not_found" if not matches else "existing_endpoint_selector_mismatch"); continue
+                record = matches[0]
+                binding = SealedExistingEndpoint(
+                    declaration["endpoint_ref"], selector_digest(selector), record["issue_id"], digest(record),
+                    identity_digest(record), write_address_digest(record), semantic_digest(record),
+                ).to_dict()
+                endpoint_bindings.append(binding)
+        elif repository_name is not None:
+            blockers.append("driver_unavailable" if self.driver is None else "remote_observation_unavailable")
+        try:
+            operation_evaluation = evaluate_write_operations_v2(
+                operation_intents, sealed_items, semantic, endpoint_bindings,
+                (snapshot_payload or {}).get("relationship_records", []),
+            )
+        except (TypeError, ValueError):
+            operation_evaluation = WriteOperationEvaluation((), False, ("write_operation_contract_invalid",))
+        blockers.extend(operation_evaluation.blockers)
+        preview_level = PreviewLevel.WRITE_ELIGIBLE if snapshot_payload is not None and operation_evaluation.eligible and not blockers else (PreviewLevel.REPOSITORY_AWARE if snapshot_payload is not None else PreviewLevel.CONCEPTUAL)
+        canonical = {
+            "workspace_identity": self.context.workspace_identity, "request_id": request_id, "preview_id": preview_id, "revision": revision,
+            "preview_level": preview_level.value, "provenance_status": "declared_unverified", "repository_identity": repository_identity,
+            "remote_authority": remote_authority, "semantic_payload": semantic, "operation_intents": list(operation_evaluation.operations or operation_intents),
+            "plan_digest": plan_digest, "operation_set_digest": operation_set_digest, "remote_snapshot": snapshot_payload,
+            "remote_snapshot_digest": snapshot_digest, "items": sealed_items, "evidence_ids": [], "blockers": sorted(set(blockers)),
+            "planner_observations": [], "canonical_version": "2", "existing_endpoint_bindings": endpoint_bindings,
+        }
+        evidence = []
+        for sealed_item in semantic["work_items"]:
+            for field in ("role", "title", "context_problem", "outcome", "scope", "non_goals", "acceptance_criteria", "verification", "required_capabilities", "write_metadata"):
+                sourced = sealed_item[field]
+                evidence.append(EvidenceRecord._create_controlled(self.context.workspace_identity, preview_id, revision, "declared_field", "declared", DeclaredSource(sourced["declared_source"]), f"{sealed_item['client_ref']}.{field}", sourced, None, "runtime-planner", None, None, "evidence-v1"))
+        if promotion is not None:
+            evidence.append(promotion.evidence_record)
+        canonical["evidence_ids"] = [record.evidence_id for record in evidence]
+        canonical["sealed_preview_digest"] = digest({key: value for key, value in canonical.items() if key != "sealed_preview_digest"})
+        canonical = SealedPreview.from_dict(canonical).to_dict()
+        save_args = dict(request_id=request_id, preview_id=preview_id, revision=revision, plan_digest=plan_digest, remote_snapshot_digest=snapshot_digest, operation_set_digest=operation_set_digest, repository_identity=repository_identity, items=sealed_items, workspace_identity=self.context.workspace_identity, canonical_payload=canonical, evidence_records=[record.to_dict() for record in evidence])
+        if promotion is not None:
+            self.store._bind_and_save_repository_aware_preview(promotion, **save_args)
+        else:
+            self.store.save_preview_revision(**save_args)
+        result = dict(canonical)
+        result.update({"remote_snapshot": None, "findings": [], "stale": False, "write_eligible": preview_level == PreviewLevel.WRITE_ELIGIBLE, "audit_context_digest": compute_audit_context_digest(self.context.workspace_identity, preview_id, revision, canonical["sealed_preview_digest"], [record.to_dict() for record in evidence])})
+        return result
+
     def preview(self, plan: Mapping[str, Any], previous_preview_id: str | None = None) -> dict[str, Any]:
+        if self._is_v2_plan(plan):
+            return self._preview_v2(plan, previous_preview_id)
         work_items = list(plan.get("work_items", ()))
         refs = [item["client_ref"] for item in work_items]
         if len(refs) != len(set(refs)):
@@ -1762,6 +1964,7 @@ class RuntimeApprovalAuthorityService:
                  authority_binding_store: Any = None, authority_binding_verifier: Any = None,
                  attestation_persistence_store: Any = None,
                  restart_credential_verifier: Any = None,
+                 existing_endpoint_revalidator: Any = None,
                  rule_registry: RuleRegistry | None = None) -> None:
         if not isinstance(context, RuntimeContext) or not callable(clock):
             raise TypeError("approval_runtime_boundary_invalid")
@@ -1787,6 +1990,9 @@ class RuntimeApprovalAuthorityService:
         self._authority_binding_verifier = authority_binding_verifier
         self._attestation_persistence_store = attestation_persistence_store
         self._restart_credential_verifier = restart_credential_verifier
+        if existing_endpoint_revalidator is not None and not callable(existing_endpoint_revalidator):
+            raise ValueError("existing_endpoint_revalidator_invalid")
+        self._existing_endpoint_revalidator = existing_endpoint_revalidator
         if host_credential_lease is not None:
             if type(host_credential_lease) is not GitHubAppInstallationCredentialLease:
                 raise ValueError("host_credential_capability_invalid")
@@ -2075,7 +2281,7 @@ class RuntimeApprovalAuthorityService:
             if not isinstance(canonical, Mapping):
                 raise ValueError("application_authority_rejected")
             try:
-                operations = tuple(normalize_write_operations(canonical["operation_intents"]))
+                operations = _execution_operations(canonical)
             except (KeyError, TypeError, ValueError) as exc:
                 raise ValueError("operation_set_mismatch") from exc
             if not operations:
@@ -2220,7 +2426,7 @@ class RuntimeApprovalAuthorityService:
             if not isinstance(canonical, Mapping):
                 raise ValueError("application_authority_rejected")
             try:
-                operations = tuple(normalize_write_operations(canonical["operation_intents"]))
+                operations = _execution_operations(canonical)
             except (KeyError, TypeError, ValueError) as exc:
                 raise ValueError("operation_set_mismatch") from exc
             if not operations:
@@ -2398,7 +2604,7 @@ class RuntimeApprovalAuthorityService:
             if not isinstance(canonical, Mapping):
                 raise ValueError("restart_reconstruction_current_state_invalid")
             try:
-                operations = tuple(normalize_write_operations(canonical["operation_intents"]))
+                operations = _execution_operations(canonical)
                 resolver = getattr(self.attestation_service, "_RuntimeAttestationOrchestrationService__resolver")
                 required = tuple(sorted(resolver.resolve(tuple(dict(item) for item in operations))))
             except Exception as exc:
@@ -2706,7 +2912,7 @@ class RuntimeApprovalAuthorityService:
                     )):
                         return False
                 identity = LogicalApplicationIdentity.from_authority(values)
-                canonical_operations = tuple(normalize_write_operations(canonical["operation_intents"]))
+                canonical_operations = _execution_operations(canonical)
                 expected_operations = tuple(
                     operation_identity(identity.application_id, index, operation)
                     for index, operation in enumerate(canonical_operations)
@@ -2765,7 +2971,7 @@ class RuntimeApprovalAuthorityService:
             entry = self._execution_context_registry.get(id(context))
             if entry is None or entry[0] is not context or context._service is not self:
                 raise ValueError("runtime_context_owner_mismatch")
-            authority, identity, anchor, operations, operation_digest, items = entry[1]
+            authority, identity, anchor, operations, operation_digest, items, canonical_version, endpoint_bindings, remote_snapshot = entry[1]
             current = self._authorities.get(authority.authority_id)
             if current is None or not self.validate_application_authority(current):
                 raise ValueError("runtime_authority_invalid")
@@ -2773,7 +2979,8 @@ class RuntimeApprovalAuthorityService:
                 raise ValueError("runtime_context_owner_mismatch")
             if (context.identity.to_dict() != identity or context.continuity_anchor.to_dict() != anchor or
                 context._expected_operations != operations or context.operation_set_digest != operation_digest or
-                context._items != items):
+                context._items != items or context._canonical_version != canonical_version or
+                context._existing_endpoint_bindings != endpoint_bindings or context._remote_snapshot != remote_snapshot):
                 raise ValueError("runtime_context_owner_mismatch")
             if (LogicalApplicationIdentity.from_authority(authority).to_dict() != identity or
                     CredentialContinuityAnchor.from_authority(authority).to_dict() != anchor or
@@ -2798,7 +3005,7 @@ class RuntimeApprovalAuthorityService:
         canonical_preview = preview.get("canonical_payload")
         if not isinstance(canonical_preview, Mapping):
             raise ValueError("operation_set_mismatch")
-        operations = tuple(normalize_write_operations(canonical_preview["operation_intents"]))
+        operations = _execution_operations(canonical_preview)
         identity = LogicalApplicationIdentity.from_authority(authority)
         if canonical_preview.get("operation_set_digest") != identity.values()["operation_set_digest"]:
             raise ValueError("operation_set_mismatch")
@@ -2808,6 +3015,9 @@ class RuntimeApprovalAuthorityService:
         object.__setattr__(context, "identity", identity)
         object.__setattr__(context, "continuity_anchor", CredentialContinuityAnchor.from_authority(authority))
         object.__setattr__(context, "_expected_operations", operations)
+        object.__setattr__(context, "_canonical_version", canonical_preview.get("canonical_version"))
+        object.__setattr__(context, "_existing_endpoint_bindings", tuple(deepcopy(canonical_preview.get("existing_endpoint_bindings", []))))
+        object.__setattr__(context, "_remote_snapshot", deepcopy(canonical_preview.get("remote_snapshot")))
         object.__setattr__(context, "operation_set_digest", identity.values()["operation_set_digest"])
         # ``items`` in the sealed payload is only the stable reference/index
         # projection.  Execution needs the approved sourced fields as well;
@@ -2829,7 +3039,8 @@ class RuntimeApprovalAuthorityService:
             raise ValueError("sealed_item_projection_invalid")
         object.__setattr__(context, "_items", frozen_items)
         snapshot = (authority, identity.to_dict(), context.continuity_anchor.to_dict(), operations,
-                    context.operation_set_digest, frozen_items)
+                    context.operation_set_digest, frozen_items, context._canonical_version,
+                    context._existing_endpoint_bindings, context._remote_snapshot)
         self._execution_context_registry[id(context)] = (context, snapshot)
         object.__setattr__(context, "_provenance", AuthorityProvenance._from_live_authority(authority, context))
         return context
@@ -2838,7 +3049,8 @@ class RuntimeApplicationExecutionContext:
     """Ephemeral service-owned boundary for constructing new PC2-A evidence."""
 
     __slots__ = ("_service", "_authority", "identity", "continuity_anchor", "_expected_operations",
-                 "operation_set_digest", "_provenance", "_items")
+                 "operation_set_digest", "_provenance", "_items", "_canonical_version",
+                 "_existing_endpoint_bindings", "_remote_snapshot")
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         raise ValueError("runtime_context_internal_only")
@@ -2878,6 +3090,27 @@ class RuntimeApplicationExecutionContext:
 
     def __setattr__(self, name: str, value: Any) -> None:
         raise AttributeError("runtime_execution_context_immutable")
+
+    def revalidate_existing_endpoint(
+        self,
+        endpoint_ref: str,
+        operation_kind: str | None = None,
+        references: tuple[Any, ...] | list[Any] | None = None,
+    ) -> None:
+        """Invoke the composed read-only pre-mutation boundary when present.
+
+        The default service has no live read adapter during offline execution;
+        in that case the sealed V2 binding remains the only trusted source and
+        the caller must still fail closed on any binding mismatch.
+        """
+        verifier = getattr(self._service, "_existing_endpoint_revalidator", None)
+        if verifier is None:
+            return
+        if not callable(verifier):
+            raise ValueError("existing_endpoint_revalidator_invalid")
+        result = verifier(self, endpoint_ref, operation_kind, references)
+        if result is False:
+            raise ValueError("existing_endpoint_semantic_stale")
 
     def _require_current(self) -> None:
         self._service.validate_execution_context(self)
@@ -3126,9 +3359,17 @@ class RuntimeApplicationStatusService:
                     raise ValueError("application_binding_conflict")
                 raise ValueError("preview_digest_mismatch")
         try:
-            operations = normalize_write_operations(normalized["operation_intents"])
-            if digest(operation_set_digest_payload(operations)) != values["operation_set_digest"]:
+            # Preview digests cover canonical operations; execution envelopes
+            # are a separate projection used for receipt identities.
+            canonical_operations = normalized.get("operation_intents", [])
+            op_digest = (
+                digest(operation_set_digest_payload_v2(canonical_operations))
+                if normalized.get("canonical_version") == "2"
+                else digest(operation_set_digest_payload(canonical_operations))
+            )
+            if op_digest != values["operation_set_digest"]:
                 raise ValueError("preview_digest_mismatch")
+            operations = _execution_operations(normalized)
         except ValueError:
             raise
         except (TypeError, KeyError):
@@ -3578,6 +3819,49 @@ class ApplicationPostconditionObservation:
 
     def _resolve_operands(self, identity: Any, operations: tuple[dict[str, Any], ...],
                           operation_index: int, operation: Mapping[str, Any]) -> tuple[Any, Any]:
+        operands = operation.get("operands")
+        if isinstance(operands, list) or any(isinstance(ref, str) and (ref.startswith("existing_issue:") or ref.startswith("work_item:")) for ref in operation.get("client_refs", [])):
+            if operands is None:
+                operands = []
+                for ref in operation.get("client_refs", []):
+                    if isinstance(ref, str) and ref.startswith("work_item:"):
+                        operands.append({"endpoint_type": "work_item", "client_ref": ref.split(":", 1)[1]})
+                    elif isinstance(ref, str) and ref.startswith("existing_issue:"):
+                        operands.append({"endpoint_type": "existing_issue", "endpoint_ref": ref.split(":", 1)[1]})
+            if operation.get("operation_kind") not in self._RELATIONSHIP_KINDS or len(operands) != 2:
+                raise ValueError("reconciliation_correlation_invalid")
+            try:
+                preview = self.store._read_preview_revision_for_status(identity.values()["workspace_identity"], identity.values()["preview_id"], identity.values()["revision"])
+                canonical = preview.get("canonical_payload", {})
+                bindings = canonical.get("existing_endpoint_bindings", [])
+                snapshot = canonical.get("remote_snapshot", {})
+            except (TypeError, KeyError, ValueError):
+                raise ValueError("reconciliation_correlation_invalid") from None
+            resolved = []
+            for operand in operands:
+                if not isinstance(operand, Mapping):
+                    raise ValueError("reconciliation_correlation_invalid")
+                if operand.get("endpoint_type") == "work_item":
+                    client_ref = operand.get("client_ref")
+                    matches = [(index, candidate) for index, candidate in enumerate(operations[:operation_index]) if candidate.get("operation_kind") == "create_issue" and (candidate.get("endpoint", {}).get("client_ref") == client_ref or candidate.get("client_refs") == [client_ref])]
+                    if len(matches) != 1:
+                        raise ValueError("operation_receipt_not_found")
+                    create_index, create_operation = matches[0]
+                    create_id = operation_identity(identity.application_id, create_index, create_operation)
+                    receipt = self._load_operation_receipt(self.execution_store, identity.application_id, create_id)
+                    resolved.append(self._receipt_operand(receipt, identity.application_id, identity, create_id, create_index, create_operation, identity.values()["repository_identity"]))
+                elif operand.get("endpoint_type") == "existing_issue":
+                    binding = next((value for value in bindings if value.get("endpoint_ref") == operand.get("endpoint_ref")), None)
+                    record = next((value for value in snapshot.get("issue_records", []) if isinstance(binding, Mapping) and value.get("issue_id") == binding.get("issue_id")), None)
+                    if not isinstance(binding, Mapping) or not isinstance(record, Mapping) or digest(dict(record)) != binding.get("remote_record_digest"):
+                        raise ValueError("reconciliation_correlation_invalid")
+                    from delivery_system.drivers.write_contract import RemoteIssueReference
+                    resolved.append(RemoteIssueReference(identity.values()["repository_identity"], record["issue_number"], str(record["numeric_issue_id"]), record["issue_id"]))
+                else:
+                    raise ValueError("reconciliation_correlation_invalid")
+            if resolved[0] == resolved[1]:
+                raise ValueError("reconciliation_correlation_invalid")
+            return resolved[0], resolved[1]
         refs = operation.get("client_refs")
         if (
             operation.get("operation_kind") not in self._RELATIONSHIP_KINDS

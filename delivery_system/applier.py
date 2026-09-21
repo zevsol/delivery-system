@@ -128,7 +128,16 @@ def _apply(service: Any, store: SQLiteExecutionStore, capability: Any, authority
             command = _materialize(context, attempt, store)
         except ValueError as exc:
             code = str(exc)
-            target = "Blocked" if code in {"write_reference_unavailable", "write_executor_invalid", "runtime_authority_required"} else "Failed"
+            currentness = {
+                "existing_endpoint_not_found", "existing_endpoint_repository_mismatch",
+                "existing_endpoint_identity_mismatch", "existing_endpoint_write_address_invalid",
+                "existing_endpoint_semantic_stale", "relationship_already_exists",
+                "remote_observation_unavailable",
+            }
+            if code in currentness:
+                target = "Blocked"
+            else:
+                target = "Blocked" if code in {"write_reference_unavailable", "write_executor_invalid", "runtime_authority_required"} else "Failed"
             state = store.settle_operation(capability, application_id, state.state_digest, attempt.operation_identity,
                                            attempt.attempt_digest, owner, context, target, code, service._utc(service.clock()))
             return ApplyResult(application_id, state.state, state.next_operation_index, recovery_code=code)
@@ -199,6 +208,41 @@ def _apply(service: Any, store: SQLiteExecutionStore, capability: Any, authority
 
 def _materialize(context: Any, attempt: Any, store: SQLiteExecutionStore) -> Any:
     operation = attempt.operation
+    if "operands" in operation or "endpoint" in operation:
+        kind = operation["operation_kind"]
+        if kind == "create_issue":
+            endpoint = operation.get("endpoint")
+            if not isinstance(endpoint, Mapping) or endpoint.get("endpoint_type") != "work_item":
+                raise ValueError("write_reference_unavailable")
+            refs = [endpoint.get("client_ref")]
+            items = {item["client_ref"]: item for item in context.canonical_items}
+            if refs[0] not in items:
+                raise ValueError("write_reference_unavailable")
+            title, body = render_create_issue(items[refs[0]])
+            return CreateIssueCommand(context.repository_identity, refs[0], title, body, attempt.request_identity)
+        if kind in {"add_sub_issue", "add_dependency"}:
+            operands = operation.get("operands")
+            if not isinstance(operands, list) or len(operands) != 2:
+                raise ValueError("write_reference_unavailable")
+            references = []
+            existing_refs = []
+            for operand in operands:
+                if not isinstance(operand, Mapping):
+                    raise ValueError("write_reference_unavailable")
+                if operand.get("endpoint_type") == "work_item":
+                    references.append(_reference_from_receipt(context, store, operand.get("client_ref")))
+                elif operand.get("endpoint_type") == "existing_issue":
+                    existing_ref = operand.get("endpoint_ref")
+                    existing_refs.append(existing_ref)
+                    references.append(_reference_from_existing_binding(context, existing_ref, revalidate=False))
+                else:
+                    raise ValueError("write_reference_unavailable")
+            if references[0] == references[1]:
+                raise ValueError("write_reference_unavailable")
+            for endpoint_ref in existing_refs:
+                context.revalidate_existing_endpoint(endpoint_ref, kind, references)
+            return RelationshipCommand(context.repository_identity, references[0], references[1])
+        raise ValueError("write_operation_kind_invalid")
     items = {item["client_ref"]: item for item in context.canonical_items}
     kind = operation["operation_kind"]
     refs = operation["client_refs"]
@@ -206,6 +250,28 @@ def _materialize(context: Any, attempt: Any, store: SQLiteExecutionStore) -> Any
         title, body = render_create_issue(items[refs[0]])
         return CreateIssueCommand(context.repository_identity, refs[0], title, body, attempt.request_identity)
     if kind in {"add_sub_issue", "add_dependency"}:
+        if getattr(context, "_canonical_version", None) == "2":
+            resolved_refs = []
+            for ref in refs:
+                if isinstance(ref, str) and ref.startswith("work_item:"):
+                    resolved_refs.append(("work_item", ref.split(":", 1)[1]))
+                elif isinstance(ref, str) and ref.startswith("existing_issue:"):
+                    resolved_refs.append(("existing_issue", ref.split(":", 1)[1]))
+                else:
+                    raise ValueError("write_reference_unavailable")
+            references = []
+            existing_refs = []
+            for ref_kind, ref in resolved_refs:
+                if ref_kind == "work_item":
+                    references.append(_reference_from_receipt(context, store, ref))
+                else:
+                    existing_refs.append(ref)
+                    references.append(_reference_from_existing_binding(context, ref, revalidate=False))
+            if references[0] == references[1]:
+                raise ValueError("write_reference_unavailable")
+            for endpoint_ref in existing_refs:
+                context.revalidate_existing_endpoint(endpoint_ref, kind, references)
+            return RelationshipCommand(context.repository_identity, references[0], references[1])
         if any(ref not in items for ref in refs):
             raise ValueError("write_reference_unavailable")
         references = []
@@ -261,3 +327,28 @@ def _reference_from_receipt(context: Any, store: SQLiteExecutionStore, client_re
             break
         return RemoteIssueReference(payload["repository_identity"], payload["issue_number"], payload["numeric_issue_id"], payload["node_id"])
     raise ValueError("write_reference_unavailable")
+
+
+def _reference_from_existing_binding(
+    context: Any,
+    endpoint_ref: str,
+    *,
+    revalidate: bool = True,
+) -> RemoteIssueReference:
+    if not isinstance(endpoint_ref, str) or context._canonical_version != "2":
+        raise ValueError("write_reference_unavailable")
+    if revalidate:
+        context.revalidate_existing_endpoint(endpoint_ref)
+    binding = next((value for value in context._existing_endpoint_bindings if value.get("endpoint_ref") == endpoint_ref), None)
+    snapshot = context._remote_snapshot
+    if not isinstance(binding, Mapping) or not isinstance(snapshot, Mapping):
+        raise ValueError("write_reference_unavailable")
+    record = next((value for value in snapshot.get("issue_records", []) if value.get("issue_id") == binding.get("issue_id")), None)
+    if not isinstance(record, Mapping) or digest(dict(record)) != binding.get("remote_record_digest"):
+        raise ValueError("write_reference_unavailable")
+    if record.get("repository_identity") != context.repository_identity or record.get("item_type") != "issue":
+        raise ValueError("write_reference_unavailable")
+    try:
+        return RemoteIssueReference(context.repository_identity, record["issue_number"], str(record["numeric_issue_id"]), record["issue_id"])
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("write_reference_unavailable") from None

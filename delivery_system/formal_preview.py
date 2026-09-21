@@ -38,9 +38,11 @@ class SealedPreview:
     blockers: tuple[str, ...] = ()
     planner_observations: tuple[dict[str, Any], ...] = ()
     sealed_preview_digest: str = ""
+    canonical_version: str | None = None
+    existing_endpoint_bindings: tuple[dict[str, Any], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
-        return normalize({
+        payload = {
             "workspace_identity": self.workspace_identity,
             "request_id": self.request_id,
             "preview_id": self.preview_id,
@@ -60,7 +62,11 @@ class SealedPreview:
             "blockers": list(self.blockers),
             "planner_observations": list(self.planner_observations),
             "sealed_preview_digest": self.sealed_preview_digest,
-        })
+        }
+        if self.canonical_version is not None:
+            payload["canonical_version"] = self.canonical_version
+            payload["existing_endpoint_bindings"] = list(self.existing_endpoint_bindings)
+        return normalize(payload)
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "SealedPreview":
@@ -73,8 +79,17 @@ class SealedPreview:
             "remote_snapshot_digest", "items", "evidence_ids", "blockers", "planner_observations",
             "sealed_preview_digest",
         }
-        if set(payload) != required:
-            raise ValueError("sealed_preview_schema_invalid")
+        version = payload.get("canonical_version")
+        if version is None:
+            if set(payload) != required:
+                raise ValueError("sealed_preview_schema_invalid")
+        elif version == "2":
+            if set(payload) != required | {"canonical_version", "existing_endpoint_bindings"}:
+                raise ValueError("sealed_preview_schema_invalid")
+            if not isinstance(payload.get("existing_endpoint_bindings"), list) or not all(isinstance(v, Mapping) for v in payload["existing_endpoint_bindings"]):
+                raise ValueError("sealed_preview_endpoint_bindings_invalid")
+        else:
+            raise ValueError("sealed_preview_version_invalid")
         if not all(isinstance(payload.get(key), str) and bool(payload.get(key)) for key in ("workspace_identity", "request_id", "preview_id")):
             raise ValueError("sealed_preview_identity_invalid")
         if not isinstance(payload.get("revision"), int) or isinstance(payload.get("revision"), bool) or payload["revision"] < 1:
@@ -103,6 +118,19 @@ class SealedPreview:
             raise ValueError("sealed_preview_authority_invalid")
         if payload.get("remote_snapshot") is not None and not isinstance(payload["remote_snapshot"], Mapping):
             raise ValueError("sealed_preview_remote_invalid")
+        if payload.get("remote_snapshot") is not None:
+            snapshot_version = payload["remote_snapshot"].get("schema_version")
+            if version is None and snapshot_version == "remote-snapshot-v2":
+                raise ValueError("sealed_preview_v1_v2_hybrid")
+            if version == "2" and snapshot_version != "remote-snapshot-v2":
+                raise ValueError("sealed_preview_v2_snapshot_invalid")
+        if version == "2" and payload.get("existing_endpoint_bindings"):
+            snapshot = payload.get("remote_snapshot")
+            if (not isinstance(snapshot, Mapping) or
+                    snapshot.get("schema_version") != "remote-snapshot-v2" or
+                    not isinstance(payload.get("remote_snapshot_digest"), str) or
+                    not payload.get("remote_snapshot_digest")):
+                raise ValueError("sealed_preview_v2_snapshot_required")
         if payload.get("remote_snapshot_digest") is not None and (not isinstance(payload["remote_snapshot_digest"], str) or not payload["remote_snapshot_digest"]):
             raise ValueError("sealed_preview_remote_digest_invalid")
         return cls(
@@ -125,6 +153,8 @@ class SealedPreview:
             blockers=tuple(str(value) for value in payload.get("blockers", ())),
             planner_observations=tuple(deepcopy(payload.get("planner_observations", ()))),
             sealed_preview_digest=payload["sealed_preview_digest"],
+            canonical_version=version,
+            existing_endpoint_bindings=tuple(deepcopy(payload.get("existing_endpoint_bindings", ()))),
         )
 
     def is_stale(self, current_remote_snapshot_digest: str) -> bool:
