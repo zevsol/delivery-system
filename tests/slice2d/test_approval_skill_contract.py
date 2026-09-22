@@ -94,7 +94,7 @@ class ApprovalSkillContractTests(unittest.TestCase):
     def test_toctou_conflict_replay_and_error_contract(self):
         for phrase in ("context_stale", "preview_stale", "audit_not_found", "audit_stale", "approval_audit_ambiguous", "approval_binding_mismatch", "approval_binding_conflict", "approval_stale", "do not automatically retry", "restart at `delivery_get_audit_context`", "never overwrite"):
             self.assertIn(phrase, self.skill)
-        for phrase in ("Runtime approval replay is idempotent", "There is no read-Approval MCP tool", "current interaction"):
+        for phrase in ("Runtime approval replay is idempotent", "delivery_get_approval_status", "NO_CURRENT_APPROVAL", "current interaction"):
             self.assertIn(phrase, self.skill)
 
     def test_receipt_security_and_no_credentials(self):
@@ -167,32 +167,34 @@ class ApprovalSkillContractTests(unittest.TestCase):
             "may have completed but the host did not receive a reliable response",
             "do not claim success",
             "do not claim failure",
-            "no public Approval status/read MCP tool",
+            "delivery_get_approval_status",
+            "do not claim that the earlier call failed or never executed",
             "Approval is explicit human intent recorded for one exact Preview and Revision",
             "It is not GitHub write permission",
             "ApplicationAuthority",
         ):
             self.assertIn(phrase, self.skill)
 
-    def test_no_new_tool_dependency_and_no_authority_or_apply(self):
+    def test_approval_tool_dependency_and_no_authority_or_apply(self):
         for phrase in (
             "Allowed MCP calls are exactly",
             "delivery_get_audit_context",
             "delivery_record_approval",
+            "delivery_get_approval_status",
             "delivery_get_application_status",
             "delivery_observe_application_postcondition",
             "delivery_apply_approved_work_items",
             "must never call `delivery_issue_application_authority`",
         ):
             self.assertIn(phrase, self.skill)
-        self.assertNotIn("delivery_get_approval", self.metadata)
-        self.assertEqual(self.metadata.count('type: "mcp"'), 2)
+        self.assertIn('value: "delivery_get_approval_status"', self.metadata)
+        self.assertEqual(self.metadata.count('type: "mcp"'), 3)
 
     def test_metadata_interface(self):
         self.assertIn('display_name: "Approve GitHub Work Items"', self.metadata)
         self.assertIn("$approve-github-work-items", self.metadata)
         self.assertIn('transport: "stdio"', self.metadata)
-        self.assertEqual(self.metadata.count('type: "mcp"'), 2)
+        self.assertEqual(self.metadata.count('type: "mcp"'), 3)
 
 
 if __name__ == "__main__":

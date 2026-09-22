@@ -13,3 +13,7 @@ dependencies:
       value: "delivery_record_approval"
       description: "Record explicit Human Approval locally; it does not issue ApplicationAuthority or write to GitHub"
       transport: "stdio"
+    - type: "mcp"
+      value: "delivery_get_approval_status"
+      description: "Read current Approval status and recover a bounded receipt after an uncertain response; it does not mutate Runtime or GitHub"
+      transport: "stdio"

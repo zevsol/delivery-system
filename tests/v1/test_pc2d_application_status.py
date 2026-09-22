@@ -817,7 +817,7 @@ class ApplicationStatusSurfaceTests(unittest.TestCase):
         payload_schema = schema["$defs"][schema["properties"]["payload"]["$ref"].rsplit("/", 1)[1]]
         properties = payload_schema["properties"]
         self.assertEqual(properties["application_id"]["pattern"], r"^application-[0-9a-f]{64}$")
-        self.assertEqual(len(tools), 8)
+        self.assertEqual(len(tools), 9)
 
 
 if __name__ == "__main__":

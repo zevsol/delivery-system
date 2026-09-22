@@ -245,6 +245,18 @@ class RecordApprovalOutput(StrictModel):
     status: Literal["valid"]
 
 
+class ApprovalStatusInput(StrictModel):
+    preview_id: StrictStr = Field(min_length=1)
+    revision: StrictInt = Field(ge=1)
+
+
+class ApprovalStatusOutput(StrictModel):
+    status: Literal["CURRENT", "NO_CURRENT_APPROVAL"]
+    preview_id: StrictStr = Field(min_length=1)
+    revision: StrictInt = Field(ge=1)
+    approval: RecordApprovalOutput | None = None
+
+
 class IssueApplicationAuthorityInput(StrictModel):
     preview_id: str = Field(min_length=1)
     revision: StrictInt = Field(ge=1)
@@ -497,6 +509,21 @@ def create_server(context: RuntimeContext | None = None, store: Any | None = Non
             payload.preview_id, payload.revision, payload.approval_command, payload.approver_claim,
         )
         return RecordApprovalOutput.model_validate(approval.to_dict())
+
+    @mcp.tool(
+        name="delivery_get_approval_status",
+        description=("Read current Approval status and recover a bounded current Approval receipt for an exact "
+                      "Preview and Revision; it never records Approval, issues Authority, or writes GitHub."),
+        annotations=ToolAnnotations(read_only_hint=True, destructive_hint=False, open_world_hint=False),
+        structured_output=True,
+    )
+    def delivery_get_approval_status(payload: ApprovalStatusInput) -> ApprovalStatusOutput:
+        if context is None or store is None:
+            raise ValueError("workspace_identity_unavailable")
+        if approval_authority_service is None:
+            raise ValueError("approval_runtime_boundary_invalid")
+        status = approval_authority_service.get_approval_status(payload.preview_id, payload.revision)
+        return ApprovalStatusOutput.model_validate(status)
 
     @mcp.tool(
         name="delivery_get_application_status",

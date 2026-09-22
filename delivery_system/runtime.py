@@ -2247,6 +2247,52 @@ class RuntimeApprovalAuthorityService:
                 raise ValueError("approval_binding_conflict")
             return existing
 
+    def get_approval_status(self, preview_id: str, revision: int) -> dict[str, Any]:
+        """Read the current Approval binding without recording or issuing authority."""
+        if (
+            not isinstance(preview_id, str)
+            or not preview_id
+            or not isinstance(revision, int)
+            or isinstance(revision, bool)
+            or revision < 1
+        ):
+            raise ValueError("approval_invalid")
+
+        with self._lock:
+            preview, audit = self._resolve_audit(preview_id, revision)
+            approval_id = self._approval_id(audit)
+            try:
+                approval = self.store.get_approval(self.context.workspace_identity, approval_id)
+            except ValueError as exc:
+                if str(exc) != "approval_not_found":
+                    raise
+                return {
+                    "status": "NO_CURRENT_APPROVAL",
+                    "preview_id": preview_id,
+                    "revision": revision,
+                    "approval": None,
+                }
+
+            if not approval.is_structurally_valid():
+                raise ValueError("approval_invalid")
+            if approval.approval_id != approval_id:
+                raise ValueError("approval_invalid")
+            if not self.store.validate_approval_current(approval):
+                raise ValueError("approval_stale")
+            if not _validate_approval_against_current_preview(
+                approval,
+                audit,
+                preview,
+                self.context.workspace_identity,
+            ):
+                raise ValueError("approval_stale")
+            return {
+                "status": "CURRENT",
+                "preview_id": preview_id,
+                "revision": revision,
+                "approval": approval.to_dict(),
+            }
+
     def issue_application_authority(self, preview_id: str, revision: int, approval_id: str) -> Any:
         from delivery_system.application_authority import ApplicationAuthority, _AUTHORITY_MARKER
         from delivery_system.application_identity import LogicalApplicationIdentity, operation_identity

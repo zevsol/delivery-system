@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from copy import copy, deepcopy
 import base64
+from contextlib import closing
 from datetime import datetime, timezone
+import sqlite3
 import tempfile
 import unittest
 from dataclasses import replace
@@ -172,6 +174,198 @@ class OperationalApprovalAuthorityTests(unittest.TestCase):
                     self.assertTrue(store.validate_approval_current(first))
                     with self.assertRaisesRegex(ValueError, "^approval_binding_conflict$"):
                         service.record_approval(preview["preview_id"], 1, command, "other-human")
+                finally:
+                    directory.cleanup()
+
+    def test_approval_status_returns_current_or_no_current_approval_for_both_stores(self):
+        for kind in ("memory", "sqlite"):
+            with self.subTest(store=kind):
+                directory, context, store, preview, audit, service = self._setup(kind)
+                try:
+                    missing = service.get_approval_status(preview["preview_id"], 1)
+                    self.assertEqual(missing["status"], "NO_CURRENT_APPROVAL")
+                    self.assertIsNone(missing["approval"])
+                    command = f"批准写入 {preview['preview_id']} 1"
+                    approval = service.record_approval(preview["preview_id"], 1, command, "human")
+                    current = service.get_approval_status(preview["preview_id"], 1)
+                    self.assertEqual(current["status"], "CURRENT")
+                    self.assertEqual(current["approval"], approval.to_dict())
+                finally:
+                    directory.cleanup()
+
+    def test_approval_status_rejects_invalid_inputs_and_preserves_target_errors(self):
+        directory, context, store, preview, audit, service = self._setup("memory")
+        try:
+            for preview_id, revision in (("", 1), (True, 1), (preview["preview_id"], True), (preview["preview_id"], 0)):
+                with self.subTest(preview_id=preview_id, revision=revision):
+                    with self.assertRaisesRegex(ValueError, "^approval_invalid$"):
+                        service.get_approval_status(preview_id, revision)
+            with self.assertRaisesRegex(ValueError, "^preview_not_found$"):
+                service.get_approval_status("missing-preview", 1)
+            with self.assertRaisesRegex(ValueError, "^preview_stale$"):
+                service.get_approval_status(preview["preview_id"], 2)
+            store._audits[(context.workspace_identity, "extra")] = audit
+            with self.assertRaisesRegex(ValueError, "^approval_audit_ambiguous$"):
+                service.get_approval_status(preview["preview_id"], 1)
+        finally:
+            directory.cleanup()
+
+    def test_approval_status_rejects_malformed_or_stale_approval(self):
+        directory, context, store, preview, audit, service = self._setup("memory")
+        try:
+            command = f"批准写入 {preview['preview_id']} 1"
+            approval = service.record_approval(preview["preview_id"], 1, command, "human")
+            key = next(key for key in store._approvals if key[1] == approval.approval_id)
+            store._approvals[key] = replace(approval, status="invalid")
+            with self.assertRaisesRegex(ValueError, "^approval_invalid$"):
+                service.get_approval_status(preview["preview_id"], 1)
+            store._approvals[key] = replace(approval, repository_identity="other/repository")
+            with self.assertRaisesRegex(ValueError, "^approval_stale$"):
+                service.get_approval_status(preview["preview_id"], 1)
+        finally:
+            directory.cleanup()
+
+    def test_approval_status_rejects_embedded_approval_id_mismatch(self):
+        directory, context, store, preview, audit, service = self._setup("memory")
+        try:
+            command = f"批准写入 {preview['preview_id']} 1"
+            approval = service.record_approval(preview["preview_id"], 1, command, "human")
+            key = next(key for key in store._approvals if key[1] == approval.approval_id)
+            corrupted = replace(approval, approval_id="approval-corrupted-payload-id")
+            self.assertNotEqual(corrupted.approval_id, key[1])
+            store._approvals[key] = corrupted
+            with self.assertRaisesRegex(ValueError, "^approval_invalid$"):
+                service.get_approval_status(preview["preview_id"], 1)
+        finally:
+            directory.cleanup()
+
+    def test_recreated_empty_inmemory_store_returns_preview_not_found(self):
+        directory, context, store, preview, audit, service = self._setup("memory")
+        try:
+            recreated_store = InMemoryPreviewStore(context.workspace_identity, TRUST)
+            recreated_service = RuntimeApprovalAuthorityService(
+                context,
+                recreated_store,
+                None,
+                clock=lambda: NOW,
+                rule_registry=build_registry_v1(),
+            )
+            with self.assertRaisesRegex(ValueError, "^preview_not_found$"):
+                recreated_service.get_approval_status(preview["preview_id"], 1)
+        finally:
+            directory.cleanup()
+
+    def test_approval_status_does_not_project_old_audit_approval_for_new_audit(self):
+        directory, context, store, preview, audit, service = self._setup("memory")
+        try:
+            command = f"批准写入 {preview['preview_id']} 1"
+            old_approval = service.record_approval(preview["preview_id"], 1, command, "human")
+            store.transition_audit_status(audit.audit_id, AuditStatus.STALE, "re-audit")
+            auditor = RuntimeAuditor(context, store, build_registry_v1(), TRUST)
+            audit_context = auditor.get_context(preview["preview_id"], 1)
+            evaluations = [
+                RuleEvaluationDraft(
+                    rule["rule_id"], rule["rule_version"], SemanticOutcome.PASSED, "re-audited",
+                )
+                for rule in audit_context["semantic_rule_contexts"] if rule["applicability"] == "Applicable"
+            ]
+            new_audit = auditor.record_audit(
+                preview["preview_id"], 1, audit_context["audit_context_digest"], evaluations, [],
+            )
+            self.assertNotEqual(service._approval_id(new_audit), old_approval.approval_id)
+            status = service.get_approval_status(preview["preview_id"], 1)
+            self.assertEqual(status["status"], "NO_CURRENT_APPROVAL")
+            self.assertIsNone(status["approval"])
+        finally:
+            directory.cleanup()
+
+    def test_approval_status_is_read_only_and_sqlite_survives_store_recreation(self):
+        for kind in ("memory", "sqlite"):
+            with self.subTest(store=kind):
+                directory, context, store, preview, audit, service = self._setup(kind)
+                try:
+                    command = f"批准写入 {preview['preview_id']} 1"
+                    approval = service.record_approval(preview["preview_id"], 1, command, "human")
+                    authority_state_names = (
+                        "_authorities", "_authority_issuance_ids", "_live_credential_contexts",
+                        "_restart_authority_provenance",
+                    )
+                    authority_state_before = {
+                        name: deepcopy(getattr(service, name)) for name in authority_state_names
+                    }
+                    if kind == "memory":
+                        store_state_before = {
+                            name: deepcopy(getattr(store, name))
+                            for name in ("_previews", "_preview_history", "_audits", "_approvals", "_evidence")
+                        }
+                    else:
+                        with closing(sqlite3.connect(store.path)) as connection:
+                            sqlite_state_before = (
+                                connection.execute(
+                                    "SELECT workspace_identity, record_type, record_id, revision, payload "
+                                    "FROM records ORDER BY workspace_identity, record_type, record_id, revision"
+                                ).fetchall(),
+                                connection.execute(
+                                    "SELECT workspace_identity, audit_id, event_no, payload, reason, occurred_at "
+                                    "FROM audit_history ORDER BY workspace_identity, audit_id, event_no"
+                                ).fetchall(),
+                            )
+                    with patch.object(store, "record_approval", wraps=store.record_approval) as record_approval, \
+                            patch.object(store, "record_audit", wraps=store.record_audit) as record_audit, \
+                            patch.object(service, "record_approval", wraps=service.record_approval) as service_record, \
+                            patch.object(service, "issue_application_authority", wraps=service.issue_application_authority) as issue_authority, \
+                            patch.object(service, "recover_application_authority", wraps=service.recover_application_authority) as recover_authority, \
+                            patch.object(service, "reconstruct_application_authority_after_restart", wraps=service.reconstruct_application_authority_after_restart) as reconstruct_authority, \
+                            patch.object(service, "create_applier", wraps=service.create_applier) as create_applier:
+                        first = service.get_approval_status(preview["preview_id"], 1)
+                        second = service.get_approval_status(preview["preview_id"], 1)
+                    self.assertEqual(first, second)
+                    self.assertEqual(first["approval"], approval.to_dict())
+                    record_approval.assert_not_called()
+                    record_audit.assert_not_called()
+                    service_record.assert_not_called()
+                    issue_authority.assert_not_called()
+                    recover_authority.assert_not_called()
+                    reconstruct_authority.assert_not_called()
+                    create_applier.assert_not_called()
+                    self.assertEqual(
+                        authority_state_before,
+                        {name: getattr(service, name) for name in authority_state_names},
+                    )
+                    if kind == "memory":
+                        self.assertEqual(
+                            store_state_before,
+                            {name: getattr(store, name) for name in store_state_before},
+                        )
+                    else:
+                        with closing(sqlite3.connect(store.path)) as connection:
+                            sqlite_state_after = (
+                                connection.execute(
+                                    "SELECT workspace_identity, record_type, record_id, revision, payload "
+                                    "FROM records ORDER BY workspace_identity, record_type, record_id, revision"
+                                ).fetchall(),
+                                connection.execute(
+                                    "SELECT workspace_identity, audit_id, event_no, payload, reason, occurred_at "
+                                    "FROM audit_history ORDER BY workspace_identity, audit_id, event_no"
+                                ).fetchall(),
+                            )
+                        self.assertEqual(sqlite_state_before, sqlite_state_after)
+                    if kind == "sqlite":
+                        restarted_store = SQLitePreviewStore(
+                            context,
+                            ignore_checker=lambda path: True,
+                            tracked_checker=lambda path: False,
+                            trust_context=TRUST,
+                        )
+                        restarted_service = RuntimeApprovalAuthorityService(
+                            context,
+                            restarted_store,
+                            None,
+                            clock=lambda: NOW,
+                            rule_registry=build_registry_v1(),
+                        )
+                        restarted = restarted_service.get_approval_status(preview["preview_id"], 1)
+                        self.assertEqual(restarted, first)
                 finally:
                     directory.cleanup()
 

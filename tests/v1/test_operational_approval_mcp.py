@@ -24,7 +24,7 @@ from delivery_system.runtime import (
 )
 from delivery_system.rules import SemanticOutcome, build_registry_v1
 from mcp_server.server import (
-    IssueApplicationAuthorityInput, RecordApprovalInput, create_server, mcp,
+    ApprovalStatusInput, IssueApplicationAuthorityInput, RecordApprovalInput, create_server, mcp,
 )
 from tests.attestation_contract.test_attestation_contract import FakeCapabilityPolicy, FakeIssuer
 from tests.attestation_orchestration.test_attestation_orchestration import FakeReadOnlyDriver
@@ -132,7 +132,7 @@ class OperationalApprovalMcpTests(unittest.TestCase):
         finally:
             directory.cleanup()
 
-    def test_discovery_has_exact_six_tools_and_annotations(self):
+    def test_discovery_has_exact_nine_tools_and_annotations(self):
         async def exercise():
             async with Client(mcp, raise_exceptions=True) as client:
                 return await client.list_tools()
@@ -143,6 +143,7 @@ class OperationalApprovalMcpTests(unittest.TestCase):
             "delivery_record_approval", "delivery_issue_application_authority",
             "delivery_apply_approved_work_items",
             "delivery_get_application_status",
+            "delivery_get_approval_status",
             "delivery_observe_application_postcondition",
         }
         self.assertEqual(set(by_name), expected)
@@ -156,6 +157,68 @@ class OperationalApprovalMcpTests(unittest.TestCase):
                 (annotations.read_only_hint, annotations.destructive_hint, annotations.open_world_hint),
                 expected_values,
             )
+
+    def test_approval_status_schema_and_current_projection(self):
+        directory, context, store, preview, audit, service = self._setup(with_attestation=False)
+        try:
+            server = create_server(context, store, approval_authority_service=service)
+            valid = {"preview_id": preview["preview_id"], "revision": 1}
+            for invalid in (
+                {"preview_id": preview["preview_id"], "revision": True},
+                {"preview_id": preview["preview_id"], "revision": "1"},
+                {"preview_id": preview["preview_id"], "revision": 1, "approval_id": "forbidden"},
+            ):
+                with self.subTest(invalid=invalid):
+                    with self.assertRaises(ValidationError):
+                        ApprovalStatusInput.model_validate(invalid)
+
+            missing = self._call(server, "delivery_get_approval_status", valid, raise_exceptions=True)
+            self.assertFalse(missing.is_error)
+            self.assertEqual(missing.structured_content["status"], "NO_CURRENT_APPROVAL")
+            self.assertIsNone(missing.structured_content["approval"])
+
+            command = f"批准写入 {preview['preview_id']} 1"
+            recorded = self._call(server, "delivery_record_approval", {
+                "preview_id": preview["preview_id"],
+                "revision": 1,
+                "approval_command": command,
+                "approver_claim": "human",
+            }, raise_exceptions=True)
+            current = self._call(server, "delivery_get_approval_status", valid, raise_exceptions=True)
+            self.assertEqual(current.structured_content["status"], "CURRENT")
+            self.assertEqual(current.structured_content["approval"], recorded.structured_content)
+
+            async def inspect():
+                async with Client(server, raise_exceptions=True) as client:
+                    return next(tool for tool in (await client.list_tools()).tools if tool.name == "delivery_get_approval_status")
+
+            tool = self.run_async(inspect())
+            self.assertEqual(
+                (tool.annotations.read_only_hint, tool.annotations.destructive_hint, tool.annotations.open_world_hint),
+                (True, False, False),
+            )
+            payload_schema = tool.input_schema["$defs"][tool.input_schema["properties"]["payload"]["$ref"].rsplit("/", 1)[1]]
+            self.assertEqual(set(payload_schema["properties"]), {"preview_id", "revision"})
+            self.assertEqual(payload_schema["properties"]["revision"]["type"], "integer")
+        finally:
+            directory.cleanup()
+
+    def test_approval_status_preserves_canonical_runtime_errors(self):
+        directory, context, store, preview, audit, service = self._setup(with_attestation=False)
+        try:
+            server = create_server(context, store, approval_authority_service=service)
+            missing = self._call(server, "delivery_get_approval_status", {
+                "preview_id": "missing-preview", "revision": 1,
+            })
+            self.assertTrue(missing.is_error)
+            self.assertIn("preview_not_found", str(missing.content))
+            stale = self._call(server, "delivery_get_approval_status", {
+                "preview_id": preview["preview_id"], "revision": 2,
+            })
+            self.assertTrue(stale.is_error)
+            self.assertIn("preview_stale", str(stale.content))
+        finally:
+            directory.cleanup()
 
     def test_new_input_models_are_strict_and_use_strict_int(self):
         valid_approval = {
@@ -443,7 +506,7 @@ class OperationalApprovalMcpTests(unittest.TestCase):
         finally:
             directory.cleanup()
 
-    def test_stdio_bootstrap_exposes_five_tools_without_credential_fabrication(self):
+    def test_stdio_bootstrap_exposes_nine_tools_without_credential_fabrication(self):
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory).resolve()
             (workspace / ".gitignore").write_text(".delivery-system/\n", encoding="utf-8")
@@ -464,7 +527,7 @@ class OperationalApprovalMcpTests(unittest.TestCase):
                     return tools, result
 
             tools, result = self.run_async(exercise())
-            self.assertEqual(len(tools.tools), 8)
+            self.assertEqual(len(tools.tools), 9)
             self.assertTrue(result.is_error)
             self.assertIn("attestation_service_unavailable", str(result.content))
 
