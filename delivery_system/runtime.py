@@ -140,14 +140,41 @@ class StorePreflightError(RuntimeError):
         super().__init__(code)
 
 
-def _default_ignored(path: Path, workspace_root: Path) -> bool:
+def _normalize_windows_drive_namespace(path: Path) -> Path:
+    """Normalize supported extended drive paths without broadening device support."""
+    if os.name != "nt":
+        return path
+    value = os.fspath(path)
+    if (
+        isinstance(value, str)
+        and value.startswith("\\\\?\\")
+        and len(value) >= 7
+        and value[4].isalpha()
+        and value[5] == ":"
+        and value[6] in "\\/"
+    ):
+        return Path(value[4:])
+    return path
+
+
+def _canonical_path_identity(path: Path, *, strict: bool) -> Path:
+    return _normalize_windows_drive_namespace(Path(path).resolve(strict=strict))
+
+
+def _canonical_workspace_relative_path(path: Path, workspace_root: Path) -> str:
     try:
-        relative = path.resolve(strict=False).relative_to(workspace_root).as_posix()
-    except (ValueError, OSError) as exc:
+        candidate = _canonical_path_identity(path, strict=False)
+        root = _canonical_path_identity(workspace_root, strict=False)
+        return candidate.relative_to(root).as_posix()
+    except (OSError, RuntimeError, ValueError) as exc:
         raise StorePreflightError("store_not_ignored_or_tracked") from exc
+
+
+def _default_ignored(path: Path, workspace_root: Path) -> bool:
+    relative = _canonical_workspace_relative_path(path, workspace_root)
     result = subprocess.run(
         ["git", "check-ignore", "--quiet", "--no-index", "--", relative],
-        cwd=workspace_root,
+        cwd=_canonical_path_identity(workspace_root, strict=False),
         capture_output=True,
         check=False,
         text=True,
@@ -156,13 +183,10 @@ def _default_ignored(path: Path, workspace_root: Path) -> bool:
 
 
 def _default_tracked(path: Path, workspace_root: Path) -> bool:
-    try:
-        relative = path.resolve(strict=False).relative_to(workspace_root).as_posix()
-    except (ValueError, OSError) as exc:
-        raise StorePreflightError("store_not_ignored_or_tracked") from exc
+    relative = _canonical_workspace_relative_path(path, workspace_root)
     result = subprocess.run(
         ["git", "ls-files", "--error-unmatch", "--", relative],
-        cwd=workspace_root,
+        cwd=_canonical_path_identity(workspace_root, strict=False),
         capture_output=True,
         check=False,
         text=True,
@@ -219,17 +243,21 @@ class RuntimeContext:
         tracked_checker: Callable[[Path], bool] | None = None,
     ) -> None:
         state = Path(self.state_path)
-        root = Path(self.normalized_workspace_root)
+        root = _canonical_path_identity(Path(self.normalized_workspace_root), strict=True)
         paths = (state.parent, state, *(Path(f"{state}-{suffix}") for suffix in ("wal", "shm", "journal")))
         if any(_is_reparse_or_symlink(path) for path in paths):
             raise StorePreflightError("store_not_ignored_or_tracked")
         try:
             for path in (state, *paths[2:]):
-                if path.exists() and path.resolve(strict=True).parent.parent != root:
+                if path.exists() and _canonical_path_identity(path, strict=True).parent.parent != root:
                     raise StorePreflightError("store_not_ignored_or_tracked")
-            if state.parent.exists() and state.parent.resolve(strict=True) != root / ".delivery-system":
+            if (
+                state.parent.exists()
+                and _canonical_path_identity(state.parent, strict=True)
+                != _canonical_path_identity(root / ".delivery-system", strict=False)
+            ):
                 raise StorePreflightError("store_not_ignored_or_tracked")
-        except OSError as exc:
+        except (OSError, RuntimeError) as exc:
             raise StorePreflightError("store_not_ignored_or_tracked") from exc
         sidecars = (
             state,
@@ -243,7 +271,7 @@ class RuntimeContext:
             raise StorePreflightError("store_not_ignored_or_tracked")
         if not state.parent.exists():
             state.parent.mkdir(parents=True, exist_ok=True)
-        if state.parent.resolve() != root / ".delivery-system":
+        if _canonical_path_identity(state.parent, strict=True) != _canonical_path_identity(root / ".delivery-system", strict=False):
             raise StorePreflightError("store_not_ignored_or_tracked")
 
 
