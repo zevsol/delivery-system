@@ -106,6 +106,88 @@ class ApprovalSkillContractTests(unittest.TestCase):
         self.assertNotIn("token loading", self.skill.lower())
         self.assertNotIn("provider setup", self.skill.lower())
 
+    def test_guided_decision_summary_and_integrity_layers(self):
+        for phrase in (
+            "primary Human Decision Summary",
+            "repository",
+            "Work Item count and titles",
+            "intended operation count and types",
+            "existing remote Issue endpoints",
+            "future external effect",
+            "Integrity details",
+            "do not make digest strings the primary decision summary",
+        ):
+            self.assertIn(phrase, self.skill)
+        summary = self.skill.index("primary Human Decision Summary")
+        claim = self.skill.index("Ask the human for a non-empty `approver_claim`")
+        self.assertLess(summary, claim)
+
+    def test_current_interaction_target_resolution_and_operation_meaning(self):
+        for phrase in (
+            "current interaction",
+            "still refer to the same ceremony target",
+            "the latest",
+            "semantic similarity",
+            "prior-session memory",
+            "add_sub_issue",
+            "child → parent",
+            "add_dependency",
+            "dependent → prerequisite",
+            "existing remote Issues",
+            "verify_relationship",
+        ):
+            self.assertIn(phrase, self.skill)
+
+    def test_decline_clarification_and_near_match_contract(self):
+        for phrase in (
+            "Abandoned",
+            "No Approval was recorded",
+            "NOT APPROVED",
+            "clarification question",
+            "ordinary discussion",
+            "unrelated text",
+            "not automatically abandonment",
+            "Only clear cancellation or refusal produces `Abandoned`",
+            "A near-match remains awaiting the exact command",
+        ):
+            self.assertIn(phrase, self.skill)
+        decline = self.skill.index("An explicit cancellation or refusal")
+        clarification = self.skill.index("A clarification question")
+        self.assertLess(decline, clarification)
+        self.assertIn("Do not call `delivery_record_approval`", self.skill[decline:])
+        self.assertIn("Do not call `delivery_record_approval`", self.skill[clarification:])
+
+    def test_recovery_uncertainty_and_authority_separation(self):
+        for phrase in (
+            "Safe interaction correction",
+            "Ceremony restart required",
+            "State investigation required",
+            "Integrity/system failure",
+            "Default automatic Runtime retry is `NO`",
+            "may have completed but the host did not receive a reliable response",
+            "do not claim success",
+            "do not claim failure",
+            "no public Approval status/read MCP tool",
+            "Approval is explicit human intent recorded for one exact Preview and Revision",
+            "It is not GitHub write permission",
+            "ApplicationAuthority",
+        ):
+            self.assertIn(phrase, self.skill)
+
+    def test_no_new_tool_dependency_and_no_authority_or_apply(self):
+        for phrase in (
+            "Allowed MCP calls are exactly",
+            "delivery_get_audit_context",
+            "delivery_record_approval",
+            "delivery_get_application_status",
+            "delivery_observe_application_postcondition",
+            "delivery_apply_approved_work_items",
+            "must never call `delivery_issue_application_authority`",
+        ):
+            self.assertIn(phrase, self.skill)
+        self.assertNotIn("delivery_get_approval", self.metadata)
+        self.assertEqual(self.metadata.count('type: "mcp"'), 2)
+
     def test_metadata_interface(self):
         self.assertIn('display_name: "Approve GitHub Work Items"', self.metadata)
         self.assertIn("$approve-github-work-items", self.metadata)
