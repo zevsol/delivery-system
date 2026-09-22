@@ -63,13 +63,13 @@ Use these recovery categories:
 
 For `approval_invalid` or `approval_command_invalid`, report that Approval was not recorded and stop the Runtime attempt. For `approval_binding_conflict`, state that the deterministic Approval identity already has different binding content; never overwrite, silently choose a claim, or retry with fabricated content. For `approval_stale`, report that the existing Approval is no longer current and stop. Default automatic Runtime retry is `NO`.
 
-If `delivery_record_approval` may have completed but the host did not receive a reliable response, do not claim success, do not claim failure, do not automatically repeat the call, and do not issue ApplicationAuthority. Explain that there is no public Approval status/read MCP tool. There is no read-Approval MCP tool; require fresh explicit human action before any later Approval attempt. Runtime idempotency remains a safety property, not permission for automatic retry.
+If `delivery_record_approval` may have completed but the host did not receive a reliable response, do not claim success, do not claim failure, do not automatically repeat the call, and do not issue ApplicationAuthority. Call `delivery_get_approval_status` for the exact Preview and Revision. If it returns `CURRENT`, present the recovered current Approval receipt. If it returns `NO_CURRENT_APPROVAL`, state only that no current persisted Approval was found for the currently resolved binding; do not claim that the earlier call failed or never executed. Require fresh explicit human action before any later Approval attempt. Runtime idempotency remains a safety property, not permission for automatic retry.
 
 Runtime approval replay is idempotent. Return the same persisted Approval receipt when Runtime returns it. A no-call replay optimization is allowed only when the complete exact successful ApprovalRecord is already present in the current interaction and unambiguously matches this request; never assume persisted approval across conversations or uncertain host state.
 
 ## MCP boundary
 
-Allowed MCP calls are exactly `delivery_get_audit_context` and `delivery_record_approval`. Do not call `delivery_plan_preview`, `delivery_record_audit`, `delivery_issue_application_authority`, `delivery_apply_approved_work_items`, `delivery_get_application_status`, `delivery_observe_application_postcondition`, or any GitHub mutation tool. The Skill must never call `delivery_issue_application_authority`; Approval is not ApplicationAuthority.
+Allowed MCP calls are exactly `delivery_get_audit_context`, `delivery_record_approval`, and `delivery_get_approval_status`. Do not call `delivery_plan_preview`, `delivery_record_audit`, `delivery_issue_application_authority`, `delivery_apply_approved_work_items`, `delivery_get_application_status`, `delivery_observe_application_postcondition`, or any GitHub mutation tool. The Skill must never call `delivery_issue_application_authority`; Approval is not ApplicationAuthority.
 
 ## Approval and ApplicationAuthority
 

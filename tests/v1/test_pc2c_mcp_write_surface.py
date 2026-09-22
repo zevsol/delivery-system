@@ -59,15 +59,15 @@ class McpWriteSurfaceTests(unittest.TestCase):
     def _success(number=1, numeric_id="1"):
         return ApplierOrchestrationTests._success(number=number, numeric_id=numeric_id)
 
-    def test_eighth_tool_preserves_previous_surface_and_adds_exact_annotations(self):
+    def test_ninth_tool_preserves_previous_surface_and_adds_exact_annotations(self):
         async def exercise():
             async with Client(mcp, raise_exceptions=True) as client:
                 return (await client.list_tools()).tools
         tools = self.run_async(exercise())
-        self.assertEqual(len(tools), 8)
+        self.assertEqual(len(tools), 9)
         expected_names = [
             "delivery_plan_preview", "delivery_get_audit_context", "delivery_record_audit",
-            "delivery_record_approval", "delivery_get_application_status",
+            "delivery_record_approval", "delivery_get_approval_status", "delivery_get_application_status",
             "delivery_issue_application_authority", "delivery_apply_approved_work_items",
             "delivery_observe_application_postcondition",
         ]
@@ -89,6 +89,7 @@ class McpWriteSurfaceTests(unittest.TestCase):
             "delivery_record_audit": (False, False, False),
             "delivery_record_approval": (False, False, False),
             "delivery_get_application_status": (True, False, False),
+            "delivery_get_approval_status": (True, False, False),
             "delivery_issue_application_authority": (False, False, True),
             "delivery_apply_approved_work_items": (False, True, True),
         }
@@ -97,6 +98,8 @@ class McpWriteSurfaceTests(unittest.TestCase):
                            tool.annotations.open_world_hint)
             if tool.name in previous_schema_digests:
                 self.assertEqual(digest(tool.input_schema), previous_schema_digests[tool.name])
+                self.assertEqual(annotations, previous_annotations[tool.name])
+            elif tool.name in previous_annotations:
                 self.assertEqual(annotations, previous_annotations[tool.name])
             else:
                 self.assertEqual(annotations, (True, False, True))
@@ -366,7 +369,7 @@ class McpWriteSurfaceTests(unittest.TestCase):
         finally:
             directory.cleanup()
 
-    def test_global_stdio_discovers_seventh_tool_but_apply_is_unavailable(self):
+    def test_global_stdio_discovers_ninth_tool_but_apply_is_unavailable(self):
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory).resolve()
             (workspace / ".gitignore").write_text(".delivery-system/\n", encoding="utf-8")
@@ -386,7 +389,7 @@ class McpWriteSurfaceTests(unittest.TestCase):
                                                         {"payload": {"application_authority_id": "authority"}})
                         return tools, result
             tools, result = self.run_async(exercise())
-            self.assertEqual(len(tools.tools), 8)
+            self.assertEqual(len(tools.tools), 9)
             self.assertTrue(result.is_error)
             self.assertIn("write_execution_boundary_unavailable", str(result.content))
 
