@@ -64,6 +64,22 @@ class ExistingIssueClaimInput(StrictModel):
     number: int | None = Field(default=None, ge=1)
 
 
+class ExistingIssueEndpointInput(StrictModel):
+    endpoint_ref: str = Field(min_length=1)
+    url: str | None = None
+    number: int | None = Field(default=None, ge=1)
+
+
+class WorkItemEndpointInput(StrictModel):
+    endpoint_type: Literal["work_item"]
+    client_ref: str = Field(min_length=1)
+
+
+class ExistingIssueEndpointRefInput(StrictModel):
+    endpoint_type: Literal["existing_issue"]
+    endpoint_ref: str = Field(min_length=1)
+
+
 class DraftWorkItemInput(StrictModel):
     client_ref: str = Field(min_length=1)
     previous_client_ref: str | None = Field(default=None, min_length=1)
@@ -81,20 +97,25 @@ class DraftWorkItemInput(StrictModel):
 
 class PlannedRelationshipInput(StrictModel):
     kind: Literal["planned_parent", "planned_dependency"]
-    from_client_ref: str
-    to_client_ref: str
+    from_client_ref: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    to_client_ref: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    from_endpoint: WorkItemEndpointInput | ExistingIssueEndpointRefInput | None = Field(default=None, exclude_if=lambda value: value is None)
+    to_endpoint: WorkItemEndpointInput | ExistingIssueEndpointRefInput | None = Field(default=None, exclude_if=lambda value: value is None)
     rationale: SourcedValueInput
 
 
 class OperationIntentInput(StrictModel):
     operation_kind: Literal["create_issue", "add_sub_issue", "add_dependency", "verify_relationship"]
-    client_refs: list[str] = Field(min_length=1)
+    client_refs: list[str] = Field(default_factory=list)
+    endpoint: WorkItemEndpointInput | None = Field(default=None, exclude_if=lambda value: value is None)
+    operands: list[WorkItemEndpointInput | ExistingIssueEndpointRefInput] | None = Field(default=None, exclude_if=lambda value: value is None)
     depends_on: list[str] = Field(default_factory=list)
 
 
 class PlanDraftInput(StrictModel):
     repository_claim: RepositoryClaimInput | None = None
     existing_issue_claims: list[ExistingIssueClaimInput] = Field(default_factory=list)
+    existing_issue_endpoints: list[ExistingIssueEndpointInput] = Field(default_factory=list)
     work_items: list[DraftWorkItemInput] = Field(min_length=1)
     planned_relationships: list[PlannedRelationshipInput] = Field(default_factory=list)
     operation_intents: list[OperationIntentInput] = Field(default_factory=list)
@@ -129,6 +150,8 @@ class PreviewOutput(StrictModel):
     sealed_preview_digest: str
     audit_context_digest: str
     remote_snapshot: dict[str, Any] | None = None
+    canonical_version: Literal["2"] | None = None
+    existing_endpoint_bindings: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class AuditContextInput(StrictModel):
@@ -342,6 +365,16 @@ def _runtime_plan_payload(payload: PreviewRequestInput) -> dict[str, Any]:
         normalized_claim = dict(repository_claim)
         normalized_claim.pop("url", None)
         plan["repository_claim"] = normalized_claim
+    for relationship in plan.get("planned_relationships", []):
+        for field in ("from_client_ref", "to_client_ref", "from_endpoint", "to_endpoint"):
+            if relationship.get(field) is None:
+                relationship.pop(field, None)
+    for operation in plan.get("operation_intents", []):
+        for field in ("endpoint", "operands"):
+            if operation.get(field) is None:
+                operation.pop(field, None)
+        if not operation.get("client_refs"):
+            operation.pop("client_refs", None)
     return plan
 
 

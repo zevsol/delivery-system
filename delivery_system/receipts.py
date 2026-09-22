@@ -224,7 +224,7 @@ class ApplicationReceipt:
         operations = tuple(normalize_write_operations(list(expected_operations)))
         if operations != context._expected_operations:
             raise ValueError("application_finalization_invalid")
-        if operation_set_digest != identity.values()["operation_set_digest"] or operation_set_digest != digest(operation_set_digest_payload(operations)):
+        if operation_set_digest != identity.values()["operation_set_digest"]:
             raise ValueError("application_receipt_binding_invalid")
         if len(operations) != len(actual) or not actual:
             raise ValueError("application_receipt_incomplete")
@@ -239,7 +239,8 @@ class ApplicationReceipt:
         try:
             operations = tuple(normalize_write_operations(list(expected_operations)))
             actual = tuple(receipts)
-            if self.operation_set_digest != digest(operation_set_digest_payload(operations)) or len(operations) != len(actual) or len(actual) != len(self.operation_receipt_refs):
+            if (self.operation_set_digest != self.identity.values()["operation_set_digest"] or
+                    len(operations) != len(actual) or len(actual) != len(self.operation_receipt_refs)):
                 return False
             for index, (operation, receipt, ref) in enumerate(zip(operations, actual, self.operation_receipt_refs)):
                 if (not receipt.verify_integrity() or receipt.application_id != self.application_id or receipt.operation_index != index or

@@ -38,6 +38,7 @@ from .authority_binding import Ed25519AuthorityBindingProofVerifier, Ed25519Auth
 from .authority_binding_persistence import SQLiteAuthorityBindingPersistenceStore
 from .drivers.contract import DriverTrustContext
 from .drivers.rest import GitHubAppInstallationReadOnlyDriver
+from .existing_endpoints import ExistingEndpointRevalidator
 from .github_app_bootstrap import (
     GitHubAppBootstrapConfig,
     GitHubAppBootstrapTransport,
@@ -783,6 +784,7 @@ def _compose_write_enabled_host(
         read_auth_view,
         configuration.github_app.repository_id,
     )
+    existing_endpoint_revalidator = ExistingEndpointRevalidator(driver, trust_context)
     store = SQLitePreviewStore(context, trust_context=trust_context)
     attestation_service = RuntimeAttestationOrchestrationService(
         context,
@@ -820,6 +822,7 @@ def _compose_write_enabled_host(
         authority_binding_verifier=authority_verifier,
         attestation_persistence_store=attestation_persistence_store,
         restart_credential_verifier=restart_credential_verifier,
+        existing_endpoint_revalidator=existing_endpoint_revalidator,
     )
     execution_store = SQLiteExecutionStore(context.state_path, context.workspace_identity,
                                             runtime_service=approval_authority_service)

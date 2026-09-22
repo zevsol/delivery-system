@@ -32,6 +32,7 @@ Apply does not own or perform planning, audit creation, Human Approval creation 
 - Report `Failed` or `Blocked` as a definitive failure with the Runtime result.
 - Treat `OutcomeUnknown`, an ambiguous execution result, or a recovery-required result as terminal for this Skill. Stop immediately, state that the remote effect may already have occurred, state that durable evidence has been retained, and state that operator or Host escalation is required.
 - Never automatically retry an ambiguous operation. Do not perform built-in remote reconciliation or remote reobservation.
+- Mixed-endpoint applications revalidate existing Issue identity, write address, semantic evidence, and desired relationship state immediately before the relationship write. If the endpoint is stale, missing, mismatched, or the relationship already exists before dispatch, settle the claimed operation as `Blocked` even when earlier receipts exist; retain those receipts as observable prior progress. If a relationship mutation was dispatched and its result is ambiguous, report `OutcomeUnknown` and stop without retrying. Never compensate by deleting newly created Issues.
 
 The user-facing result must distinguish Approval from Application, and definitive success or failure from recovery-required. Application is not read-only; disclose that it may mutate GitHub Issues within the exact approved operation set.
 

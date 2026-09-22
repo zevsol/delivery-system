@@ -23,6 +23,7 @@ from delivery_system.runtime import RuntimeApprovalAuthorityService
 from delivery_system.attestation_github_app import GitHubAppInstallationCapabilityEvidence
 from delivery_system.github_app_credential import GitHubAppInstallationCredentialLease
 import delivery_system.runtime as runtime_module
+import delivery_system.applier as applier_module
 from tests.fakes.fake_write_driver import FakeWriteDriver
 from tests.v1 import test_operational_approval_authority as approval_fixture
 from unittest.mock import patch
@@ -657,6 +658,58 @@ class ApplierOrchestrationTests(unittest.TestCase):
             self.assertEqual(len(driver.trace), 3)
             command = driver.trace[2].command
             self.assertEqual((command.first.issue_number, command.second.issue_number), (21, 22))
+        finally:
+            directory.cleanup()
+
+    def test_pre_dispatch_currentness_failure_without_prior_receipt_is_blocked(self):
+        directory, context, preview, service, authority, driver = self._compose((self._success(),))
+        try:
+            store = self._store(context, service, directory)
+            def fail_before_dispatch(runtime_context, attempt, execution_store):
+                raise ValueError("existing_endpoint_semantic_stale")
+
+            with patch.object(applier_module, "_materialize", side_effect=fail_before_dispatch):
+                result = service.create_applier(store).apply(authority.authority_id)
+            application_id = service.create_execution_context(authority.authority_id).identity.application_id
+            state = store.get_execution(application_id)
+            self.assertEqual((result.state, result.recovery_code), ("Blocked", "existing_endpoint_semantic_stale"))
+            self.assertEqual((state.state, state.next_operation_index), ("Blocked", 0))
+            self.assertEqual(driver.trace, ())
+        finally:
+            directory.cleanup()
+
+    def test_pre_dispatch_currentness_failure_after_prior_receipt_preserves_partial_progress(self):
+        operations = [
+            {"operation_kind": "create_issue", "client_refs": ["child"], "depends_on": []},
+            {"operation_kind": "create_issue", "client_refs": ["parent"], "depends_on": []},
+            {"operation_kind": "add_sub_issue", "client_refs": ["child", "parent"], "depends_on": []},
+        ]
+        observations = (self._success(number=41, numeric_id="401"),
+                        self._success(number=42, numeric_id="402"),
+                        self._relationship_success(identity="must-not-dispatch"))
+        directory, context, preview, service, authority, driver = self._compose_operations(("child", "parent"), operations, observations)
+        try:
+            store = self._store(context, service, directory)
+            application_id = service.create_execution_context(authority.authority_id).identity.application_id
+            original = applier_module._materialize
+
+            def fail_relationship_before_dispatch(runtime_context, attempt, execution_store):
+                if attempt.operation["operation_kind"] == "add_sub_issue":
+                    raise ValueError("existing_endpoint_identity_mismatch")
+                return original(runtime_context, attempt, execution_store)
+
+            with patch.object(applier_module, "_materialize", side_effect=fail_relationship_before_dispatch):
+                result = service.create_applier(store).apply(authority.authority_id)
+            state = store.get_execution(application_id)
+            relationship_identity = operation_identity(application_id, 2, operations[2])
+            relationship_attempt = store.get_attempt(application_id, relationship_identity)
+            self.assertEqual((result.state, result.recovery_code), ("Blocked", "existing_endpoint_identity_mismatch"))
+            self.assertEqual((state.state, state.next_operation_index), ("Blocked", 2))
+            self.assertEqual(len(state.operation_receipt_refs), 2)
+            self.assertEqual(relationship_attempt.state, "Blocked")
+            self.assertEqual([entry.operation for entry in driver.trace], ["create_issue", "create_issue"])
+            with self.assertRaisesRegex(ValueError, "^operation_receipt_not_found$"):
+                store.get_operation_receipt(application_id, relationship_identity)
         finally:
             directory.cleanup()
 

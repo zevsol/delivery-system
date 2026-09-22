@@ -73,7 +73,9 @@ class McpWriteSurfaceTests(unittest.TestCase):
         ]
         self.assertEqual([tool.name for tool in tools], expected_names)
         previous_schema_digests = {
-            "delivery_plan_preview": "sha256:9fd77b63e490c722dbe4b3be96cea5ebab052e1f8face278bb11fac8335df589",
+            # V2 mixed-endpoint planning adds explicit endpoint declarations and
+            # typed operation unions while preserving all legacy fields.
+            "delivery_plan_preview": "sha256:157d282c3d67518db56632036cdb3d01b86c99de624349c3dd532896eeeec5b8",
             "delivery_get_audit_context": "sha256:7e5a88fa6cb96c5c3568d34d41eb7ef922003bcd28a04faddceb22230df085cc",
             "delivery_record_audit": "sha256:ee441336c876fa2e5ebdb6aa1801e47e9b21bb903a4260d1811f8e5e43ff69af",
             "delivery_record_approval": "sha256:f444ab3177f1608391e8f19dd3bd1da45632c2eae6c7d330b94a642da989adbe",

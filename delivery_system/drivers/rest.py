@@ -288,6 +288,8 @@ class LocalRestReadOnlyDriver(ReadOnlyDriver):
             "updated_at": str(raw["updated_at"]), "repository_identity": repository,
             "repository_url": str(raw["repository_url"]),
         }
+        if isinstance(raw.get("state"), str) and raw["state"].casefold() in {"open", "closed"}:
+            normalized["state"] = raw["state"].casefold()
         if body_present:
             normalized["body"] = body
         return normalized

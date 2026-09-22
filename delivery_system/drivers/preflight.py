@@ -9,7 +9,7 @@ from typing import Mapping, Sequence
 
 from delivery_system.evidence import EvidenceRecord
 from delivery_system.protocol import canonical_payload, digest
-from delivery_system.remote_snapshot import TypedRemoteSnapshot
+from delivery_system.remote_snapshot import TypedRemoteSnapshot, TypedRemoteSnapshotV2
 
 from .contract import (
     DriverReadResponse,
@@ -228,6 +228,7 @@ def validate_driver_facts(
 
 def bind_validated_facts(
     facts: ValidatedRemoteFacts, binding: RuntimeEvidenceBinding, trust_context: DriverTrustContext,
+    *, snapshot_schema_version: str = "remote-snapshot-v1",
 ) -> RuntimeEvidenceBindingResult:
     """Phase two: bind verified facts to final Runtime identity exactly once."""
     response = facts.response
@@ -246,9 +247,23 @@ def bind_validated_facts(
         facts.canonical_remote_content_payload, trust_context.trusted_driver_identity,
         response.canonical_repository, response.query_scope,
     )
-    snapshot = TypedRemoteSnapshot.from_records(
+    snapshot_type = TypedRemoteSnapshotV2 if snapshot_schema_version == "remote-snapshot-v2" else TypedRemoteSnapshot
+    snapshot_records = list(response.issue_records)
+    if snapshot_schema_version == "remote-snapshot-v2":
+        snapshot_records = [{
+            "issue_id": record.get("issue_id", record.get("node_id")),
+            "numeric_issue_id": record.get("numeric_issue_id", record.get("numeric_id")),
+            "issue_number": record.get("issue_number", record.get("number")),
+            "item_type": record.get("item_type"),
+            "title": record.get("title"),
+            "body": record.get("body"),
+            "state": record.get("state"),
+            "updated_at": record.get("updated_at"),
+            "repository_identity": record.get("repository_identity"),
+        } for record in snapshot_records]
+    snapshot = snapshot_type.from_records(
         response.canonical_repository, response.query_scope, response.query_complete,
-        response.pagination_complete, list(response.issue_records),
+        response.pagination_complete, snapshot_records,
         {key: value for key, value in response.permissions.items() if isinstance(value, bool)},
         [key for key, value in response.capabilities.items() if value is True],
         list(response.relationship_records), evidence_ids=[evidence.evidence_id],

@@ -7,9 +7,59 @@ from typing import Any, Mapping
 from delivery_system.canonical import digest
 from delivery_system.evidence import EvidenceRecord
 from delivery_system.formal_preview import PreviewLevel, SealedPreview
-from delivery_system.remote_snapshot import TypedRemoteSnapshot
+from delivery_system.remote_snapshot import TypedRemoteSnapshot, TypedRemoteSnapshotV2
 from delivery_system.runtime_authority import RuntimePromotion
-from delivery_system.write_operations import evaluate_write_operations, operation_set_digest_payload
+from delivery_system.write_operations import evaluate_write_operations, evaluate_write_operations_v2, operation_set_digest_payload, operation_set_digest_payload_v2
+from delivery_system.existing_endpoints import semantic_digest, identity_digest, write_address_digest
+
+
+def _validate_v2_endpoint_authority(canonical: Mapping[str, Any]) -> None:
+    """Validate the persisted declaration-to-binding authority relationship.
+
+    Declarations in the semantic payload are the only source of executable
+    endpoint authority.  Bindings are Runtime-sealed resolutions of those
+    declarations and therefore must be unique, declared, and (once the
+    Preview is repository-aware) complete.
+    """
+    if canonical.get("canonical_version") != "2":
+        return
+    semantic = canonical.get("semantic_payload")
+    if not isinstance(semantic, Mapping):
+        raise ValueError("sealed_preview_endpoint_declarations_invalid")
+    declarations = semantic.get("existing_issue_endpoints")
+    if not isinstance(declarations, list):
+        raise ValueError("sealed_preview_endpoint_declarations_invalid")
+    declared_refs: list[str] = []
+    for declaration in declarations:
+        if not isinstance(declaration, Mapping):
+            raise ValueError("sealed_preview_endpoint_declaration_invalid")
+        endpoint_ref = declaration.get("endpoint_ref")
+        if not isinstance(endpoint_ref, str) or not endpoint_ref.strip():
+            raise ValueError("sealed_preview_endpoint_declaration_invalid")
+        declared_refs.append(endpoint_ref)
+    if len(declared_refs) != len(set(declared_refs)):
+        raise ValueError("sealed_preview_endpoint_declaration_duplicate")
+
+    bindings = canonical.get("existing_endpoint_bindings")
+    if not isinstance(bindings, list):
+        raise ValueError("sealed_preview_endpoint_bindings_invalid")
+    binding_refs: list[str] = []
+    for binding in bindings:
+        if not isinstance(binding, Mapping):
+            raise ValueError("sealed_preview_endpoint_binding_invalid")
+        endpoint_ref = binding.get("endpoint_ref")
+        if not isinstance(endpoint_ref, str) or not endpoint_ref.strip():
+            raise ValueError("sealed_preview_endpoint_binding_invalid")
+        binding_refs.append(endpoint_ref)
+    if len(binding_refs) != len(set(binding_refs)):
+        raise ValueError("sealed_preview_endpoint_binding_duplicate")
+    if any(endpoint_ref not in set(declared_refs) for endpoint_ref in binding_refs):
+        raise ValueError("sealed_preview_endpoint_binding_undeclared")
+
+    level = canonical.get("preview_level")
+    if level in {PreviewLevel.REPOSITORY_AWARE.value, PreviewLevel.WRITE_ELIGIBLE.value}:
+        if set(declared_refs) != set(binding_refs):
+            raise ValueError("sealed_preview_endpoint_binding_coverage_invalid")
 
 
 def _validate_preview_payload(canonical: Mapping[str, Any], request_id: str,
@@ -40,13 +90,16 @@ def _validate_preview_payload(canonical: Mapping[str, Any], request_id: str,
     if canonical.get("workspace_identity") != expected_workspace_identity:
         raise ValueError("workspace_identity_mismatch")
     validate_sealed_preview_invariants(canonical, expected_workspace_identity, promotion=promotion)
+    _validate_v2_endpoint_authority(canonical)
     semantic = canonical.get("semantic_payload")
     operations = canonical.get("operation_intents")
     if not isinstance(semantic, Mapping) or not isinstance(operations, list):
         raise ValueError("sealed_preview_incomplete")
-    if digest(semantic) != plan_digest or canonical.get("plan_digest") != plan_digest:
+    is_v2 = canonical.get("canonical_version") == "2"
+    expected_plan_digest = digest({"canonical_version": "2", "semantic_payload": semantic}) if is_v2 else digest(semantic)
+    if expected_plan_digest != plan_digest or canonical.get("plan_digest") != plan_digest:
         raise ValueError("plan_digest_mismatch")
-    operation_semantics = operation_set_digest_payload(operations)
+    operation_semantics = operation_set_digest_payload_v2(operations) if is_v2 else operation_set_digest_payload(operations)
     if digest(operation_semantics) != operation_set_digest or canonical.get("operation_set_digest") != operation_set_digest:
         raise ValueError("operation_set_digest_mismatch")
     if canonical.get("remote_snapshot_digest") != remote_snapshot_digest:
@@ -61,7 +114,8 @@ def _validate_preview_payload(canonical: Mapping[str, Any], request_id: str,
         pagination_complete = remote_payload.get("pagination_complete")
         if not isinstance(query_complete, bool) or not isinstance(pagination_complete, bool):
             raise ValueError("remote_snapshot_invalid")
-        snapshot = TypedRemoteSnapshot.from_records(
+        snapshot_type = TypedRemoteSnapshotV2 if remote_payload.get("schema_version") == "remote-snapshot-v2" else TypedRemoteSnapshot
+        snapshot = snapshot_type.from_records(
             repository_identity=str(remote_payload.get("repository_identity", "")),
             query_scope=remote_payload.get("query_scope", {}),
             query_complete=query_complete,
@@ -75,6 +129,19 @@ def _validate_preview_payload(canonical: Mapping[str, Any], request_id: str,
         )
         if snapshot.digest() != remote_snapshot_digest:
             raise ValueError("remote_snapshot_digest_mismatch")
+        if is_v2:
+            bindings = canonical.get("existing_endpoint_bindings")
+            if not isinstance(bindings, list):
+                raise ValueError("sealed_preview_endpoint_bindings_invalid")
+            records = {record.get("issue_id"): record for record in remote_payload.get("issue_records", []) if isinstance(record, Mapping)}
+            for binding in bindings:
+                if not isinstance(binding, Mapping) or set(binding) != {"endpoint_ref", "selector_digest", "issue_id", "remote_record_digest", "identity_digest", "write_address_digest", "semantic_digest"}:
+                    raise ValueError("sealed_preview_endpoint_binding_invalid")
+                record = records.get(binding.get("issue_id"))
+                if not isinstance(record, Mapping) or digest(dict(record)) != binding.get("remote_record_digest"):
+                    raise ValueError("sealed_preview_endpoint_binding_invalid")
+                if identity_digest(record) != binding.get("identity_digest") or write_address_digest(record) != binding.get("write_address_digest") or semantic_digest(record) != binding.get("semantic_digest"):
+                    raise ValueError("sealed_preview_endpoint_binding_invalid")
     evidence_records = evidence_records or []
     ids = sorted(str(record.get("evidence_id")) for record in evidence_records)
     if len(ids) != len(set(ids)):
@@ -110,11 +177,11 @@ def _runtime_preview_level(canonical: Mapping[str, Any]) -> PreviewLevel:
         return PreviewLevel.CONCEPTUAL
     if remote.get("query_complete") is True and remote.get("pagination_complete") is True:
         try:
-            evaluation = evaluate_write_operations(
-                canonical.get("operation_intents", []),
-                canonical.get("items", []),
-                canonical.get("semantic_payload", {}),
-            )
+            if canonical.get("canonical_version") == "2":
+                remote = canonical.get("remote_snapshot") or {}
+                evaluation = evaluate_write_operations_v2(canonical.get("operation_intents", []), canonical.get("items", []), canonical.get("semantic_payload", {}), canonical.get("existing_endpoint_bindings", []), remote.get("relationship_records", []))
+            else:
+                evaluation = evaluate_write_operations(canonical.get("operation_intents", []), canonical.get("items", []), canonical.get("semantic_payload", {}))
         except (TypeError, ValueError):
             return PreviewLevel.REPOSITORY_AWARE
         if evaluation.eligible and not canonical.get("blockers"):
