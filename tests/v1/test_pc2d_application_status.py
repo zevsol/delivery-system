@@ -30,6 +30,10 @@ class ApplicationStatusSurfaceTests(unittest.TestCase):
         return mcp_surface.McpWriteSurfaceTests._call(server, "delivery_get_application_status", payload)
 
     @staticmethod
+    def _error_code(result):
+        return result.meta["com.delivery-system/public-tool-error"]["code"]
+
+    @staticmethod
     def _server(context, service, execution_store):
         return create_server(
             context,
@@ -229,7 +233,7 @@ class ApplicationStatusSurfaceTests(unittest.TestCase):
             ):
                 result = self._call(server, {"application_id": application_id})
                 self.assertTrue(result.is_error)
-                self.assertIn("application_id_invalid", str(result.content))
+                self.assertEqual(self._error_code(result), "application_id_invalid")
             with self.assertRaises(ValidationError):
                 server_payload = {"application_id": "application-" + "a" * 64, "workspace": "other"}
                 from mcp_server.server import GetApplicationStatusInput
@@ -237,7 +241,7 @@ class ApplicationStatusSurfaceTests(unittest.TestCase):
 
             missing = self._call(server, {"application_id": "application-" + "a" * 64})
             self.assertTrue(missing.is_error)
-            self.assertIn("application_not_found", str(missing.content))
+            self.assertEqual(self._error_code(missing), "application_not_found")
 
             applied = mcp_surface.McpWriteSurfaceTests._call(
                 server, "delivery_apply_approved_work_items",
@@ -249,7 +253,7 @@ class ApplicationStatusSurfaceTests(unittest.TestCase):
                 other_server = self._server(other_context, other_service, other_store)
                 result = self._call(other_server, {"application_id": application_id})
                 self.assertTrue(result.is_error)
-                self.assertIn("application_not_found", str(result.content))
+                self.assertEqual(self._error_code(result), "application_not_found")
             finally:
                 other_directory.cleanup()
         finally:
@@ -271,7 +275,7 @@ class ApplicationStatusSurfaceTests(unittest.TestCase):
             self._replace_payload(execution_store.path, "application_execution", application_id, state)
             result = self._call(server, {"application_id": application_id})
             self.assertTrue(result.is_error)
-            self.assertIn("state_integrity_invalid", str(result.content))
+            self.assertEqual(self._error_code(result), "state_integrity_invalid")
         finally:
             directory.cleanup()
 
@@ -290,7 +294,7 @@ class ApplicationStatusSurfaceTests(unittest.TestCase):
             self._replace_payload(execution_store.path, "operation_attempts", application_id, attempt, attempt["operation_identity"])
             result = self._call(server, {"application_id": application_id})
             self.assertTrue(result.is_error)
-            self.assertIn("attempt_integrity_invalid", str(result.content))
+            self.assertEqual(self._error_code(result), "attempt_integrity_invalid")
         finally:
             directory.cleanup()
 
@@ -313,7 +317,7 @@ class ApplicationStatusSurfaceTests(unittest.TestCase):
             )
             result = self._call(server, {"application_id": application_id})
             self.assertTrue(result.is_error)
-            self.assertIn("attempt_integrity_invalid", str(result.content))
+            self.assertEqual(self._error_code(result), "attempt_integrity_invalid")
         finally:
             directory.cleanup()
 
@@ -335,7 +339,7 @@ class ApplicationStatusSurfaceTests(unittest.TestCase):
             )
             result = self._call(server, {"application_id": application_id})
             self.assertTrue(result.is_error)
-            self.assertIn("receipt_integrity_invalid", str(result.content))
+            self.assertEqual(self._error_code(result), "application_receipt_integrity_invalid")
         finally:
             directory.cleanup()
 
@@ -355,7 +359,7 @@ class ApplicationStatusSurfaceTests(unittest.TestCase):
                 connection.commit()
             result = self._call(server, {"application_id": application_id})
             self.assertTrue(result.is_error)
-            self.assertIn("application_receipt_not_found", str(result.content))
+            self.assertEqual(self._error_code(result), "application_receipt_not_found")
             self.assertEqual(len(driver.trace), 1)
         finally:
             directory.cleanup()
@@ -379,7 +383,7 @@ class ApplicationStatusSurfaceTests(unittest.TestCase):
             )
             result = self._call(server, {"application_id": application_id})
             self.assertTrue(result.is_error)
-            self.assertIn("receipt_integrity_invalid", str(result.content))
+            self.assertEqual(self._error_code(result), "receipt_integrity_invalid")
         finally:
             directory.cleanup()
 
@@ -398,7 +402,7 @@ class ApplicationStatusSurfaceTests(unittest.TestCase):
             self._replace_payload(execution_store.path, "application_receipts", application_id, application)
             result = self._call(server, {"application_id": application_id})
             self.assertTrue(result.is_error)
-            self.assertIn("application_receipt_integrity_invalid", str(result.content))
+            self.assertEqual(self._error_code(result), "application_receipt_integrity_invalid")
         finally:
             directory.cleanup()
 
@@ -418,7 +422,7 @@ class ApplicationStatusSurfaceTests(unittest.TestCase):
                 connection.commit()
             result = self._call(server, {"application_id": application_id})
             self.assertTrue(result.is_error)
-            self.assertIn("operation_receipt_not_found", str(result.content))
+            self.assertEqual(self._error_code(result), "operation_receipt_not_found")
         finally:
             directory.cleanup()
 
@@ -436,7 +440,7 @@ class ApplicationStatusSurfaceTests(unittest.TestCase):
                 runtime_context, capability, initial, now = self._pending(context, service, authority, execution_store)
                 result = self._call(server, {"application_id": initial.application_id})
             self.assertTrue(result.is_error)
-            self.assertIn("preview_digest_mismatch", str(result.content))
+            self.assertEqual(self._error_code(result), "preview_digest_mismatch")
         finally:
             directory.cleanup()
 
@@ -451,8 +455,8 @@ class ApplicationStatusSurfaceTests(unittest.TestCase):
             self._replace_payload(store_a.path, "application_execution", state_a.application_id, state_b_payload)
             result = self._call(server_a, {"application_id": state_a.application_id})
             self.assertTrue(result.is_error)
-            self.assertIn("application_binding_conflict", str(result.content))
-            self.assertNotIn(state_b.application_id, str(result.content))
+            self.assertEqual(self._error_code(result), "application_binding_conflict")
+            self.assertNotIn(state_b.application_id, result.content[0].text)
         finally:
             directory_a.cleanup()
             directory_b.cleanup()
@@ -480,8 +484,8 @@ class ApplicationStatusSurfaceTests(unittest.TestCase):
             self._replace_payload(store_a.path, "application_receipts", application_a, receipt_b)
             result = self._call(server_a, {"application_id": application_a})
             self.assertTrue(result.is_error)
-            self.assertIn("application_binding_conflict", str(result.content))
-            self.assertNotIn(application_b, str(result.content))
+            self.assertEqual(self._error_code(result), "application_binding_conflict")
+            self.assertNotIn(application_b, result.content[0].text)
         finally:
             directory_a.cleanup()
             directory_b.cleanup()
@@ -508,7 +512,7 @@ class ApplicationStatusSurfaceTests(unittest.TestCase):
             )
             result = self._call(server, {"application_id": initial.application_id})
             self.assertTrue(result.is_error)
-            self.assertIn("attempt_integrity_invalid", str(result.content))
+            self.assertEqual(self._error_code(result), "attempt_integrity_invalid")
         finally:
             directory.cleanup()
 
@@ -540,7 +544,7 @@ class ApplicationStatusSurfaceTests(unittest.TestCase):
             )
             result = self._call(server, {"application_id": application_id})
             self.assertTrue(result.is_error)
-            self.assertIn("receipt_integrity_invalid", str(result.content))
+            self.assertEqual(self._error_code(result), "receipt_integrity_invalid")
         finally:
             directory.cleanup()
 
@@ -595,7 +599,7 @@ class ApplicationStatusSurfaceTests(unittest.TestCase):
                 )
                 result = self._call(self._server(context, service, execution_store), {"application_id": state_id})
                 self.assertTrue(result.is_error)
-                self.assertIn("state_integrity_invalid", str(result.content))
+                self.assertEqual(self._error_code(result), "state_integrity_invalid")
             finally:
                 directory.cleanup()
 
@@ -621,9 +625,9 @@ class ApplicationStatusSurfaceTests(unittest.TestCase):
                     connection.commit()
                 result = self._call(server, {"application_id": application_id})
                 self.assertTrue(result.is_error)
-                self.assertIn(expected_code, str(result.content))
+                self.assertEqual(self._error_code(result), expected_code)
                 for raw in ("JSONDecodeError", "KeyError", "IndexError", "sqlite3"):
-                    self.assertNotIn(raw, str(result.content))
+                    self.assertNotIn(raw, result.content[0].text)
             finally:
                 directory.cleanup()
 
@@ -657,7 +661,7 @@ class ApplicationStatusSurfaceTests(unittest.TestCase):
             )
             result = self._call(server, {"application_id": application_id})
             self.assertTrue(result.is_error)
-            self.assertIn("state_integrity_invalid", str(result.content))
+            self.assertEqual(self._error_code(result), "state_integrity_invalid")
         finally:
             directory.cleanup()
 
@@ -690,7 +694,7 @@ class ApplicationStatusSurfaceTests(unittest.TestCase):
                  patch.object(service.store, "get_evidence_records", side_effect=AssertionError("evidence read before envelope validation")):
                 result = self._call(self._server(context, service, execution_store), {"application_id": initial.application_id})
             self.assertTrue(result.is_error)
-            self.assertIn("preview_digest_mismatch", str(result.content))
+            self.assertEqual(self._error_code(result), "preview_digest_mismatch")
         finally:
             directory.cleanup()
 
@@ -717,8 +721,8 @@ class ApplicationStatusSurfaceTests(unittest.TestCase):
             )
             result = self._call(self._server(context, service, execution_store), {"application_id": initial.application_id})
             self.assertTrue(result.is_error)
-            self.assertIn("state_integrity_invalid", str(result.content))
-            self.assertNotIn("ValidationError", str(result.content))
+            self.assertEqual(self._error_code(result), "state_integrity_invalid")
+            self.assertNotIn("ValidationError", result.content[0].text)
             self.assertEqual(len(driver.trace), 0)
         finally:
             directory.cleanup()
@@ -743,7 +747,7 @@ class ApplicationStatusSurfaceTests(unittest.TestCase):
             )
             result = self._call(self._server(context, service, execution_store), {"application_id": initial.application_id})
             self.assertTrue(result.is_error)
-            self.assertIn("state_integrity_invalid", str(result.content))
+            self.assertEqual(self._error_code(result), "state_integrity_invalid")
             self.assertEqual(len(driver.trace), 0)
         finally:
             directory.cleanup()
@@ -775,9 +779,9 @@ class ApplicationStatusSurfaceTests(unittest.TestCase):
                 )
                 result = self._call(server, {"application_id": application_id})
                 self.assertTrue(result.is_error)
-                self.assertIn("application_receipt_integrity_invalid", str(result.content))
+                self.assertEqual(self._error_code(result), "application_receipt_integrity_invalid")
                 for raw in ("ValidationError", "ValueError", "datetime", "JSONDecodeError"):
-                    self.assertNotIn(raw, str(result.content))
+                    self.assertNotIn(raw, result.content[0].text)
                 self.assertEqual(len(driver.trace), 1)
             finally:
                 directory.cleanup()
@@ -802,7 +806,7 @@ class ApplicationStatusSurfaceTests(unittest.TestCase):
             )
             result = self._call(server, {"application_id": application_id})
             self.assertTrue(result.is_error)
-            self.assertIn("application_receipt_integrity_invalid", str(result.content))
+            self.assertEqual(self._error_code(result), "application_receipt_integrity_invalid")
             self.assertEqual(len(driver.trace), 1)
         finally:
             directory.cleanup()

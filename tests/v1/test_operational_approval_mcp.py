@@ -103,6 +103,10 @@ class OperationalApprovalMcpTests(unittest.TestCase):
                 return await client.call_tool(tool_name, {"payload": payload})
         return self.run_async(exercise())
 
+    @staticmethod
+    def _error_code(result):
+        return result.meta["com.delivery-system/public-tool-error"]["code"]
+
     def test_server_binds_supplied_approval_registry_identity(self):
         directory, context, store, preview, audit, service = self._setup(with_attestation=False)
         try:
@@ -211,12 +215,12 @@ class OperationalApprovalMcpTests(unittest.TestCase):
                 "preview_id": "missing-preview", "revision": 1,
             })
             self.assertTrue(missing.is_error)
-            self.assertIn("preview_not_found", str(missing.content))
+            self.assertEqual(self._error_code(missing), "preview_not_found")
             stale = self._call(server, "delivery_get_approval_status", {
                 "preview_id": preview["preview_id"], "revision": 2,
             })
             self.assertTrue(stale.is_error)
-            self.assertIn("preview_stale", str(stale.content))
+            self.assertEqual(self._error_code(stale), "preview_stale")
         finally:
             directory.cleanup()
 
@@ -292,7 +296,7 @@ class OperationalApprovalMcpTests(unittest.TestCase):
             approval_result, first, second = self.run_async(exercise())
             self.assertFalse(first.is_error)
             self.assertTrue(second.is_error)
-            self.assertIn("authority_issuance_requires_recovery", str(second.content))
+            self.assertEqual(self._error_code(second), "authority_issuance_requires_recovery")
             self.assertEqual(len(service._authorities), 1)
             self.assertTrue(service.validate_application_authority(next(iter(service._authorities.values()))))
             self.assertEqual(len(first.structured_content["required_capabilities"]), 1)
@@ -347,11 +351,11 @@ class OperationalApprovalMcpTests(unittest.TestCase):
             self.assertEqual(first.structured_content, replay.structured_content)
             self.assertEqual(first.structured_content["approved_at"], "2026-08-14T12:00:00Z")
             self.assertTrue(conflict.is_error)
-            self.assertIn("approval_binding_conflict", str(conflict.content))
+            self.assertEqual(self._error_code(conflict), "approval_binding_conflict")
             self.assertTrue(malformed.is_error)
-            self.assertIn("approval_command_invalid", str(malformed.content))
+            self.assertEqual(self._error_code(malformed), "approval_command_invalid")
             self.assertTrue(whitespace.is_error)
-            self.assertIn("approval_invalid", str(whitespace.content))
+            self.assertEqual(self._error_code(whitespace), "approval_invalid")
 
             store.transition_audit_status(audit.audit_id, AuditStatus.STALE, "test")
             stale = self._call(server, "delivery_record_approval", {
@@ -359,7 +363,7 @@ class OperationalApprovalMcpTests(unittest.TestCase):
                 "approval_command": command, "approver_claim": "human",
             })
             self.assertTrue(stale.is_error)
-            self.assertIn("audit_not_found", str(stale.content))
+            self.assertEqual(self._error_code(stale), "audit_not_found")
             self.assertEqual(store.get_approval(context.workspace_identity, first.structured_content["approval_id"]).to_dict(), first.structured_content)
         finally:
             directory.cleanup()
@@ -381,7 +385,7 @@ class OperationalApprovalMcpTests(unittest.TestCase):
             second = self._call(server, "delivery_issue_application_authority", authority_payload)
             self.assertFalse(first.is_error)
             self.assertTrue(second.is_error)
-            self.assertIn("authority_issuance_requires_recovery", str(second.content))
+            self.assertEqual(self._error_code(second), "authority_issuance_requires_recovery")
             self.assertEqual(set(first.structured_content), AUTHORITY_FIELDS)
             self.assertEqual(first.structured_content["required_capabilities"], ["issues:write"])
             self.assertEqual(first.structured_content["granted_capabilities"], ["issues:write"])
@@ -393,7 +397,7 @@ class OperationalApprovalMcpTests(unittest.TestCase):
                 **authority_payload, "approval_id": "approval-wrong",
             })
             self.assertTrue(wrong.is_error)
-            self.assertIn("approval_binding_mismatch", str(wrong.content))
+            self.assertEqual(self._error_code(wrong), "approval_binding_mismatch")
 
         finally:
             directory.cleanup()
@@ -413,7 +417,7 @@ class OperationalApprovalMcpTests(unittest.TestCase):
                 "approval_id": approval.structured_content["approval_id"],
             })
             self.assertTrue(result.is_error)
-            self.assertIn("credential_capability_insufficient", str(result.content))
+            self.assertEqual(self._error_code(result), "credential_capability_insufficient")
         finally:
             directory.cleanup()
 
@@ -438,7 +442,7 @@ class OperationalApprovalMcpTests(unittest.TestCase):
             with patch.object(service.attestation_service, "resolve_registered_binding", side_effect=without_grant):
                 missing_grant = self._call(server, "delivery_issue_application_authority", payload)
             self.assertTrue(missing_grant.is_error)
-            self.assertIn("verified_attestation_context_unverified", str(missing_grant.content))
+            self.assertEqual(self._error_code(missing_grant), "verified_attestation_context_unverified")
         finally:
             directory.cleanup()
 
@@ -456,7 +460,7 @@ class OperationalApprovalMcpTests(unittest.TestCase):
                 "approval_id": approval.structured_content["approval_id"],
             })
             self.assertTrue(expired.is_error)
-            self.assertIn("credential_binding_mismatch", str(expired.content))
+            self.assertEqual(self._error_code(expired), "credential_binding_mismatch")
         finally:
             directory.cleanup()
 
@@ -488,7 +492,7 @@ class OperationalApprovalMcpTests(unittest.TestCase):
                     "approval_command": "command", "approver_claim": "human",
                 })
                 self.assertTrue(result.is_error)
-                self.assertIn("workspace_identity_unavailable", str(result.content))
+                self.assertEqual(self._error_code(result), "workspace_identity_unavailable")
 
     def test_authority_without_attestation_fails_closed(self):
         directory, context, store, preview, audit, service = self._setup(with_attestation=False)
@@ -502,7 +506,7 @@ class OperationalApprovalMcpTests(unittest.TestCase):
                     })
             result = self.run_async(exercise())
             self.assertTrue(result.is_error)
-            self.assertIn("attestation_service_unavailable", str(result.content))
+            self.assertEqual(self._error_code(result), "attestation_service_unavailable")
         finally:
             directory.cleanup()
 
@@ -529,7 +533,7 @@ class OperationalApprovalMcpTests(unittest.TestCase):
             tools, result = self.run_async(exercise())
             self.assertEqual(len(tools.tools), 9)
             self.assertTrue(result.is_error)
-            self.assertIn("attestation_service_unavailable", str(result.content))
+            self.assertEqual(self._error_code(result), "attestation_service_unavailable")
 
 
 if __name__ == "__main__":

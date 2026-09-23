@@ -56,6 +56,10 @@ class McpWriteSurfaceTests(unittest.TestCase):
         return McpWriteSurfaceTests.run_async(exercise())
 
     @staticmethod
+    def _error_code(result):
+        return result.meta["com.delivery-system/public-tool-error"]["code"]
+
+    @staticmethod
     def _success(number=1, numeric_id="1"):
         return ApplierOrchestrationTests._success(number=number, numeric_id=numeric_id)
 
@@ -110,19 +114,19 @@ class McpWriteSurfaceTests(unittest.TestCase):
             {"application_id": "application-" + "a" * 64, "extra": "rejected"},
         )
         self.assertTrue(result.is_error)
-        self.assertNotIn("remote_observation", str(result.content))
+        self.assertNotIn("remote_observation", result.content[0].text)
 
     def test_global_apply_is_unconfigured_and_fails_closed(self):
         result = self._call(mcp, "delivery_apply_approved_work_items",
                             {"application_authority_id": "authority"})
         self.assertTrue(result.is_error)
-        self.assertIn("write_execution_boundary_unavailable", str(result.content))
+        self.assertEqual(self._error_code(result), "write_execution_boundary_unavailable")
 
     def test_global_application_status_is_unconfigured_and_fails_closed(self):
         result = self._call(mcp, "delivery_get_application_status",
                             {"application_id": "application-" + "a" * 64})
         self.assertTrue(result.is_error)
-        self.assertIn("application_status_boundary_unavailable", str(result.content))
+        self.assertEqual(self._error_code(result), "internal_error")
 
     def test_apply_input_is_strict_and_forbids_injection(self):
         for value in (1, True):
@@ -138,7 +142,7 @@ class McpWriteSurfaceTests(unittest.TestCase):
                                     "delivery_apply_approved_work_items",
                                     {"application_authority_id": value})
                 self.assertTrue(result.is_error)
-                self.assertIn("application_authority_id_invalid", str(result.content))
+                self.assertEqual(self._error_code(result), "application_authority_id_invalid")
             finally:
                 directory.cleanup()
 
@@ -256,7 +260,7 @@ class McpWriteSurfaceTests(unittest.TestCase):
             result = self._call(server, "delivery_apply_approved_work_items",
                                 {"application_authority_id": "authority"})
             self.assertTrue(result.is_error)
-            self.assertIn("write_executor_required", str(result.content))
+            self.assertEqual(self._error_code(result), "write_executor_required")
         finally:
             directory.cleanup()
 
@@ -344,7 +348,7 @@ class McpWriteSurfaceTests(unittest.TestCase):
                 result = self._call(server, "delivery_apply_approved_work_items",
                                     {"application_authority_id": authority.authority_id})
                 self.assertTrue(result.is_error)
-                self.assertIn("application_replay_validation_required", str(result.content))
+                self.assertEqual(self._error_code(result), "application_replay_validation_required")
         finally:
             directory.cleanup()
 
@@ -391,7 +395,7 @@ class McpWriteSurfaceTests(unittest.TestCase):
             tools, result = self.run_async(exercise())
             self.assertEqual(len(tools.tools), 9)
             self.assertTrue(result.is_error)
-            self.assertIn("write_execution_boundary_unavailable", str(result.content))
+            self.assertEqual(self._error_code(result), "write_execution_boundary_unavailable")
 
 
 if __name__ == "__main__":

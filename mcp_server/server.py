@@ -8,18 +8,26 @@ from datetime import datetime, timezone
 from typing import Annotated, Any, Literal
 
 from mcp.server import MCPServer
-from mcp.types import ToolAnnotations
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, StrictInt, StrictStr
+from mcp.server.context import ServerRequestContext
+from mcp.server.mcpserver.context import Context
+from mcp.server.mcpserver.exceptions import ToolError
+from mcp.shared.exceptions import MCPError
+from mcp.types import INVALID_PARAMS, CallToolRequestParams, CallToolResult, TextContent, ToolAnnotations
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, StrictInt, StrictStr, ValidationError
 
 from delivery_system.runtime import (
     ApplicationPostconditionObservation, AuditContextService, RuntimeApplicationStatusService,
     RuntimeApprovalAuthorityService, RuntimeContext, RuntimePlanner, SQLitePreviewStore,
+    StorePreflightError,
 )
 from delivery_system.applier import ApplyResult
 from delivery_system.execution_store import SQLiteExecutionStore
-from delivery_system.drivers.contract import DriverTrustContext
+from delivery_system.drivers.contract import DriverError, DriverTrustContext
 from delivery_system.auditor import FindingDraft, RuleEvaluationDraft, RuntimeAuditor
 from delivery_system.rules import ResultClass, RuleRegistry, SemanticOutcome, build_registry_v1
+from delivery_system.public_error_contract import (
+    INTERNAL_ERROR_CODE, PUBLIC_ERROR_REGISTRY, PublicErrorDescriptor, descriptor_for_code,
+)
 
 
 SERVER_NAME = "delivery-system-planner"
@@ -394,6 +402,91 @@ def _production_clock() -> datetime:
     return datetime.now(timezone.utc)
 
 
+_PUBLIC_ERROR_META_KEY = "com.delivery-system/public-tool-error"
+
+
+def _exception_chain(error: BaseException):
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
+
+
+def _specific_validation_code(error: ValidationError) -> str | None:
+    try:
+        details = error.errors()
+    except Exception:
+        return None
+    for detail in details:
+        context = detail.get("ctx")
+        if not isinstance(context, dict):
+            continue
+        nested = context.get("error")
+        if (
+            isinstance(nested, ValueError)
+            and len(nested.args) == 1
+            and type(nested.args[0]) is str
+            and nested.args[0] == "application_id_invalid"
+        ):
+            return nested.args[0]
+    return None
+
+
+def _registered_code_from_trusted_exception(error: BaseException) -> str | None:
+    if isinstance(error, (DriverError, StorePreflightError)):
+        code = error.code
+        if type(code) is str and code in PUBLIC_ERROR_REGISTRY:
+            return code
+    if isinstance(error, ValueError) and len(error.args) == 1:
+        candidate = error.args[0]
+        if type(candidate) is str and candidate in PUBLIC_ERROR_REGISTRY:
+            return candidate
+    return None
+
+
+def _descriptor_for_tool_error(error: ToolError) -> PublicErrorDescriptor:
+    for cause in _exception_chain(error.__cause__):
+        if isinstance(cause, ValidationError):
+            return descriptor_for_code(_specific_validation_code(cause) or "input_invalid")
+        code = _registered_code_from_trusted_exception(cause)
+        if code is not None:
+            return descriptor_for_code(code)
+    return descriptor_for_code(INTERNAL_ERROR_CODE)
+
+
+def _error_result(descriptor: PublicErrorDescriptor) -> CallToolResult:
+    return CallToolResult(
+        content=[TextContent(type="text", text=descriptor.safe_text)],
+        structured_content=None,
+        is_error=True,
+        meta={_PUBLIC_ERROR_META_KEY: descriptor.public_error().to_meta()},
+    )
+
+
+class DeliverySystemMCPServer(MCPServer):
+    async def _handle_call_tool(
+        self, ctx: ServerRequestContext[Any], params: CallToolRequestParams,
+    ) -> CallToolResult:
+        context = Context(
+            request_context=ctx,
+            mcp_server=self,
+            input_params=params,
+            subscriptions=self._subscriptions,
+        )
+        try:
+            return await self.call_tool(params.name, params.arguments or {}, context)
+        except MCPError:
+            raise
+        except ToolError as error:
+            if error.__cause__ is None:
+                raise MCPError(code=INVALID_PARAMS, message="Unknown tool") from None
+            return _error_result(_descriptor_for_tool_error(error))
+        except Exception:
+            return _error_result(descriptor_for_code(INTERNAL_ERROR_CODE))
+
+
 def create_server(context: RuntimeContext | None = None, store: Any | None = None, driver: Any = None,
                   trust_context: DriverTrustContext | None = None,
                   approval_authority_service: RuntimeApprovalAuthorityService | None = None,
@@ -430,7 +523,7 @@ def create_server(context: RuntimeContext | None = None, store: Any | None = Non
                 execution_store.workspace_identity != context.workspace_identity or
                 execution_store.runtime_service is not approval_authority_service):
             raise ValueError("write_execution_boundary_invalid")
-    mcp = MCPServer(SERVER_NAME)
+    mcp = DeliverySystemMCPServer(SERVER_NAME)
 
     @mcp.tool(
         name=TOOL_NAME,

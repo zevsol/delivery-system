@@ -154,6 +154,10 @@ class ApplicationObservationTests(unittest.TestCase):
         import asyncio
         return asyncio.run(exercise())
 
+    @staticmethod
+    def _error_code(result):
+        return result.meta["com.delivery-system/public-tool-error"]["code"]
+
     def test_add_sub_issue_and_dependency_confirmed(self):
         expected = {
             "application_id", "operation_index", "operation_identity", "operation_kind",
@@ -206,7 +210,7 @@ class ApplicationObservationTests(unittest.TestCase):
             application_id = service.create_execution_context(authority.authority_id).identity.application_id
             result = self._call(server, application_id)
             self.assertTrue(result.is_error)
-            self.assertIn("reconciliation_operation_unsupported", str(result.content))
+            self.assertEqual(self._error_code(result), "reconciliation_operation_unsupported")
             self.assertEqual(driver.calls, 0)
         finally:
             directory.cleanup()
@@ -243,7 +247,7 @@ class ApplicationObservationTests(unittest.TestCase):
                 with self.subTest(state=state_name), patch.object(execution_store, "get_execution", return_value=candidate):
                     result = self._call(server, application_id)
                     self.assertTrue(result.is_error)
-                    self.assertIn("application_reconciliation_state_invalid", str(result.content))
+                    self.assertEqual(self._error_code(result), "application_reconciliation_state_invalid")
             self.assertEqual(driver.calls, 0)
         finally:
             directory.cleanup()
@@ -252,7 +256,7 @@ class ApplicationObservationTests(unittest.TestCase):
         application_id = "application-" + "a" * 64
         result = self._call(create_server(), application_id + " ")
         self.assertTrue(result.is_error)
-        self.assertIn("application_id_invalid", str(result.content))
+        self.assertEqual(self._error_code(result), "application_id_invalid")
 
         directory, context, service, authority, execution_store, driver, server = self._configured()
         try:
@@ -260,7 +264,7 @@ class ApplicationObservationTests(unittest.TestCase):
             with patch.object(execution_store, "get_execution", side_effect=ValueError("state_integrity_invalid")):
                 result = self._call(server, application_id)
             self.assertTrue(result.is_error)
-            self.assertIn("state_integrity_invalid", str(result.content))
+            self.assertEqual(self._error_code(result), "state_integrity_invalid")
 
         finally:
             directory.cleanup()
@@ -275,13 +279,13 @@ class ApplicationObservationTests(unittest.TestCase):
             ):
                 result = self._call(server, application_id)
             self.assertTrue(result.is_error)
-            self.assertIn("sealed_preview_schema_invalid", str(result.content))
+            self.assertEqual(self._error_code(result), "sealed_preview_schema_invalid")
             self.assertEqual(driver.calls, 0)
 
             with patch.object(execution_store, "get_operation_receipt", side_effect=ValueError("operation_receipt_not_found")):
                 result = self._call(server, application_id)
             self.assertTrue(result.is_error)
-            self.assertIn("operation_receipt_not_found", str(result.content))
+            self.assertEqual(self._error_code(result), "operation_receipt_not_found")
 
             live = service.create_execution_context(authority.authority_id)
             state = execution_store.get_execution(application_id, expected_operations=live.expected_operations)
@@ -291,7 +295,7 @@ class ApplicationObservationTests(unittest.TestCase):
             with patch.object(execution_store, "get_attempt", return_value=tampered_attempt):
                 result = self._call(server, application_id)
             self.assertTrue(result.is_error)
-            self.assertIn("attempt_integrity_invalid", str(result.content))
+            self.assertEqual(self._error_code(result), "attempt_integrity_invalid")
 
             for field, value in (("operation_identity", "operation-forged"), ("operation_index", 99),
                                  ("request_identity", "request-forged")):
@@ -300,7 +304,7 @@ class ApplicationObservationTests(unittest.TestCase):
                 with self.subTest(attempt_field=field), patch.object(execution_store, "get_attempt", return_value=tampered):
                     result = self._call(server, application_id)
                     self.assertTrue(result.is_error)
-                    self.assertIn("attempt_integrity_invalid", str(result.content))
+                    self.assertEqual(self._error_code(result), "attempt_integrity_invalid")
 
             live_operation = live.expected_operations[0]
             receipt = execution_store.get_operation_receipt(
@@ -320,7 +324,7 @@ class ApplicationObservationTests(unittest.TestCase):
             with patch.object(execution_store, "get_operation_receipt", return_value=tampered_receipt):
                 result = self._call(server, application_id)
             self.assertTrue(result.is_error)
-            self.assertIn("receipt_integrity_invalid", str(result.content))
+            self.assertEqual(self._error_code(result), "receipt_integrity_invalid")
         finally:
             directory.cleanup()
 
@@ -339,7 +343,7 @@ class ApplicationObservationTests(unittest.TestCase):
                 application_id = service.create_execution_context(authority.authority_id).identity.application_id
                 result = self._call(server, application_id)
                 self.assertTrue(result.is_error)
-                self.assertIn("remote_observation_unavailable", str(result.content))
+                self.assertEqual(self._error_code(result), "remote_observation_unavailable")
                 self.assertEqual(driver.calls, 1)
             finally:
                 directory.cleanup()
@@ -361,7 +365,8 @@ class ApplicationObservationTests(unittest.TestCase):
                 application_id = service.create_execution_context(authority.authority_id).identity.application_id
                 result = self._call(server, application_id)
                 self.assertTrue(result.is_error)
-                self.assertIn(code, str(result.content))
+                expected_code = code if code == "remote_observation_unavailable" else "internal_error"
+                self.assertEqual(self._error_code(result), expected_code)
             finally:
                 directory.cleanup()
 
@@ -436,8 +441,8 @@ class ApplicationObservationTests(unittest.TestCase):
                 with self.subTest(field=field):
                     result = self._call(server, application_id)
                     self.assertTrue(result.is_error)
-                    self.assertIn("attempt_integrity_invalid", str(result.content))
-                    self.assertEqual(driver.calls, 0)
+                    self.assertEqual(self._error_code(result), "attempt_integrity_invalid")
+                self.assertEqual(driver.calls, 0)
             finally:
                 directory.cleanup()
 
@@ -475,8 +480,8 @@ class ApplicationObservationTests(unittest.TestCase):
                 with self.subTest(field=field):
                     result = self._call(server, application_id)
                     self.assertTrue(result.is_error)
-                    expected = "repository_identity_mismatch" if field == "repository" else "receipt_integrity_invalid"
-                    self.assertIn(expected, str(result.content))
+                    expected = "internal_error" if field == "repository" else "receipt_integrity_invalid"
+                    self.assertEqual(self._error_code(result), expected)
                     self.assertEqual(driver.calls, 0)
             finally:
                 directory.cleanup()
@@ -509,7 +514,7 @@ class ApplicationObservationTests(unittest.TestCase):
                 with self.subTest(table=table):
                     result = self._call(server, application_id)
                     self.assertTrue(result.is_error)
-                    self.assertIn(expected, str(result.content))
+                    self.assertEqual(self._error_code(result), expected)
                     self.assertEqual(driver.calls, 0)
                 # Restore the trusted row before testing the other artifact.
                 status_fixture.ApplicationStatusSurfaceTests._replace_payload(
@@ -540,7 +545,7 @@ class ApplicationObservationTests(unittest.TestCase):
         application_id = "application-" + "a" * 64
         result = self._call(create_server(), application_id)
         self.assertTrue(result.is_error)
-        self.assertIn("application_reconciliation_boundary_unavailable", str(result.content))
+        self.assertEqual(self._error_code(result), "application_reconciliation_boundary_unavailable")
 
 
 if __name__ == "__main__":
