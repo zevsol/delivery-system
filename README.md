@@ -1,39 +1,68 @@
 # Delivery System
 
-Delivery System is a governed software-delivery control system for AI-assisted development. It turns development intent into deterministic, auditable GitHub work-item previews. Before any bounded application, a Sealed Preview requires independent audit and explicit Human Approval; Apply executes only the approved operation set and, for a definitive outcome, preserves a durable result and receipt; if execution is not definitive, it preserves recovery-required evidence and stops safely.
+Delivery System turns development intent into reviewed, approved, and traceable GitHub work items. It gives an external source-checkout user a governed path from a proposed change to a bounded application, with an independent audit and explicit Human Approval before GitHub can be modified.
 
-V1 is intentionally bounded to GitHub Issues and their relationships through an explicit Plan → Audit → Approve → Apply workflow.
+> **Safe first run:** start with Preview-only planning.
+> Local Delivery System state may change; GitHub is not modified.
+> → [Getting Started](docs/getting-started.md)
 
-## Maintainer references
+## What it does
 
-- [Architecture and lifecycle](docs/architecture-and-lifecycle.md)
-- [Debt register](docs/debt-register.md)
-
-It provides a structured planning protocol with:
-
-- explicit User-asserted, model-proposed, and model-assumption values;
-- deterministic canonical payloads and plan digests;
-- Runtime-owned request, preview, revision, and item lineage;
-- typed audit and approval record schemas and validators;
-- a Runtime-owned Rule Registry and deterministic audit recording contract;
-- explicit Human Approval recording for approval-eligible Sealed Previews;
-- a local PreviewStore contract with SQLite preflight checks;
-- an official MCP SDK stdio server exposed through `delivery-system-mcp`.
-
-The Planner does not write to GitHub. The Runtime may write local PreviewStore state under the explicitly supplied workspace root. A workspace is started with:
+V1 is bounded to GitHub Issues and their relationships. The product path is:
 
 ```text
-delivery-system-mcp --workspace-root <absolute-path>
+Plan → Audit → Human Approval → Apply → Result / Recovery
 ```
 
-The current Runtime Auditor records deterministic audit results for Conceptual previews from declared semantic evaluations. The user-facing `audit-github-work-items` Skill reads an existing Sealed Preview, evaluates the returned audit context, and records a local Runtime Audit. It does not approve a Preview, write to GitHub, implement the Applier, or create or modify a Preview. Conceptual audits are never approval-eligible.
+The four user-facing jobs are provided by the bundled Skills:
 
-The user-facing `approve-github-work-items` Skill records explicit Human Approval for a specific Sealed Preview through the Runtime. Approval is not ApplicationAuthority, does not issue ApplicationAuthority, and does not execute the Applier or write to GitHub. Human Approval can be recorded locally without credential or attestation bootstrap.
+- `plan-github-work-items` prepares a Sealed Preview.
+- `audit-github-work-items` independently audits an existing Preview.
+- `approve-github-work-items` records Human Approval for one exact Preview.
+- `apply-github-work-items` applies only the approved operation set.
 
-The user-facing `apply-github-work-items` Skill applies one exact, explicitly approved Sealed Preview through the existing bounded Applier path. Apply is separate from Human Approval and may perform irreversible GitHub Issue mutations within the approved operation set. ApplicationAuthority issuance is internal orchestration and is not a user-facing objective. Definitive success requires the durable Applied result and application receipt; ambiguous or recovery-required results stop without automatic retry and require operator or Host escalation.
+## Safety at a glance
 
-The current package is source code and a Python runtime prototype. It is not a ChatGPT or Codex Plugin, Universal Public Plugin, Personal Repository Beta, Host Tested installation, or external Integration Tested release.
+| Stage | Local Delivery System effect | GitHub effect |
+| --- | --- | --- |
+| Plan | May create or update local planning state | Plan does not write GitHub |
+| Audit | May record local audit state | Audit does not write GitHub |
+| Human Approval | Records local approval state | Human Approval does not write GitHub |
+| Apply | Records execution/result state | Apply is the GitHub-write boundary; only approved operations may be applied |
 
-The bundled local state database is `.delivery-system/state.sqlite3` and is excluded from Git. It does not store tokens, cookies, or authentication configuration. The Planner does not provide destructive cleanup operations.
+Automatic retry is not authorized.
 
-The current local stdio server exposes nine MCP surfaces: `delivery_plan_preview`, `delivery_get_audit_context`, `delivery_record_audit`, `delivery_record_approval`, `delivery_get_approval_status`, `delivery_get_application_status`, `delivery_issue_application_authority`, `delivery_apply_approved_work_items`, and `delivery_observe_application_postcondition`. `delivery_get_application_status` reads a bounded, Runtime-validated projection of durable application state and recovery evidence; it never retries, resumes, reobserves GitHub, reconciles remote effects, transitions application state, or writes GitHub. The Planner, Auditor, Approval, and Apply Skills are deterministically contract-tested; the Auditor Skill has also been behavior-tested through isolated local execution with three real Runtime audit contexts and independent semantic review. Host credential/bootstrap, installation, and formal release packaging remain outside the verified capability boundary. The bounded Applier and GitHub application path are implemented through the existing protected execution boundary.
+Ambiguous execution outcomes stop safely and require recovery or operator/Host escalation.
+
+ApplicationAuthority, attestation, receipts, digests, and other integrity details are internal orchestration rather than ordinary user objectives.
+
+## Current status
+
+Delivery System is currently source-usable prototype software. It is not currently claimed as Install Tested, Host Tested, an externally Integration Tested release, or formally Released. Host credential/bootstrap configuration, installation lifecycle, and formal release packaging remain outside the verified capability boundary.
+
+## Quick start
+
+The safe first path is Preview-only: [Getting Started](docs/getting-started.md).
+
+The guide uses a source checkout, a dependency-ready Python environment, and a local stdio MCP server. A first Preview may change local Runtime state, but it does not modify GitHub and does not imply Approval.
+
+## First Preview
+
+Start with a clear intent, problem, desired outcome, scope, non-goals, acceptance criteria, and verification expectation. The guide includes a representative inventory batch-tracking example and explains how to interpret the resulting Preview and Revision.
+
+## Write-enabled use
+
+A separate `github-app-write` Host profile supports the governed write-enabled path. It requires operator configuration. Apply is the only stage that may modify GitHub. See [Host configuration](docs/host-configuration.md) for the canonical operator contract; it is not required for the Preview-only first run.
+
+## Documentation
+
+| Audience | Start here | Purpose |
+| --- | --- | --- |
+| User | [Getting Started](docs/getting-started.md) | Source checkout, startup, and first safe Preview |
+| Operator | [Host configuration](docs/host-configuration.md) | Write-enabled Host configuration |
+| Maintainer | [Architecture and lifecycle](docs/architecture-and-lifecycle.md) | Runtime and lifecycle architecture |
+| Maintainer | [Debt register](docs/debt-register.md) | Deferred work and residual responsibilities |
+
+## Maintainer / operator references
+
+The repository is MIT licensed. Public product documentation is written for users first; architecture, lifecycle, Host configuration, and debt details remain in their respective maintained documents.

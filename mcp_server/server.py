@@ -31,7 +31,7 @@ from delivery_system.public_error_contract import (
 
 
 SERVER_NAME = "delivery-system-planner"
-SERVER_VERSION = "0.5.0"
+SERVER_VERSION = "0.1.0"
 TOOL_NAME = "delivery_plan_preview"
 TOOL_ANNOTATIONS = ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=False)
 
