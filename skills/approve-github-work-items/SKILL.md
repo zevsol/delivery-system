@@ -82,3 +82,16 @@ After success, say “Approval recorded.” Show the Approval ID, Preview ID, Re
 `approval_id`, `audit_id`, `audit_digest`, `audit_result`, `preview_id`, `revision`, `plan_digest`, `remote_snapshot_digest`, `operation_set_digest`, `repository_identity`, `approval_command`, `approver_claim`, `approved_at`, `status`.
 
 Also state: “Application authority was not issued. No GitHub mutation was executed.” Do not describe Approval as GitHub write authorization, credential capability, ApplicationAuthority, or completed GitHub work.
+
+## Handoff to Apply
+
+After successful `delivery_record_approval`, preserve the exact Runtime-returned `approval_id`, `preview_id`, and `revision`.
+
+State:
+
+- Approval was recorded;
+- no GitHub mutation occurred;
+- ApplicationAuthority was not issued;
+- Apply remains a separate user job.
+
+If the user explicitly chooses to execute the approved work, the next user-facing Skill is `apply-github-work-items`. Do not invoke Apply automatically because Approval succeeded. Approval records explicit human intent for one exact target; it is not executable GitHub authority.

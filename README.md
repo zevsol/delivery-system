@@ -14,6 +14,8 @@ V1 is bounded to GitHub Issues and their relationships. The product path is:
 Plan → Audit → Human Approval → Apply → Result / Recovery
 ```
 
+For the complete handoff and safety path, see [User Workflow](docs/user-workflow.md).
+
 The four user-facing jobs are provided by the bundled Skills:
 
 - `plan-github-work-items` prepares a Sealed Preview.

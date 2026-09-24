@@ -122,7 +122,7 @@ A successful first result means:
 - blockers or clarification findings may still be present;
 - write eligibility is not Human Approval.
 
-Preview-only is the safe first path. Audit is the next governed product stage; this guide does not replace the later Audit → Approval → Apply workflow documentation.
+Preview-only is the safe first path. When the Preview is ready for independent review, continue through [User Workflow](user-workflow.md): Audit → Human Approval → Apply → Result / Recovery. This guide does not execute those later stages.
 
 ## Write-enabled path
 
