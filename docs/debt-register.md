@@ -170,15 +170,6 @@ Every entry has Category, Status, Risk, Why deferred / rationale, Constraints pr
 - Review point: Related capability reopening.
 - Decision/owner state: Test maintenance authorization required.
 
-### CI-VALIDATOR-01 — Official-validator CI coverage
-- Category: Release/CI; Status: Deferred; Risk: Medium
-- Why deferred / rationale: Local validator evidence exists; CI enforcement remains incomplete.
-- Constraints preserved: Do not claim CI evidence not executed.
-- Evidence/reference: Validator scripts and CI configuration.
-- Reconsideration trigger: CI or release preparation.
-- Review point: Before first release.
-- Decision/owner state: Release/CI authorization required.
-
 ### PROD-NULL-PARITY-01 — Optional-null semantic parity
 - Category: Product; Status: Deferred; Risk: Low
 - Why deferred / rationale: Outside current reviewed surface.
@@ -207,6 +198,15 @@ Every entry has Category, Status, Risk, Why deferred / rationale, Constraints pr
 - Decision/owner state: Product/UX decision required.
 
 ## Resolved and superseded entries
+
+### CI-VALIDATOR-01 — Official-validator CI coverage
+- Category: Release/CI; Status: Resolved; Risk: Medium
+- Why deferred / rationale: Resolved by deterministic GitHub CI provisioning of the official OpenAI Codex Skill Validator from an immutable upstream commit, SHA-256 verification before publication, workflow-level UTF-8 execution, and official Validator contract coverage for all four bundled public Skills.
+- Constraints preserved: CI Validator acquisition must remain fail-closed before `SKILL_CREATOR_VALIDATOR` publication, and Planner, Auditor, Approval, and Apply must remain covered by official Validator execution. This resolution does not establish Install Tested, Host Tested, external Integration Tested, or Released status.
+- Evidence/reference: `.github/workflows/ci.yml`; `tests/slice2c/test_planner_skill_contract.py`; `tests/slice2c/test_auditor_skill_contract.py`; `tests/slice2d/test_approval_skill_contract.py`; `tests/slice2d/test_apply_skill_contract.py`; PR #50; PR CI run `36094423972`; post-merge main CI run `36095274275`.
+- Reconsideration trigger: Official Validator provenance, acquisition, integrity verification, CI runtime/dependency behavior, bundled public Skill set, or Validator invocation contract changes.
+- Review point: Before changing CI Validator enforcement or adding/removing a bundled public Skill, and before first release review if the enforcement contract has changed.
+- Decision/owner state: Official Validator CI enforcement is resolved for the current four bundled public Skills. Installation, release compatibility, Host/integration evidence, operator lifecycle, and other release-readiness concerns remain owned by their existing debt entries.
 
 ### GOV-HOSTCFG-01 — Durable Host configuration contract
 - Category: Operator; Status: Resolved; Risk: High
