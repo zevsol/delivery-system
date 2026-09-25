@@ -8,6 +8,8 @@ import subprocess
 import sys
 import unittest
 
+import yaml
+
 
 ROOT = Path(__file__).parents[2]
 SKILL_DIR = ROOT / "skills" / "apply-github-work-items"
@@ -35,6 +37,7 @@ class ApplySkillContractTests(unittest.TestCase):
     def setUpClass(cls):
         cls.skill = SKILL_PATH.read_text(encoding="utf-8")
         cls.metadata = OPENAI_PATH.read_text(encoding="utf-8")
+        cls.metadata_document = yaml.safe_load(cls.metadata)
 
     @staticmethod
     def section(document, heading):
@@ -164,18 +167,31 @@ class ApplySkillContractTests(unittest.TestCase):
             self.assertIn(phrase, guidance)
 
     def test_metadata_has_exact_internal_mcp_surface(self):
-        entries = re.findall(
-            r'- type: "([^"]+)"\n\s+value: "([^"]+)"\n\s+description: "([^"]+)"\n\s+transport: "([^"]+)"',
-            self.metadata,
-        )
+        self.assertIsInstance(self.metadata_document, dict)
+        self.assertIn("dependencies", self.metadata_document)
+        dependencies = self.metadata_document["dependencies"]
+        self.assertIsInstance(dependencies, dict)
+        self.assertIn("tools", dependencies)
+        tools = dependencies["tools"]
+        self.assertIsInstance(tools, list)
+        self.assertEqual(len(tools), 5)
+        self.assertTrue(all(isinstance(entry, dict) for entry in tools))
         self.assertEqual(
-            [(kind, value, transport) for kind, value, _description, transport in entries],
+            [(entry.get("type"), entry.get("value"), entry.get("transport")) for entry in tools],
             [
                 ("mcp", "delivery_get_audit_context", "stdio"),
                 ("mcp", "delivery_issue_application_authority", "stdio"),
                 ("mcp", "delivery_apply_approved_work_items", "stdio"),
+                ("mcp", "delivery_get_application_status", "stdio"),
+                ("mcp", "delivery_observe_application_postcondition", "stdio"),
             ],
         )
+        status_description = tools[3]["description"]
+        self.assertIn("bounded durable Application status and recovery evidence", status_description)
+        self.assertIn("does not retry, resume, reconcile, or write to GitHub", status_description)
+        observation_description = tools[4]["description"]
+        self.assertIn("restricted OutcomeUnknown relationship postcondition evidence", observation_description)
+        self.assertIn("does not establish causal attribution, authorize retry or resume, or write to GitHub", observation_description)
 
     def test_approval_remains_separate_and_recovery_is_not_application(self):
         preconditions = self.section(self.skill, "Preconditions and handoff")
@@ -201,7 +217,7 @@ class ApplySkillContractTests(unittest.TestCase):
         self.assertIn('transport: "stdio"', self.metadata)
         for tool in ("delivery_get_audit_context", "delivery_issue_application_authority", "delivery_apply_approved_work_items"):
             self.assertIn(f'value: "{tool}"', self.metadata)
-        self.assertEqual(self.metadata.count('type: "mcp"'), 3)
+        self.assertEqual(self.metadata.count('type: "mcp"'), 5)
 
 
 if __name__ == "__main__":

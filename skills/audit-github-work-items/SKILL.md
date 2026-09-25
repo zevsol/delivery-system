@@ -27,6 +27,16 @@ Independently review an existing Delivery System Sealed Preview and record the r
 7. Call `delivery_record_audit` with the same `preview_id`, `revision`, returned `audit_context_digest`, `semantic_evaluations`, and `finding_drafts`.
 8. Use the returned `audit_id`, `audit_scope`, `result`, `status`, `audit_payload_digest`, `audit_digest`, `findings`, `rule_evaluations`, and `approval_eligible` exactly as returned. Do not calculate, replace, or infer Runtime-owned fields.
 
+## Handoff to Human Approval
+
+Use the Runtime-returned `result`, `status`, `audit_scope`, and `approval_eligible` exactly as returned. A `Passed` result alone does not establish Approval eligibility: a passed Conceptual Audit remains non-approval-eligible.
+
+Navigate to `approve-github-work-items` only when the current Audit is approval-eligible, including the relevant `WriteEligible` condition and `approval_eligible=true`. Carry forward the exact `preview_id` and `revision`.
+
+The returned `audit_id` is an audit receipt/result identifier. It is not a caller-supplied Approval target. Approval remains bound to the exact Preview ID and Revision, and Runtime independently validates the current Audit state.
+
+For any non-eligible, stale, blocked, incomplete, or clarification-required result, stop or require correction, new information, revision, and re-audit as appropriate.
+
 ### Decomposition rubric
 
 Evaluate the sealed graph independently of Planner suggestions. Under `SEM-WORK-ITEM-DECOMPOSITION`, require one coherent primary outcome, bounded Scope, independently meaningful verification, a valid stopping point, and distinguish under-decomposition, over-decomposition, implementation fragments, bounded technical outcomes, and shared-capability Work Items. Under `SEM-PARENT-SUBISSUE`, require that the Parent owns a distinct integration/system outcome, that hierarchy is necessary, and that Parent acceptance and verification are meaningful beyond child completion; tracking-only containers fail. Under `SEM-DEPENDENCY`, require that B's defined outcome is necessary for A's Acceptance Criteria under the approved plan; reject implementation-order-only links and dependency cycles. Under `SEM-ASSUMPTION-CLARITY`, material uncertainty about boundaries, graph shape, acceptance, or relationship direction requires clarification. Under `SEM-DUPLICATE-OVERLAP`, use remote evidence for duplicate or partial-overlap judgment without inferring remote mutation authority.
