@@ -14,6 +14,7 @@ permissions:
 
 env:
   PIP_CONFIG_FILE: NUL
+  PYTHONUTF8: '1'
 
 jobs:
   test:
@@ -51,6 +52,61 @@ jobs:
 
       - name: Check dependency consistency
         run: python -m pip --isolated check
+
+      - name: Provision official Skill Validator
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+
+          $validatorUri = 'https://raw.githubusercontent.com/openai/codex/84aa75204ad604bcf498df180d128181c89b2f0b/codex-rs/skills/src/assets/samples/skill-creator/scripts/quick_validate.py'
+          $expectedSha256 = 'EE6DBA90F44D37171C5A6EDB8095979C54919FF6822C1A907AFCA2E78C48738C'
+
+          if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP)) {
+            throw 'RUNNER_TEMP is unavailable'
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:GITHUB_ENV)) {
+            throw 'GITHUB_ENV is unavailable'
+          }
+
+          $validatorDirectory = Join-Path $env:RUNNER_TEMP 'delivery-system-official-validator'
+          $validatorPath = Join-Path $validatorDirectory 'quick_validate.py'
+
+          New-Item -ItemType Directory -Force -Path $validatorDirectory | Out-Null
+
+          Invoke-WebRequest `
+            -UseBasicParsing `
+            -Uri $validatorUri `
+            -OutFile $validatorPath
+
+          if (-not (Test-Path -LiteralPath $validatorPath -PathType Leaf)) {
+            throw "Validator download did not produce a file: $validatorPath"
+          }
+
+          $actualSha256 = (Get-FileHash `
+            -LiteralPath $validatorPath `
+            -Algorithm SHA256).Hash.ToUpperInvariant()
+
+          if ($actualSha256 -ne $expectedSha256) {
+            throw "Validator SHA-256 mismatch. Expected $expectedSha256, got $actualSha256"
+          }
+
+          $firstLine = Get-Content `
+            -LiteralPath $validatorPath `
+            -Encoding utf8 `
+            -TotalCount 1
+
+          if ($firstLine -ne '#!/usr/bin/env python3') {
+            throw 'Validator shebang verification failed'
+          }
+
+          $envLine = 'SKILL_CREATOR_VALIDATOR=' + $validatorPath + [Environment]::NewLine
+          [System.IO.File]::AppendAllText(
+            $env:GITHUB_ENV,
+            $envLine,
+            [System.Text.UTF8Encoding]::new($false)
+          )
 
       - name: Run repository tests
         run: python -B -m unittest discover -v
