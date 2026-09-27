@@ -42,6 +42,10 @@ ApplicationAuthority, attestation, receipts, digests, and other integrity detail
 
 Delivery System is currently source-usable prototype software. It is not currently claimed as Install Tested, Host Tested, an externally Integration Tested release, or formally Released. Host credential/bootstrap configuration, installation lifecycle, and formal release packaging remain outside the verified capability boundary.
 
+## Compatibility
+
+Formal Delivery System releases use an explicit, evidence-backed compatibility declaration. Current prototype behavior, historical migrations, tests, and version metadata do not by themselves establish cross-release compatibility. Delivery System is not formally Released; see [Release compatibility](docs/release-compatibility.md) for the future release policy.
+
 ## Quick start
 
 The safe first path is Preview-only: [Getting Started](docs/getting-started.md).

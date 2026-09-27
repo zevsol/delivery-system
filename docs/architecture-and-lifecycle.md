@@ -54,7 +54,7 @@ Bounded Runtime status and recovery surfaces exist. Long-lived operator observab
 
 ## Compatibility policy surface
 
-Future compatibility decisions may cover SQLite schema, Preview/Audit/Approval records, attestations, authority bindings, execution receipts, MCP/API structures, and Skills. No unapproved backward-compatibility promise is made. See `ARC-RELEASE-COMPAT-01` and `ARC-SQLITE-COMPAT-01`.
+Formal compatibility is declaration-based and evidence-backed; the full policy is maintained in [Release compatibility](release-compatibility.md). V7 is the declared first-formal-release compatibility baseline for the complete current Runtime state model. V3–V6 migration paths and intermediate V5/V6 store layers remain implementation mechanisms and do not automatically create formal release guarantees. Newer or invalid state remains fail-closed; downgrade and rollback after committed migration are unsupported. Backup/restore, SQLite transition compatibility, workspace portability, installation lifecycle, and related capabilities remain separately owned. Current prototype metadata is not a formal release declaration. See `ARC-RELEASE-COMPAT-01`, `ARC-SQLITE-COMPAT-01`, `ARC-SQLITE-BACKUP-01`, `ARC-SQLITE-RECOVERY-01`, `ARC-INSTALL-LIFECYCLE-01`, and `ARC-WORKSPACE-ID-01`.
 
 ## Open architecture decisions and debt references
 
