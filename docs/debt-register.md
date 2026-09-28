@@ -116,15 +116,6 @@ Every entry has Category, Status, Risk, Why deferred / rationale, Constraints pr
 - Review point: Before first release.
 - Decision/owner state: Operator architecture decision required.
 
-### ARC-RELEASE-COMPAT-01 — Release compatibility policy
-- Category: Architecture; Status: Open; Risk: High
-- Why deferred / rationale: Stored and public contracts lack approved compatibility policy.
-- Constraints preserved: Do not promise backward compatibility.
-- Evidence/reference: Runtime persistence, MCP surfaces, Skills.
-- Reconsideration trigger: First release or compatibility-sensitive change.
-- Review point: Before first release.
-- Decision/owner state: Product/architecture decision required.
-
 ### SEC-REVOCATION-TEST-01 — Revocation 1 MiB test coverage
 - Category: Security; Status: Deferred; Risk: Low
 - Why deferred / rationale: Boundary exists; maximum-payload automated coverage remains absent.
@@ -198,6 +189,15 @@ Every entry has Category, Status, Risk, Why deferred / rationale, Constraints pr
 - Decision/owner state: Product/UX decision required.
 
 ## Resolved and superseded entries
+
+### ARC-RELEASE-COMPAT-01 — Release compatibility policy
+- Category: Architecture; Status: Resolved; Risk: High
+- Why deferred / rationale: Resolved by the canonical `docs/release-compatibility.md` policy using **EXACT RELEASE BASELINE + EXPLICIT COMPATIBILITY DECLARATION**, which defines release identity, public MCP/Skill/workflow compatibility surfaces, SQLite first-formal-release state boundaries, operator/package/Python/install/support-window boundaries, change classification, and evidence requirements.
+- Constraints preserved: Compatibility remains declaration-based. No default backward, forward, N-1, SemVer, downgrade, committed-migration rollback, cross-release backup/restore, workspace-portability, universal-upgrade, or support-window guarantee is created. Current `0.1.0` remains metadata only and is not formally Released. SQLite backup/recovery/transition compatibility, workspace portability, installation lifecycle, key lifecycle, observability, Host evidence, external integration evidence, and formal release authorization remain separately owned.
+- Evidence/reference: `docs/release-compatibility.md`; `README.md`; `docs/architecture-and-lifecycle.md`; `tests/v1/test_release_compatibility_contract.py`; PR #52; PR CI run `36310580171`; post-merge main CI run `36311071824`.
+- Reconsideration trigger: Formal release preparation; any compatibility-sensitive change to public MCP/Skill/workflow contracts, durable-state acceptance or migration, documented operator configuration, packaging/Python support, installation/upgrade behavior, support-window policy, or an explicit release-to-release transition.
+- Review point: Before each formal release or declared cross-release transition, and before accepting a change classified **BREAKING** or **REVIEW REQUIRED** against a declared baseline.
+- Decision/owner state: Release compatibility policy is resolved by the canonical per-release declaration contract. Future compatibility guarantees and transition-specific support require explicit declaration and proportional evidence; adjacent lifecycle and operational debts remain with their existing owners.
 
 ### CI-VALIDATOR-01 — Official-validator CI coverage
 - Category: Release/CI; Status: Resolved; Risk: Medium
