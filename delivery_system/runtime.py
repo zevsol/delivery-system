@@ -242,6 +242,24 @@ class RuntimeContext:
         ignore_checker: Callable[[Path], bool] | None = None,
         tracked_checker: Callable[[Path], bool] | None = None,
     ) -> None:
+        self.validate_store_paths_read_only(
+            ignore_checker=ignore_checker,
+            tracked_checker=tracked_checker,
+        )
+        state = Path(self.state_path)
+        root = _canonical_path_identity(Path(self.normalized_workspace_root), strict=True)
+        if not state.parent.exists():
+            state.parent.mkdir(parents=True, exist_ok=True)
+        if _canonical_path_identity(state.parent, strict=True) != _canonical_path_identity(root / ".delivery-system", strict=False):
+            raise StorePreflightError("store_not_ignored_or_tracked")
+
+    def validate_store_paths_read_only(
+        self,
+        *,
+        ignore_checker: Callable[[Path], bool] | None = None,
+        tracked_checker: Callable[[Path], bool] | None = None,
+    ) -> None:
+        """Validate Runtime state paths without creating or opening state."""
         state = Path(self.state_path)
         root = _canonical_path_identity(Path(self.normalized_workspace_root), strict=True)
         paths = (state.parent, state, *(Path(f"{state}-{suffix}") for suffix in ("wal", "shm", "journal")))
@@ -268,10 +286,6 @@ class RuntimeContext:
         ignored = ignore_checker or (lambda path: _default_ignored(path, root))
         tracked = tracked_checker or (lambda path: _default_tracked(path, root))
         if not all(ignored(path) for path in sidecars) or any(tracked(path) for path in sidecars):
-            raise StorePreflightError("store_not_ignored_or_tracked")
-        if not state.parent.exists():
-            state.parent.mkdir(parents=True, exist_ok=True)
-        if _canonical_path_identity(state.parent, strict=True) != _canonical_path_identity(root / ".delivery-system", strict=False):
             raise StorePreflightError("store_not_ignored_or_tracked")
 
 

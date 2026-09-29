@@ -885,6 +885,22 @@ def _v7_fingerprint(connection: sqlite3.Connection) -> bool:
         return False
 
 
+def validate_schema_v7_read_only(
+    connection: sqlite3.Connection,
+    *,
+    expected_workspace_identity: str,
+) -> None:
+    """Validate an existing V7 store without migrating or mutating it."""
+    expected = _workspace(expected_workspace_identity)
+    version, workspace = _metadata(connection)
+    if version != 7:
+        raise SchemaOwnerError("attestation_persistence_schema_version_unsupported")
+    if workspace != expected:
+        raise SchemaOwnerError("attestation_persistence_workspace_mismatch")
+    if not _v7_fingerprint(connection):
+        raise SchemaOwnerError("attestation_persistence_schema_shape_mismatch")
+
+
 def ensure_schema_v6(connection: sqlite3.Connection, *, expected_workspace_identity: str) -> None:
     """Atomically add and validate execution persistence on a V5 store."""
     ensure_schema_v4(connection, expected_workspace_identity=expected_workspace_identity)
