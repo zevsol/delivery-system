@@ -14,7 +14,7 @@ Tracked files own shipped product source, tests, documentation, and governance. 
 
 ## Runtime state lifecycle
 
-Current Runtime state is `.delivery-system/state.sqlite3`. Runtime initializes and validates this active state, versions and migrates supported schemas, performs integrity checks, and preserves bounded recovery/execution records. Backup, restore, rollback, and corruption-recovery procedures are not yet specified.
+Current Runtime state is `.delivery-system/state.sqlite3`. Runtime initializes and validates this active state, versions and migrates supported schemas, performs integrity checks, and preserves bounded recovery/execution records. Offline operator backup and restore are provided by the source-runnable [`SQLite backup and restore`](sqlite-backup-restore.md) maintenance module. The current contract is V7-only, exact-release, exact-workspace, and limited to restoring into an empty active state slot; it does not provide migration, overwrite, portability, or corruption remediation.
 
 ## Workspace identity lifetime
 
@@ -22,7 +22,7 @@ Workspace identity is derived from the canonical workspace path. Rename or reloc
 
 ## SQLite lifecycle and current limitations
 
-Schema versioning, migrations, integrity checking, and current-scope concurrency behavior are implemented. Operational WAL/journal policy, backup, restore, rollback, corruption recovery, long-term compatibility, and multi-version upgrade guarantees remain unresolved. See `ARC-SQLITE-BACKUP-01`, `ARC-SQLITE-RECOVERY-01`, and `ARC-SQLITE-COMPAT-01`.
+Schema versioning, migrations, integrity checking, current-scope concurrency behavior, and the bounded offline backup/restore contract are implemented. Operational WAL/journal policy, backup transition compatibility, rollback after committed migration, corruption recovery, long-term compatibility, and multi-version upgrade guarantees remain separately owned. See `ARC-SQLITE-BACKUP-01`, `ARC-SQLITE-RECOVERY-01`, and `ARC-SQLITE-COMPAT-01`.
 
 ## Credential and trust lifecycle
 
