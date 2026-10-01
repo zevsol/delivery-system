@@ -34,6 +34,12 @@ from .attestation_signing import (
     TrustedEd25519IssuerKeyRegistry,
     TrustedEd25519Key,
 )
+from .ed25519_lifecycle import (
+    Ed25519LifecycleError,
+    Ed25519LifecycleManifest,
+    parse_lifecycle_manifest,
+    preflight_ed25519_lifecycle,
+)
 from .authority_binding import Ed25519AuthorityBindingProofVerifier, Ed25519AuthorityBindingSigner
 from .authority_binding_persistence import SQLiteAuthorityBindingPersistenceStore
 from .drivers.contract import DriverTrustContext
@@ -139,11 +145,13 @@ _HOST_ENVIRONMENT_FIELDS = (
     _HostEnvironmentField("DELIVERY_SYSTEM_ATTESTATION_PRIVATE_KEY_PATH", "attestation_private_key_path", "required", "protected-reference"),
     _HostEnvironmentField("DELIVERY_SYSTEM_ATTESTATION_PUBLIC_KEY_PATH", "attestation_public_key_path", "required", "public-trust-material-reference"),
     _HostEnvironmentField("DELIVERY_SYSTEM_ATTESTATION_TRUSTED_KEYS_PATH", "attestation_trusted_keys_path", "required", "public-trust-material-reference"),
+    _HostEnvironmentField("DELIVERY_SYSTEM_ATTESTATION_LIFECYCLE_PATH", "attestation_lifecycle_path", "optional", "non-secret-lifecycle-policy-reference"),
     _HostEnvironmentField("DELIVERY_SYSTEM_AUTHORITY_BINDING_ISSUER_ID", "authority_binding_issuer_id", "required", "non-secret"),
     _HostEnvironmentField("DELIVERY_SYSTEM_AUTHORITY_BINDING_ACTIVE_KEY_ID", "authority_binding_active_key_id", "required", "non-secret"),
     _HostEnvironmentField("DELIVERY_SYSTEM_AUTHORITY_BINDING_PRIVATE_KEY_PATH", "authority_binding_private_key_path", "required", "protected-reference"),
     _HostEnvironmentField("DELIVERY_SYSTEM_AUTHORITY_BINDING_PUBLIC_KEY_PATH", "authority_binding_public_key_path", "required", "public-trust-material-reference"),
     _HostEnvironmentField("DELIVERY_SYSTEM_AUTHORITY_BINDING_TRUSTED_KEYS_PATH", "authority_binding_trusted_keys_path", "required", "public-trust-material-reference"),
+    _HostEnvironmentField("DELIVERY_SYSTEM_AUTHORITY_BINDING_LIFECYCLE_PATH", "authority_binding_lifecycle_path", "optional", "non-secret-lifecycle-policy-reference"),
     _HostEnvironmentField("DELIVERY_SYSTEM_REVOCATION_PROVIDER_URL", "revocation_provider_url", "required", "non-secret"),
     _HostEnvironmentField("DELIVERY_SYSTEM_REVOCATION_TIMEOUT_MS", "revocation_timeout_ms", "required", "non-secret"),
     _HostEnvironmentField("DELIVERY_SYSTEM_REVOCATION_AUTH_TOKEN_PATH", "revocation_auth_token_path", "optional", "protected-reference"),
@@ -154,7 +162,11 @@ _OPTIONAL_ENVIRONMENT_FIELDS = tuple(field.name for field in _HOST_ENVIRONMENT_F
 _FORBIDDEN_ENVIRONMENT_FIELDS = tuple(field.name for field in _HOST_ENVIRONMENT_FIELDS if field.state == "forbidden")
 _PROTECTED_REFERENCE_FIELDS = tuple(field.name for field in _HOST_ENVIRONMENT_FIELDS if field.classification == "protected-reference")
 _PUBLIC_REFERENCE_FIELDS = tuple(field.name for field in _HOST_ENVIRONMENT_FIELDS if field.classification == "public-trust-material-reference")
-_NON_SECRET_FIELDS = tuple(field.name for field in _HOST_ENVIRONMENT_FIELDS if field.classification == "non-secret")
+_NON_SECRET_FIELDS = tuple(
+    field.name
+    for field in _HOST_ENVIRONMENT_FIELDS
+    if field.classification in {"non-secret", "non-secret-lifecycle-policy-reference"}
+)
 
 
 @dataclass(frozen=True)
@@ -175,6 +187,8 @@ class HostConfiguration:
     revocation_provider_url: str
     revocation_timeout_ms: int
     revocation_auth_token_path: str | None
+    attestation_lifecycle_path: str | None = None
+    authority_binding_lifecycle_path: str | None = None
 
     ENVIRONMENT_FIELDS = _HOST_ENVIRONMENT_FIELDS
     REQUIRED_ENVIRONMENT_FIELDS = _REQUIRED_ENVIRONMENT_FIELDS
@@ -220,6 +234,12 @@ class HostConfiguration:
             or not os.path.isabs(self.revocation_auth_token_path)
         ):
             raise _configuration_error()
+        for name in ("attestation_lifecycle_path", "authority_binding_lifecycle_path"):
+            value = getattr(self, name)
+            if value is not None and (
+                type(value) is not str or not value.strip() or not os.path.isabs(value)
+            ):
+                raise _configuration_error()
 
     @classmethod
     def from_environment(cls, environment: Mapping[str, str] | None = None) -> "HostConfiguration":
@@ -269,6 +289,8 @@ class HostConfiguration:
             revocation_provider_url=provider_url,
             revocation_timeout_ms=_required_timeout_ms(values, "revocation_timeout_ms"),
             revocation_auth_token_path=_optional_path(values, "revocation_auth_token_path"),
+            attestation_lifecycle_path=_optional_path(values, "attestation_lifecycle_path"),
+            authority_binding_lifecycle_path=_optional_path(values, "authority_binding_lifecycle_path"),
         )
 
     def __repr__(self) -> str:
@@ -388,6 +410,10 @@ def _validate_external_key_paths(context: RuntimeContext, config: HostConfigurat
     )
     if config.revocation_auth_token_path is not None:
         paths = paths + (config.revocation_auth_token_path,)
+    if config.attestation_lifecycle_path is not None:
+        paths = paths + (config.attestation_lifecycle_path,)
+    if config.authority_binding_lifecycle_path is not None:
+        paths = paths + (config.authority_binding_lifecycle_path,)
     identities = [_path_identities(path) for path in paths]
     for lexical, resolved in identities:
         if _inside(root, lexical) or _inside(root, resolved):
@@ -397,7 +423,11 @@ def _validate_external_key_paths(context: RuntimeContext, config: HostConfigurat
         raise HostCompositionError("host_key_role_path_conflict")
 
 
-def _read_external_json(path: str, opened_object_validator: Callable[[int], None]) -> Any:
+def _read_external_json(
+    path: str,
+    opened_object_validator: Callable[[int], None],
+    error_code: str = "host_trust_bundle_invalid",
+) -> Any:
     try:
         flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
         fd = os.open(path, flags)
@@ -415,7 +445,7 @@ def _read_external_json(path: str, opened_object_validator: Callable[[int], None
     except Exception as exc:
         if isinstance(exc, HostCompositionError):
             raise
-        raise HostCompositionError("host_trust_bundle_invalid") from None
+        raise HostCompositionError(error_code) from None
 
 
 def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -469,6 +499,27 @@ def _load_trust_bundle(
         raise
     except Exception:
         raise HostCompositionError(f"{role}_trust_bundle_invalid") from None
+
+
+def _load_lifecycle_manifest(
+    path: str | None,
+    opened_object_validator: Callable[[int], None],
+    role: str,
+) -> Ed25519LifecycleManifest | None:
+    if path is None:
+        return None
+    try:
+        raw = _read_external_json(
+            path, opened_object_validator,
+            error_code=f"{role}_lifecycle_manifest_invalid",
+        )
+        return parse_lifecycle_manifest(raw, role=role)
+    except HostCompositionError:
+        raise
+    except Ed25519LifecycleError:
+        raise HostCompositionError(f"{role}_lifecycle_manifest_invalid") from None
+    except Exception:
+        raise HostCompositionError(f"{role}_lifecycle_manifest_invalid") from None
 
 
 def _public_key_bytes(key: Ed25519PublicKey) -> bytes:
@@ -679,19 +730,6 @@ def _compose_write_enabled_host(
         raise _configuration_error()
     _validate_external_key_paths(context, configuration)
     opened_object_validator = _workspace_opened_object_validator(context)
-    rsa_source = private_key_source or FileGitHubAppPrivateKeySource(
-        configuration.github_app.private_key_path,
-        opened_file_validator=opened_object_validator,
-    )
-    bootstrap = GitHubAppInstallationCredentialBootstrap(
-        configuration.github_app,
-        private_key_source=rsa_source,
-        transport=bootstrap_transport,
-        clock=clock,
-        credential_instance_id_factory=credential_instance_id_factory or (lambda: str(uuid.uuid4())),
-    )
-    lease = bootstrap.acquire()
-
     private_source = ed_private_source or FileEd25519PrivateKeySource(
         configuration.attestation_private_key_path,
         opened_file_validator=opened_object_validator,
@@ -707,17 +745,10 @@ def _compose_write_enabled_host(
     if derived_public != configured_public:
         raise HostCompositionError("attestation_key_pair_mismatch")
 
-    signer = Ed25519HostSigner(configuration.attestation_issuer_id, configuration.attestation_key_id, private_key)
     attestation_entries = _load_trust_bundle(
         context, configuration.attestation_trusted_keys_path,
         opened_object_validator, "attestation",
     )
-    _require_active_trusted_key(
-        attestation_entries, configuration.attestation_issuer_id,
-        configuration.attestation_key_id, public_key, "attestation",
-    )
-    registry = TrustedEd25519IssuerKeyRegistry(attestation_entries)
-    verifier = Ed25519ProofVerifier(registry)
 
     authority_private_source = FileEd25519PrivateKeySource(
         configuration.authority_binding_private_key_path,
@@ -734,25 +765,69 @@ def _compose_write_enabled_host(
         raise HostCompositionError("authority_binding_key_pair_mismatch")
     if authority_derived_public == _public_key_bytes(public_key):
         raise HostCompositionError("host_key_role_conflict")
+    authority_entries = _load_trust_bundle(
+        context, configuration.authority_binding_trusted_keys_path,
+        opened_object_validator, "authority_binding",
+    )
+
+    attestation_manifest = _load_lifecycle_manifest(
+        configuration.attestation_lifecycle_path,
+        opened_object_validator,
+        "attestation",
+    )
+    authority_manifest = _load_lifecycle_manifest(
+        configuration.authority_binding_lifecycle_path,
+        opened_object_validator,
+        "authority_binding",
+    )
+    try:
+        attestation_preflight = preflight_ed25519_lifecycle(
+            role="attestation",
+            active_issuer_id=configuration.attestation_issuer_id,
+            active_key_id=configuration.attestation_key_id,
+            private_key=private_key,
+            public_key=public_key,
+            trust_candidates=attestation_entries,
+            manifest=attestation_manifest,
+        )
+        authority_preflight = preflight_ed25519_lifecycle(
+            role="authority-binding",
+            active_issuer_id=configuration.authority_binding_issuer_id,
+            active_key_id=configuration.authority_binding_active_key_id,
+            private_key=authority_private_key,
+            public_key=authority_public_key,
+            trust_candidates=authority_entries,
+            manifest=authority_manifest,
+        )
+    except Ed25519LifecycleError as exc:
+        raise HostCompositionError(exc.code) from None
+
+    signer = Ed25519HostSigner(configuration.attestation_issuer_id, configuration.attestation_key_id, private_key)
+    registry = TrustedEd25519IssuerKeyRegistry(attestation_preflight.effective_trust_keys)
+    verifier = Ed25519ProofVerifier(registry)
     authority_signing_delegate = Ed25519HostSigner(
         configuration.authority_binding_issuer_id,
         configuration.authority_binding_active_key_id,
         authority_private_key,
     )
     authority_signer = Ed25519AuthorityBindingSigner(authority_signing_delegate)
-    authority_entries = _load_trust_bundle(
-        context, configuration.authority_binding_trusted_keys_path,
-        opened_object_validator, "authority_binding",
-    )
-    _require_active_trusted_key(
-        authority_entries, configuration.authority_binding_issuer_id,
-        configuration.authority_binding_active_key_id, authority_public_key,
-        "authority_binding",
-    )
-    authority_registry = TrustedEd25519IssuerKeyRegistry(authority_entries)
+    authority_registry = TrustedEd25519IssuerKeyRegistry(authority_preflight.effective_trust_keys)
     authority_verifier = Ed25519AuthorityBindingProofVerifier(
         Ed25519ProofVerifier(authority_registry),
     )
+
+    rsa_source = private_key_source or FileGitHubAppPrivateKeySource(
+        configuration.github_app.private_key_path,
+        opened_file_validator=opened_object_validator,
+    )
+    bootstrap = GitHubAppInstallationCredentialBootstrap(
+        configuration.github_app,
+        private_key_source=rsa_source,
+        transport=bootstrap_transport,
+        clock=clock,
+        credential_instance_id_factory=credential_instance_id_factory or (lambda: str(uuid.uuid4())),
+    )
+    lease = bootstrap.acquire()
 
     revocation_token = _read_secret_token(
         configuration.revocation_auth_token_path, opened_object_validator,

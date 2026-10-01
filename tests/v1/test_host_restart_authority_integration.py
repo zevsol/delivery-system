@@ -10,7 +10,8 @@ from unittest.mock import patch
 from delivery_system.auditor import RuleEvaluationDraft, RuntimeAuditor
 from delivery_system.drivers.contract import DriverReadResponse
 from delivery_system.host_composition import compose_write_enabled_host, load_host_configuration
-from delivery_system.protocol import digest
+from delivery_system.ed25519_lifecycle import public_key_fingerprint
+from delivery_system.protocol import canonical_payload, digest
 from delivery_system.rules import SemanticOutcome, build_registry_v1
 from delivery_system.runtime import RuntimeContext, RuntimePlanner
 
@@ -219,6 +220,89 @@ class HostRestartIntegrationTests(unittest.TestCase):
                         self._compose()
             finally:
                 authority_bundle.write_text(json.dumps(data), encoding="utf-8")
+        finally:
+            first.close()
+
+    def test_managed_historical_attestation_trust_survives_fresh_composition(self) -> None:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+
+        k1 = serialization.load_pem_private_key(self.credential_private_path.read_bytes(), password=None)
+        k2 = ed25519.Ed25519PrivateKey.generate()
+        k2_private_path = Path(self.keys.name) / "credential-private-2.pem"
+        k2_public_path = Path(self.keys.name) / "credential-public-2.pem"
+        k2_private_path.write_bytes(host_fixture._pem_private(k2))
+        k2_public_path.write_bytes(host_fixture._pem_public(k2.public_key()))
+        bundle = Path(self.environment["DELIVERY_SYSTEM_ATTESTATION_TRUSTED_KEYS_PATH"])
+        bundle.write_text(json.dumps({
+            "version": 1,
+            "keys": [
+                {"issuer_id": "host-issuer", "key_id": "host-key-1", "algorithm": "ed25519", "public_key_path": str(self.credential_public_path)},
+                {"issuer_id": "host-issuer", "key_id": "host-key-2", "algorithm": "ed25519", "public_key_path": str(k2_public_path)},
+            ],
+        }), encoding="utf-8")
+        manifest = Path(self.keys.name) / "attestation-lifecycle.json"
+        def write_manifest(active_key: str) -> None:
+            states = {"host-key-1": "historical", "host-key-2": "active"}
+            if active_key == "host-key-1":
+                states = {"host-key-1": "active", "host-key-2": "historical"}
+            manifest.write_text(json.dumps({
+                "version": 1,
+                "role": "attestation",
+                "issuer_id": "host-issuer",
+                "keys": [
+                    {"issuer_id": "host-issuer", "key_id": "host-key-1", "algorithm": "ed25519", "public_key_fingerprint": public_key_fingerprint(k1.public_key()), "state": states["host-key-1"]},
+                    {"issuer_id": "host-issuer", "key_id": "host-key-2", "algorithm": "ed25519", "public_key_fingerprint": public_key_fingerprint(k2.public_key()), "state": states["host-key-2"]},
+                ],
+            }), encoding="utf-8")
+
+        first_environment = dict(self.environment)
+        first_environment["DELIVERY_SYSTEM_ATTESTATION_KEY_ID"] = "host-key-1"
+        first_environment["DELIVERY_SYSTEM_ATTESTATION_LIFECYCLE_PATH"] = str(manifest)
+        write_manifest("host-key-1")
+        with self._compose_with_store_ready():
+            first = self._compose(environment=first_environment)
+        try:
+            preview, _audit, approval = self._prepare(first)
+            original = first.approval_authority_service.issue_application_authority(
+                preview["preview_id"], 1, approval.approval_id,
+            )
+            issuance_id = first.approval_authority_service._authority_issuance_ids[original.authority_id]
+            artifact_before = first.attestation_persistence_store.get_artifact_aggregate(
+                self.context.workspace_identity,
+                first.authority_binding_store.load_authority_binding(
+                    self.context.workspace_identity, issuance_id,
+                ).payload.attestation_artifact_id,
+            )
+            proof_payload = canonical_payload(
+                artifact_before.artifact.claims_payload.to_payload(),
+            ).encode("utf-8")
+            self.assertEqual(artifact_before.artifact.claims_payload.key_id, "host-key-1")
+            self.assertTrue(first.verifier.verify(
+                proof_payload, artifact_before.artifact.detached_proof,
+                "host-issuer", "host-key-1", "ed25519",
+            ))
+            first.close()
+
+            second_environment = dict(first_environment)
+            second_environment["DELIVERY_SYSTEM_ATTESTATION_KEY_ID"] = "host-key-2"
+            second_environment["DELIVERY_SYSTEM_ATTESTATION_PRIVATE_KEY_PATH"] = str(k2_private_path)
+            second_environment["DELIVERY_SYSTEM_ATTESTATION_PUBLIC_KEY_PATH"] = str(k2_public_path)
+            write_manifest("host-key-2")
+            with self._compose_with_store_ready():
+                second = self._compose(environment=second_environment)
+            try:
+                self.assertIsNotNone(second.registry.resolve("host-issuer", "host-key-1", "ed25519"))
+                self.assertTrue(second.verifier.verify(
+                    proof_payload, artifact_before.artifact.detached_proof,
+                    "host-issuer", "host-key-1", "ed25519",
+                ))
+                recovered = second.approval_authority_service.reconstruct_application_authority_after_restart(
+                    preview["preview_id"], 1, approval.approval_id,
+                )
+                self.assertEqual(recovered.authority_id, original.authority_id)
+            finally:
+                second.close()
         finally:
             first.close()
 

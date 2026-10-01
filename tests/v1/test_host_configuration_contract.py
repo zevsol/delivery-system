@@ -31,7 +31,7 @@ class HostConfigurationContractTests(unittest.TestCase):
         for line in document.splitlines():
             if line == "The following inputs are required:":
                 state = "required"
-            elif line == "The following input is optional:":
+            elif line == "The following inputs are optional:":
                 state = "optional"
             elif line.startswith("| `DELIVERY_SYSTEM_"):
                 cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
@@ -52,7 +52,11 @@ class HostConfigurationContractTests(unittest.TestCase):
         optional = {field.name for field in fields if field.state == "optional"}
         forbidden = {field.name for field in fields if field.state == "forbidden"}
         self.assertEqual(len(required), 16)
-        self.assertEqual(optional, {"DELIVERY_SYSTEM_REVOCATION_AUTH_TOKEN_PATH"})
+        self.assertEqual(optional, {
+            "DELIVERY_SYSTEM_REVOCATION_AUTH_TOKEN_PATH",
+            "DELIVERY_SYSTEM_ATTESTATION_LIFECYCLE_PATH",
+            "DELIVERY_SYSTEM_AUTHORITY_BINDING_LIFECYCLE_PATH",
+        })
         self.assertEqual(forbidden, {"DELIVERY_SYSTEM_GITHUB_INSTALLATION_ID"})
         self.assertEqual(required & optional, set())
         self.assertEqual(required & forbidden, set())
@@ -60,7 +64,7 @@ class HostConfigurationContractTests(unittest.TestCase):
         self.assertEqual(set(HostConfiguration.OPTIONAL_ENVIRONMENT_FIELDS), optional)
         self.assertEqual(set(HostConfiguration.FORBIDDEN_ENVIRONMENT_FIELDS), forbidden)
         self.assertTrue(set(HostConfiguration.PROTECTED_REFERENCE_FIELDS) <= required | optional)
-        self.assertTrue(set(HostConfiguration.PUBLIC_REFERENCE_FIELDS) <= required)
+        self.assertTrue(set(HostConfiguration.PUBLIC_REFERENCE_FIELDS) <= required | optional)
         classified = (
             set(HostConfiguration.PROTECTED_REFERENCE_FIELDS)
             | set(HostConfiguration.PUBLIC_REFERENCE_FIELDS)
@@ -74,6 +78,7 @@ class HostConfigurationContractTests(unittest.TestCase):
             "non-secret": "non-secret",
             "protected-reference": "protected reference",
             "public-trust-material-reference": "public trust-material reference",
+            "non-secret-lifecycle-policy-reference": "non-secret lifecycle-policy reference",
             "forbidden": "forbidden",
         }
         expected = {
