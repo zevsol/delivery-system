@@ -44,6 +44,7 @@ from delivery_system.host_composition import (
 )
 from delivery_system.host_revocation import ExternalRevocationError, ExternalRevocationReader
 from delivery_system.runtime import RuntimeApprovalAuthorityService, RuntimeContext
+from delivery_system.ed25519_lifecycle import public_key_fingerprint
 
 
 NOW = datetime(2026, 9, 7, 12, tzinfo=timezone.utc)
@@ -360,6 +361,7 @@ class CompositionTests(unittest.TestCase):
         self.context = RuntimeContext.from_workspace_root(workspace)
         rsa_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         ed_private = ed25519.Ed25519PrivateKey.generate()
+        self.ed_private = ed_private
         self.rsa_path = keys / "github-rsa.pem"
         self.ed_private_path = keys / "attestation-private.pem"
         self.ed_public_path = keys / "attestation-public.pem"
@@ -423,20 +425,20 @@ class CompositionTests(unittest.TestCase):
             expected_posts=0,
         )
 
-    def test_ed_private_parent_topology_swap_rejected_after_acquire(self) -> None:
+    def test_ed_private_parent_topology_swap_rejected_before_acquire(self) -> None:
         ed_private = ed25519.Ed25519PrivateKey.generate()
         self._composition_rejects_parent_swap(
             "DELIVERY_SYSTEM_ATTESTATION_PRIVATE_KEY_PATH",
             _pem_private(ed_private),
-            expected_posts=1,
+            expected_posts=0,
         )
 
-    def test_ed_public_parent_topology_swap_rejected_after_acquire(self) -> None:
+    def test_ed_public_parent_topology_swap_rejected_before_acquire(self) -> None:
         ed_private = ed25519.Ed25519PrivateKey.generate()
         self._composition_rejects_parent_swap(
             "DELIVERY_SYSTEM_ATTESTATION_PUBLIC_KEY_PATH",
             _pem_public(ed_private.public_key()),
-            expected_posts=1,
+            expected_posts=0,
         )
 
     def test_explicit_profile_composes_actual_h3_lease_attestation_and_runtime(self) -> None:
@@ -500,7 +502,7 @@ class CompositionTests(unittest.TestCase):
         with patch.object(type(self.context), "ensure_store_ready", lambda self, **kwargs: Path(self.state_path).parent.mkdir(parents=True, exist_ok=True)):
             with self.assertRaises(HostCompositionError):
                 self._compose(transport, lambda: str(uuid.uuid4()))
-        self.assertEqual(transport.token_posts, 1)
+        self.assertEqual(transport.token_posts, 0)
 
     def test_two_compositions_acquire_once_each_and_reserve_distinct_instances(self) -> None:
         first_transport = FakeBootstrapTransport()
@@ -629,6 +631,89 @@ class CompositionTests(unittest.TestCase):
                 bundle_path.write_text(json.dumps(payload), encoding="utf-8")
                 with self.assertRaises(HostCompositionError):
                     self._compose(FakeBootstrapTransport(), lambda: str(uuid.uuid4()))
+
+    def test_managed_lifecycle_filters_retired_and_compromised_candidates(self) -> None:
+        keys = Path(self.keys.name)
+        retired = ed25519.Ed25519PrivateKey.generate()
+        compromised = ed25519.Ed25519PrivateKey.generate()
+        retired_path = keys / "attestation-retired-public.pem"
+        compromised_path = keys / "attestation-compromised-public.pem"
+        retired_path.write_bytes(_pem_public(retired.public_key()))
+        compromised_path.write_bytes(_pem_public(compromised.public_key()))
+        candidate = dict(self.environment)
+        bundle = Path(candidate["DELIVERY_SYSTEM_ATTESTATION_TRUSTED_KEYS_PATH"])
+        bundle.write_text(json.dumps({
+            "version": 1,
+            "keys": [
+                {"issuer_id": "host-issuer", "key_id": "host-key", "algorithm": "ed25519", "public_key_path": candidate["DELIVERY_SYSTEM_ATTESTATION_PUBLIC_KEY_PATH"]},
+                {"issuer_id": "host-issuer", "key_id": "host-key-retired", "algorithm": "ed25519", "public_key_path": str(retired_path)},
+                {"issuer_id": "host-issuer", "key_id": "host-key-compromised", "algorithm": "ed25519", "public_key_path": str(compromised_path)},
+            ],
+        }), encoding="utf-8")
+        lifecycle = keys / "attestation-lifecycle.json"
+        lifecycle.write_text(json.dumps({
+            "version": 1,
+            "role": "attestation",
+            "issuer_id": "host-issuer",
+            "keys": [
+                {"issuer_id": "host-issuer", "key_id": "host-key", "algorithm": "ed25519", "public_key_fingerprint": public_key_fingerprint(self.ed_private.public_key()), "state": "active"},
+                {"issuer_id": "host-issuer", "key_id": "host-key-retired", "algorithm": "ed25519", "public_key_fingerprint": public_key_fingerprint(retired.public_key()), "state": "retired"},
+                {"issuer_id": "host-issuer", "key_id": "host-key-compromised", "algorithm": "ed25519", "public_key_fingerprint": public_key_fingerprint(compromised.public_key()), "state": "compromised"},
+            ],
+        }), encoding="utf-8")
+        candidate["DELIVERY_SYSTEM_ATTESTATION_LIFECYCLE_PATH"] = str(lifecycle)
+        with patch.object(type(self.context), "ensure_store_ready", lambda self, **kwargs: Path(self.state_path).parent.mkdir(parents=True, exist_ok=True)):
+            composition = self._compose(FakeBootstrapTransport(), lambda: str(uuid.uuid4()), candidate)
+        try:
+            self.assertIsNotNone(composition.registry.resolve("host-issuer", "host-key", "ed25519"))
+            self.assertIsNone(composition.registry.resolve("host-issuer", "host-key-retired", "ed25519"))
+            self.assertIsNone(composition.registry.resolve("host-issuer", "host-key-compromised", "ed25519"))
+        finally:
+            composition.close()
+
+    def test_lifecycle_and_credential_material_are_not_persisted(self) -> None:
+        lifecycle = Path(self.keys.name) / "attestation-lifecycle.json"
+        manifest_text = json.dumps({
+            "version": 1,
+            "role": "attestation",
+            "issuer_id": "host-issuer",
+            "keys": [{
+                "issuer_id": "host-issuer",
+                "key_id": "host-key",
+                "algorithm": "ed25519",
+                "public_key_fingerprint": public_key_fingerprint(self.ed_private.public_key()),
+                "state": "active",
+            }],
+        }, separators=(",", ":"))
+        lifecycle.write_text(manifest_text, encoding="utf-8")
+        candidate = dict(self.environment)
+        candidate["DELIVERY_SYSTEM_ATTESTATION_LIFECYCLE_PATH"] = str(lifecycle)
+        with patch.object(type(self.context), "ensure_store_ready", lambda self, **kwargs: Path(self.state_path).parent.mkdir(parents=True, exist_ok=True)):
+            composition = self._compose(FakeBootstrapTransport(), lambda: str(uuid.uuid4()), candidate)
+        composition.close()
+        private_bytes = self.ed_private.private_bytes(
+            serialization.Encoding.Raw,
+            serialization.PrivateFormat.Raw,
+            serialization.NoEncryption(),
+        )
+        persisted_files = [path.read_bytes() for path in Path(self.workspace.name).rglob("*") if path.is_file()]
+        self.assertTrue(persisted_files)
+        self.assertTrue(all(TOKEN.encode("utf-8") not in data for data in persisted_files))
+        self.assertTrue(all(private_bytes not in data for data in persisted_files))
+        self.assertTrue(all(manifest_text.encode("utf-8") not in data for data in persisted_files))
+
+    def test_invalid_managed_lifecycle_fails_before_installation_lease(self) -> None:
+        lifecycle = Path(self.keys.name) / "invalid-lifecycle.json"
+        lifecycle.write_text(
+            '{"version":1,"role":"attestation","issuer_id":"host-issuer","issuer_id":"duplicate","keys":[]}',
+            encoding="utf-8",
+        )
+        candidate = dict(self.environment)
+        candidate["DELIVERY_SYSTEM_ATTESTATION_LIFECYCLE_PATH"] = str(lifecycle)
+        transport = FakeBootstrapTransport()
+        with self.assertRaises(HostCompositionError):
+            self._compose(transport, lambda: str(uuid.uuid4()), candidate)
+        self.assertEqual(transport.calls, [])
 
     def test_physical_active_key_collision_between_roles_fails_closed(self) -> None:
         authority_private = Path(self.environment["DELIVERY_SYSTEM_AUTHORITY_BINDING_PRIVATE_KEY_PATH"])

@@ -10,6 +10,8 @@ The Host requires an explicit `--workspace-root` input. The Runtime derives work
 
 The Host environment adapter reads the documented operator environment contract and produces a validated `HostConfiguration`. Protected external key and token references point to material outside tracked repository content. Public key and trust-bundle references point to operator-controlled public trust material.
 
+Attestation and authority-binding lifecycle manifests are optional external, non-secret lifecycle-policy/authorization-policy inputs. Each manifest is validated during fresh-process composition before the operational Runtime and GitHub installation lease are constructed. A manifest does not contain private key material or cryptographic trust material.
+
 The composition flow is:
 
 ```text
@@ -47,11 +49,13 @@ The following inputs are required:
 | `DELIVERY_SYSTEM_REVOCATION_PROVIDER_URL` | revocation provider endpoint | HTTP or HTTPS URL with network location | non-secret |
 | `DELIVERY_SYSTEM_REVOCATION_TIMEOUT_MS` | revocation request timeout | integer from `1` through `120000` | non-secret |
 
-The following input is optional:
+The following inputs are optional:
 
 | Name | Purpose | Accepted shape | Classification |
 | --- | --- | --- | --- |
 | `DELIVERY_SYSTEM_REVOCATION_AUTH_TOKEN_PATH` | optional revocation authentication token reference | absolute path | protected reference |
+| `DELIVERY_SYSTEM_ATTESTATION_LIFECYCLE_PATH` | optional attestation Ed25519 lifecycle manifest | absolute path | non-secret lifecycle-policy reference |
+| `DELIVERY_SYSTEM_AUTHORITY_BINDING_LIFECYCLE_PATH` | optional authority-binding Ed25519 lifecycle manifest | absolute path | non-secret lifecycle-policy reference |
 
 The following operator authority input is forbidden:
 
@@ -63,9 +67,13 @@ The following operator authority input is forbidden:
 
 ## Configuration and protected material
 
-Non-secret identifiers, repository values, endpoint, and timeout may be supplied as configuration values. Private key and token contents remain external protected material; only their path references are part of this contract. Public keys and trust bundles remain operator-controlled external trust material. No private key, token, or protected credential content belongs in tracked configuration, Runtime state, logs, errors, or this document.
+Non-secret identifiers, repository values, endpoint, and timeout may be supplied as configuration values. Private key and token contents remain external protected material; only their path references are part of this contract. Public keys and trust bundles remain operator-controlled external cryptographic trust material. Lifecycle manifest paths are separate non-secret lifecycle-policy/authorization-policy references; the manifest supplies lifecycle policy while the trust bundle supplies cryptographic candidate material. No private key, token, or protected credential content belongs in tracked configuration, Runtime state, logs, errors, or this document.
 
-The existing composition checks remain authoritative, including workspace exclusion, opened-object validation, path-role separation, key-pair verification, and active-key trust checks.
+The existing composition checks remain authoritative, including workspace exclusion, opened-object validation, path-role separation, key-pair verification, and active-key trust checks. When a lifecycle manifest is present, strict manifest parsing rejects duplicate or unknown JSON members, unknown states, invalid fingerprints, unclassified trust candidates, and selector disagreement. The canonical fingerprint is `sha256:` followed by the lowercase SHA-256 digest of the raw 32-byte Ed25519 public key; PEM/DER container formatting and file paths are not part of the fingerprint.
+
+Without a lifecycle manifest, bounded legacy mode derives the configured active identity as `active` and all other existing trusted bundle identities as `historical`. Managed mode permits exactly one `active` identity and classifies other identities as `historical`, `retired`, or `compromised`. Only active and historical identities enter the effective verification registry. Retired and compromised material never regains trust merely because it remains in the candidate bundle. The active selector remains owned by Host configuration; the manifest cross-validates it rather than introducing another selector.
+
+Lifecycle activation is fresh-process-only. Pure Ed25519 material/trust preflight performs parsing, public/private matching, lifecycle validation, effective trust projection, role checks, and a non-secret sign/verify self-check. It does not start a second Host, open SQLite, acquire an installation lease, or reload a running process. A failed preflight stops the new composition closed. Only when the previous process is still running and healthy, its material remains usable, and that material has not been compromised may an operator use it as a manual rollback boundary; no automatic fallback or rollback occurs.
 
 ## Composition result
 
@@ -83,5 +91,9 @@ This contract does not define:
 - a service manager;
 - deployment architecture;
 - SQLite backup or recovery;
-- key rotation;
+- GitHub App key rotation, installation-token renewal, or automatic rotation;
+- in-process reload, process orchestration, or automatic rollback;
+- key generation, private-key backup, or secret persistence;
+- provider-level key compromise/revocation semantics;
+- durable lifecycle evidence or final operational recovery procedures;
 - a reusable integration harness.
