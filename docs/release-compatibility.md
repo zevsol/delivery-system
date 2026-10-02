@@ -8,6 +8,19 @@ Implemented behavior, historical migrations, tests, matching metadata versions, 
 
 The policy identity is **EXACT RELEASE BASELINE + EXPLICIT COMPATIBILITY DECLARATION**. Compatibility is declaration-based per release and per future release transition.
 
+## First-release artifact boundary
+
+The bounded first-release artifact model is two coordinated artifacts, and its installation lifecycle is Install Tested on Windows 11 / CPython 3.14.6:
+
+- the Python Runtime wheel and sdist, whose canonical version is owned by `pyproject.toml` under `[project].version`;
+- a release-owned Skills plugin artifact containing exactly the four bundled Skills and a root `plugin.json` with the same version.
+
+Installed Runtime code reads its release identity from distribution metadata. An uninstalled source checkout may use the canonical `pyproject.toml` as a developer-only fallback; that fallback is not the installed-release authority. Installed metadata and source metadata must agree when both are present. A contradiction fails closed.
+
+The Skills plugin artifact does not contain `mcp.json`, `.mcp.json`, `.app.json`, credentials, or an embedded Runtime path. Host/operator configuration separately connects the installed `delivery-system-mcp` console entrypoint through local stdio. The plugin artifact does not imply a remote MCP service or public Plugin Directory publication.
+
+The Runtime and Skills/plugin artifacts are one release-bound set: their versions must match, the release must contain exactly nine public MCP tools and exactly four Skills, and artifact/install evidence is required before `0.1.0` can be declared formally Released.
+
 ## Compatibility policy
 
 ### REL-VERSION — Release version identity
@@ -99,11 +112,11 @@ The formal distribution contract may include the project/package name, release v
 
 ### PYTHON-CONTRACT — Python eligibility and evidence
 
-`requires-python = ">=3.10"` is package eligibility metadata. It is not evidence that every Python version at or above 3.10 is Install Tested or supported. Tested and supported interpreter claims require separate evidence. Raising the declared minimum Python version is compatibility-significant relative to environments explicitly supported by a prior release.
+`requires-python = ">=3.10"` is package eligibility metadata. It is not evidence that every Python version at or above 3.10 is Install Tested or supported. Current Install Tested evidence covers Windows 11 / CPython 3.14.6 only. Tested and supported interpreter claims require separate evidence. Raising the declared minimum Python version is compatibility-significant relative to environments explicitly supported by a prior release.
 
 ### INSTALL-UPGRADE — Installation and upgrade boundary
 
-For the first formal release, clean installation and uninstall may become supported only after separate lifecycle evidence. Prototype or source-checkout to first-formal-release upgrade is not automatically supported. For future formal releases, upgrade compatibility is transition-specific; no universal N-to-N+1 upgrade guarantee exists.
+For the bounded first-release artifact model, clean wheel installation, Runtime uninstall with workspace/plugin preservation, and same-release reinstall/reopen are evidenced on Windows 11 / CPython 3.14.6. A source-checkout to first-formal-release upgrade is not automatically supported. Cross-release upgrade compatibility is transition-specific; no universal N-to-N+1 upgrade guarantee exists.
 
 ### SUPPORT-WINDOW — Support window
 

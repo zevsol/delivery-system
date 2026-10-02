@@ -18,6 +18,7 @@ import tempfile
 from typing import Any, Callable, Mapping, Sequence
 
 from delivery_system import sqlite_schema
+from delivery_system.release_identity import ReleaseIdentityError, current_release_id
 from delivery_system.runtime import (
     RuntimeContext,
     StorePreflightError,
@@ -47,8 +48,6 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _UTC_TIMESTAMP_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$"
 )
-_PROJECT_SECTION_RE = re.compile(r"(?ms)^\[project\]\s*(.*?)(?=^\[|\Z)")
-_PROJECT_VERSION_RE = re.compile(r"(?m)^\s*version\s*=\s*([\"'])([^\r\n\"']+)\1\s*$")
 
 
 class SQLiteMaintenanceError(RuntimeError):
@@ -163,18 +162,9 @@ class SQLiteBackupManifest:
 
 
 def _current_release_id() -> str:
-    """Read the release identity from the source checkout's project metadata."""
-    project_path = Path(__file__).resolve().parent.parent / "pyproject.toml"
     try:
-        text = project_path.read_text(encoding="utf-8")
-        section_match = _PROJECT_SECTION_RE.search(text)
-        if section_match is None:
-            raise ValueError("project_section")
-        matches = list(_PROJECT_VERSION_RE.finditer(section_match.group(1)))
-        if len(matches) != 1 or not matches[0].group(2).strip():
-            raise ValueError("project_version")
-        return matches[0].group(2)
-    except (OSError, UnicodeError, ValueError) as exc:
+        return current_release_id()
+    except ReleaseIdentityError as exc:
         raise SQLiteMaintenanceError("sqlite_maintenance_release_unavailable") from exc
 
 

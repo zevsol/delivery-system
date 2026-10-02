@@ -20,6 +20,7 @@ from delivery_system.runtime import (
     RuntimeApprovalAuthorityService, RuntimeContext, RuntimePlanner, SQLitePreviewStore,
     StorePreflightError,
 )
+from delivery_system.release_identity import current_release_id
 from delivery_system.applier import ApplyResult
 from delivery_system.execution_store import SQLiteExecutionStore
 from delivery_system.drivers.contract import DriverError, DriverTrustContext
@@ -31,7 +32,7 @@ from delivery_system.public_error_contract import (
 
 
 SERVER_NAME = "delivery-system-planner"
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = current_release_id()
 TOOL_NAME = "delivery_plan_preview"
 TOOL_ANNOTATIONS = ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=False)
 
