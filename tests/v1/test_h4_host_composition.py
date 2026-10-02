@@ -13,6 +13,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 import uuid
 
+import jwt
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519, rsa
 
@@ -469,6 +470,101 @@ class CompositionTests(unittest.TestCase):
         server = composition.create_server()
         self.assertIsNotNone(server)
 
+    def test_fresh_composition_with_distinct_g2_uses_g2_jwt_and_new_lease(self) -> None:
+        g1 = serialization.load_pem_private_key(self.rsa_path.read_bytes(), password=None)
+        g2 = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        g2_path = Path(self.keys.name) / "github-rsa-g2.pem"
+        g2_path.write_bytes(_pem_private(g2))
+        g2_environment = dict(self.environment)
+        g2_environment["DELIVERY_SYSTEM_GITHUB_APP_PRIVATE_KEY_PATH"] = str(g2_path)
+        first_transport = FakeBootstrapTransport()
+        second_transport = FakeBootstrapTransport()
+        first_id = str(uuid.uuid4())
+        second_id = str(uuid.uuid4())
+
+        with patch.object(type(self.context), "ensure_store_ready", lambda self, **kwargs: Path(self.state_path).parent.mkdir(parents=True, exist_ok=True)):
+            first = self._compose(first_transport, lambda: first_id)
+            try:
+                before = first.lease._snapshot()
+                second = self._compose(second_transport, lambda: second_id, g2_environment)
+                try:
+                    app_jwt = second_transport.calls[0][1]
+                    jwt.decode(
+                        app_jwt,
+                        g2.public_key(),
+                        algorithms=["RS256"],
+                        options={"verify_exp": False, "verify_iat": False},
+                    )
+                    with self.assertRaises(jwt.InvalidTokenError):
+                        jwt.decode(
+                            app_jwt,
+                            g1.public_key(),
+                            algorithms=["RS256"],
+                            options={"verify_exp": False, "verify_iat": False},
+                        )
+                    self.assertIs(type(second), HostComposition)
+                    self.assertIsNot(first, second)
+                    self.assertIsNot(first.lease, second.lease)
+                    self.assertNotEqual(before.credential_instance_id, second.lease._snapshot().credential_instance_id)
+                    self.assertEqual(first_transport.token_posts, 1)
+                    self.assertEqual(second_transport.token_posts, 1)
+                    self.assertEqual(first.lease._snapshot(), before)
+                finally:
+                    second.close()
+            finally:
+                first.close()
+
+    def test_failed_g2_fresh_composition_does_not_fallback_to_g1(self) -> None:
+        class RejectingG2Transport(FakeBootstrapTransport):
+            def get_app(self, app_jwt: str) -> GitHubAppBootstrapResponse:
+                self.calls.append(("app", app_jwt))
+                raise GitHubAppBootstrapError("credential_acquisition_failed")
+
+        g1 = serialization.load_pem_private_key(self.rsa_path.read_bytes(), password=None)
+        g2 = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        g2_path = Path(self.keys.name) / "github-rsa-g2-failing.pem"
+        g2_path.write_bytes(_pem_private(g2))
+        g2_environment = dict(self.environment)
+        g2_environment["DELIVERY_SYSTEM_GITHUB_APP_PRIVATE_KEY_PATH"] = str(g2_path)
+        first_transport = FakeBootstrapTransport()
+        rejecting_transport = RejectingG2Transport()
+
+        with patch.object(type(self.context), "ensure_store_ready", lambda self, **kwargs: Path(self.state_path).parent.mkdir(parents=True, exist_ok=True)):
+            first = self._compose(first_transport, lambda: str(uuid.uuid4()))
+            try:
+                before = first.lease._snapshot()
+                with self.assertRaises(HostCompositionError):
+                    self._compose(rejecting_transport, lambda: str(uuid.uuid4()), g2_environment)
+                self.assertEqual(len(rejecting_transport.calls), 1)
+                self.assertEqual(rejecting_transport.token_posts, 0)
+                app_jwt = rejecting_transport.calls[0][1]
+                jwt.decode(
+                    app_jwt,
+                    g2.public_key(),
+                    algorithms=["RS256"],
+                    options={"verify_exp": False, "verify_iat": False},
+                )
+                with self.assertRaises(jwt.InvalidTokenError):
+                    jwt.decode(
+                        app_jwt,
+                        g1.public_key(),
+                        algorithms=["RS256"],
+                        options={"verify_exp": False, "verify_iat": False},
+                    )
+                self.assertEqual(first.lease._snapshot(), before)
+            finally:
+                first.close()
+
+    def test_malformed_g2_fails_before_bootstrap_network(self) -> None:
+        malformed_path = Path(self.keys.name) / "github-rsa-g2-malformed.pem"
+        malformed_path.write_bytes(b"not-a-private-key")
+        candidate = dict(self.environment)
+        candidate["DELIVERY_SYSTEM_GITHUB_APP_PRIVATE_KEY_PATH"] = str(malformed_path)
+        transport = FakeBootstrapTransport()
+        with self.assertRaises(HostCompositionError):
+            self._compose(transport, lambda: str(uuid.uuid4()), candidate)
+        self.assertEqual(transport.calls, [])
+
     def test_composition_rejects_workspace_controlled_paths_before_acquire(self) -> None:
         for name in (
             "DELIVERY_SYSTEM_GITHUB_APP_PRIVATE_KEY_PATH",
@@ -691,6 +787,7 @@ class CompositionTests(unittest.TestCase):
         with patch.object(type(self.context), "ensure_store_ready", lambda self, **kwargs: Path(self.state_path).parent.mkdir(parents=True, exist_ok=True)):
             composition = self._compose(FakeBootstrapTransport(), lambda: str(uuid.uuid4()), candidate)
         composition.close()
+        rsa_private_bytes = self.rsa_path.read_bytes()
         private_bytes = self.ed_private.private_bytes(
             serialization.Encoding.Raw,
             serialization.PrivateFormat.Raw,
@@ -699,6 +796,7 @@ class CompositionTests(unittest.TestCase):
         persisted_files = [path.read_bytes() for path in Path(self.workspace.name).rglob("*") if path.is_file()]
         self.assertTrue(persisted_files)
         self.assertTrue(all(TOKEN.encode("utf-8") not in data for data in persisted_files))
+        self.assertTrue(all(rsa_private_bytes not in data for data in persisted_files))
         self.assertTrue(all(private_bytes not in data for data in persisted_files))
         self.assertTrue(all(manifest_text.encode("utf-8") not in data for data in persisted_files))
 

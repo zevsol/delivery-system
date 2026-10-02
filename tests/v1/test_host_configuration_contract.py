@@ -137,6 +137,35 @@ class HostConfigurationContractTests(unittest.TestCase):
         self.assertEqual(parameters["configuration"].kind, inspect.Parameter.KEYWORD_ONLY)
         self.assertNotIn("environment", parameters)
 
+    def test_github_app_fresh_composition_continuity_contract_is_documented(self) -> None:
+        host_document = Path("docs/host-configuration.md").read_text(encoding="utf-8")
+        architecture_document = Path("docs/architecture-and-lifecycle.md").read_text(encoding="utf-8")
+        host_document = host_document.lower()
+        for phrase in (
+            "github app fresh-composition continuity",
+            "g1 → g2",
+            "successful installation lease",
+            "no automatic fallback to g1",
+            "no automatic installation-token renewal/reacquisition loop",
+            "normal rotation",
+            "compromise",
+            "rsa private-key material remains external and non-persistent",
+        ):
+            with self.subTest(document="host", phrase=phrase):
+                self.assertIn(phrase, host_document)
+        architecture_document = architecture_document.lower()
+        for phrase in (
+            "fresh-composition github app continuity is supported",
+            "no persistent github app key lifecycle state",
+            "no simultaneous multi-key runtime",
+            "no universal keymanager",
+            "no provider-revocation redesign",
+            "installation-token lifecycle remains separately owned",
+            "`arc-key-lifecycle-01` remains open",
+        ):
+            with self.subTest(document="architecture", phrase=phrase):
+                self.assertIn(phrase, architecture_document)
+
 
 if __name__ == "__main__":
     unittest.main()
