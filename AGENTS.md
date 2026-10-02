@@ -344,6 +344,35 @@ At an approved checkpoint, retain enough state to recover:
 
 Do not copy entire review histories into the active checkpoint.
 
+## Final Report Persistence Contract
+
+For every governed Delivery System gate, `.dev/codex-last-report.md` is the mandatory canonical handoff report.
+
+At completion of every gate, including read-only gates:
+
+1. Construct the complete final gate report.
+2. Overwrite `.dev/codex-last-report.md`; never append to the previous gate report.
+3. Flush/close the file successfully.
+4. Read the file back from disk.
+5. Verify the read-back report contains the current exact gate ID and final verdict.
+6. Emit the read-back file contents as the final console response.
+
+The console final report and `.dev/codex-last-report.md` MUST NOT be independently generated.
+
+`.dev/codex-last-report.md`:
+
+* remains ignored;
+* must never be staged;
+* must never be committed;
+* does not count as tracked/product mutation;
+* MUST still be overwritten for read-only gates.
+
+If write, flush, or read-back verification fails, the gate MUST NOT return its normal PASS verdict. Instead return:
+
+`<CURRENT-GATE-ID> BLOCKED — FINAL REPORT PERSISTENCE FAILED`
+
+Any older instruction saying report persistence is merely “permitted”, “optional”, or an allowed handoff is superseded by this contract.
+
 When a session resumes:
 
 1. load the applicable `AGENTS.md`;
