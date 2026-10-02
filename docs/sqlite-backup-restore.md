@@ -43,7 +43,7 @@ Restore requires:
 
 The canonical `state.sqlite3` and each active `state.sqlite3-wal`, `state.sqlite3-shm`, and `state.sqlite3-journal` path must be absent. Restore never overwrites, deletes, quarantines, or replaces an existing database or sidecar. It stages a validated database under `.delivery-system` and atomically publishes it only when the target remains absent.
 
-Restore does not migrate the artifact, rebind workspace identity, provide cross-release or cross-workspace portability, repair corruption, start the Host, or resume an interrupted application. The bounded damaged-state recovery procedure is documented below; release transition compatibility remains separately owned by `ARC-SQLITE-COMPAT-01`.
+Restore does not migrate the artifact, rebind workspace identity, provide cross-release or cross-workspace portability, repair corruption, start the Host, or resume an interrupted application. The bounded damaged-state recovery procedure is documented below. Same-release V7 restore is the supported current boundary; cross-release restore is not guaranteed. A future Release N → N+1 transition must explicitly declare whether older backups or states are accepted and provide proportional evidence. Restore does not implement release downgrade or reverse a successfully committed migration, and an external pre-migration backup does not make an older Runtime compatible with newer state.
 
 ## Corruption recovery procedure
 

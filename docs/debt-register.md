@@ -62,15 +62,6 @@ Every entry has Category, Status, Risk, Why deferred / rationale, Constraints pr
 - Review point: Before portability work.
 - Decision/owner state: Architecture decision required.
 
-### ARC-SQLITE-COMPAT-01 — SQLite upgrade and rollback compatibility
-- Category: Architecture; Status: Open; Risk: High
-- Why deferred / rationale: Versioning/migration exists without long-term compatibility guarantees.
-- Constraints preserved: Do not promise compatibility unapproved by product.
-- Evidence/reference: Runtime schema/migration code.
-- Reconsideration trigger: Schema-changing feature.
-- Review point: Before first release.
-- Decision/owner state: Architecture decision required.
-
 ### ARC-INSTALL-LIFECYCLE-01 — Install, upgrade, uninstall
 - Category: Release/CI; Status: Deferred; Risk: Medium
 - Why deferred / rationale: Packaging is not a complete operator lifecycle.
@@ -163,6 +154,15 @@ Every entry has Category, Status, Risk, Why deferred / rationale, Constraints pr
 
 ## Resolved and superseded entries
 
+### ARC-SQLITE-COMPAT-01 — SQLite upgrade and rollback compatibility
+- Category: Architecture; Status: Resolved; Risk: High
+- Why deferred / rationale: Resolved by the bounded first-release compatibility policy: V7 is the first formal SQLite baseline; historical V3–V6 migrations remain implementation behavior only; newer or unknown state fails closed; failed migration transactions roll back; committed migrations are forward-only; downgrade and reverse migration are unsupported; cross-release restore is not guaranteed; and future formal transitions require explicit declarations and evidence.
+- Constraints preserved: Resolution does not establish arbitrary prototype-state support, universal N→N+1 compatibility, backward/forward/N-1 compatibility, downgrade, reverse migration, post-commit migration rollback, cross-release backup/restore, workspace portability, installation upgrade lifecycle, or LTS/support-window guarantees.
+- Evidence/reference: `delivery_system/sqlite_schema.py`; `delivery_system/runtime.py`; relevant attestation/schema migration tests; `tests/v1/test_authority_binding_persistence.py`; `tests/v1/test_sqlite_backup_restore.py`; `tests/v1/test_release_compatibility_contract.py`; `docs/release-compatibility.md`; `docs/architecture-and-lifecycle.md`; `docs/sqlite-backup-restore.md`; D1 targeted `123 tests / OK`; canonical main full-suite evidence `1191 tests / OK / skipped=1`.
+- Reconsideration trigger: An actual formal Release N → N+1 transition, a selected historical-state guarantee, downgrade/reverse migration, cross-release restore, a changed formal SQLite baseline, or a materially changed support-window policy.
+- Review point: Before declaring a formal release transition or changing the bounded first-release compatibility contract.
+- Decision/owner state: The bounded V7 first-formal-release SQLite compatibility contract is resolved. Future transition-specific compatibility remains declaration-based and is not guaranteed without separate evidence.
+
 ### ARC-SQLITE-RECOVERY-01 — SQLite corruption recovery
 - Category: Architecture; Status: Resolved; Risk: High
 - Why deferred / rationale: Resolved by pre-migration read-only physical-integrity validation for existing canonical state, stable fail-closed corruption mapping, preservation/no-replacement behavior, explicit offline quarantine, reuse of validated exact-release/exact-workspace empty-slot restore, and fresh-process restart.
@@ -170,21 +170,21 @@ Every entry has Category, Status, Risk, Why deferred / rationale, Constraints pr
 - Evidence/reference: `delivery_system/sqlite_schema.py`; `delivery_system/runtime.py`; `docs/sqlite-backup-restore.md`; `docs/architecture-and-lifecycle.md`; `tests/slice1_5/test_revision22_runtime.py`; `tests/v1/test_sqlite_backup_restore.py`; `tests/attestation_persistence_store/test_sqlite_store.py`; D2 focused and full-suite evidence.
 - Reconsideration trigger: Any requirement for in-place repair/salvage, automatic quarantine or backup selection, automatic empty fallback, zero-data-loss recovery, cross-release/workspace recovery, migration rollback, or automated incident response.
 - Review point: Before changing the recovery boundary or before a release requiring capabilities outside this bounded contract.
-- Decision/owner state: Bounded first-release SQLite corruption recovery is resolved. `ARC-SQLITE-COMPAT-01`, `ARC-WORKSPACE-ID-01`, `ARC-INSTALL-LIFECYCLE-01`, and unrelated recovery/observability/evidence debts remain separately owned and unchanged.
+- Decision/owner state: Bounded first-release SQLite corruption recovery is resolved. `ARC-WORKSPACE-ID-01`, `ARC-INSTALL-LIFECYCLE-01`, and unrelated recovery/observability/evidence debts remain separately owned and unchanged.
 
 ### ARC-SQLITE-BACKUP-01 — SQLite backup and restore
 - Category: Architecture; Status: Resolved; Risk: High
 - Why deferred / rationale: Resolved by the bounded offline operator maintenance contract **OFFLINE VERIFIED SQLITE BACKUP BUNDLE + EMPTY-SLOT ATOMIC RESTORE**, providing source-runnable backup and restore for the complete current V7 Runtime SQLite state with independent artifact validation and fail-closed activation.
-- Constraints preserved: Backup/restore remains offline, V7-only, exact-release, exact-workspace, and empty-slot only. Restore does not overwrite or repair existing state, migrate artifacts, rebind workspace identity, provide cross-release or cross-workspace portability, resume application execution, or establish a complete disaster-recovery guarantee. Backup artifact SHA-256 detects manifest/database inconsistency but is not authentication or provenance. The bounded damaged-state recovery procedure is recorded by `ARC-SQLITE-RECOVERY-01`; release-transition compatibility remains owned by `ARC-SQLITE-COMPAT-01`; workspace portability remains owned by `ARC-WORKSPACE-ID-01`.
+- Constraints preserved: Backup/restore remains offline, V7-only, exact-release, exact-workspace, and empty-slot only. Restore does not overwrite or repair existing state, migrate artifacts, rebind workspace identity, provide cross-release or cross-workspace portability, resume application execution, or establish a complete disaster-recovery guarantee. Backup artifact SHA-256 detects manifest/database inconsistency but is not authentication or provenance. The bounded damaged-state recovery procedure is recorded by `ARC-SQLITE-RECOVERY-01`; future cross-release transitions remain declaration-based under `ARC-RELEASE-COMPAT-01`; workspace portability remains owned by `ARC-WORKSPACE-ID-01`.
 - Evidence/reference: `delivery_system/sqlite_maintenance.py`; `delivery_system/runtime.py`; `delivery_system/sqlite_schema.py`; `docs/sqlite-backup-restore.md`; `docs/architecture-and-lifecycle.md`; `tests/v1/test_sqlite_backup_restore.py`; PR #54; PR CI run `36541468534`; post-merge main CI run `36543713298`.
 - Reconsideration trigger: Runtime SQLite state/schema ownership, backup bundle format, release identity binding, workspace identity binding, restore activation/publication semantics, supported publication platforms, or an explicit cross-release/portable restore requirement changes.
 - Review point: Before changing the backup/restore contract and before each formal release when those boundaries have changed.
-- Decision/owner state: The bounded first-release SQLite backup/restore contract is resolved for the current V7 exact-release/exact-workspace Runtime state. Corruption recovery, release-transition compatibility, workspace portability, installation lifecycle, key lifecycle, observability, and broader disaster-recovery concerns remain separately owned.
+- Decision/owner state: The bounded first-release SQLite backup/restore contract is resolved for the current V7 exact-release/exact-workspace Runtime state. Corruption recovery, future transition-specific declarations, workspace portability, installation lifecycle, key lifecycle, observability, and broader disaster-recovery concerns remain separately bounded by their existing contracts.
 
 ### ARC-RELEASE-COMPAT-01 — Release compatibility policy
 - Category: Architecture; Status: Resolved; Risk: High
 - Why deferred / rationale: Resolved by the canonical `docs/release-compatibility.md` policy using **EXACT RELEASE BASELINE + EXPLICIT COMPATIBILITY DECLARATION**, which defines release identity, public MCP/Skill/workflow compatibility surfaces, SQLite first-formal-release state boundaries, operator/package/Python/install/support-window boundaries, change classification, and evidence requirements.
-- Constraints preserved: Compatibility remains declaration-based. No default backward, forward, N-1, SemVer, downgrade, committed-migration rollback, cross-release backup/restore, workspace-portability, universal-upgrade, or support-window guarantee is created. Current `0.1.0` remains metadata only and is not formally Released. SQLite backup/recovery/transition compatibility, workspace portability, installation lifecycle, key lifecycle, observability, Host evidence, external integration evidence, and formal release authorization remain separately owned.
+- Constraints preserved: Compatibility remains declaration-based. No default backward, forward, N-1, SemVer, downgrade, committed-migration rollback, cross-release backup/restore, workspace-portability, universal-upgrade, or support-window guarantee is created. Current `0.1.0` remains metadata only and is not formally Released. SQLite backup/recovery, future transition-specific declarations, workspace portability, installation lifecycle, key lifecycle, observability, Host evidence, external integration evidence, and formal release authorization remain separately bounded.
 - Evidence/reference: `docs/release-compatibility.md`; `README.md`; `docs/architecture-and-lifecycle.md`; `tests/v1/test_release_compatibility_contract.py`; PR #52; PR CI run `36310580171`; post-merge main CI run `36311071824`.
 - Reconsideration trigger: Formal release preparation; any compatibility-sensitive change to public MCP/Skill/workflow contracts, durable-state acceptance or migration, documented operator configuration, packaging/Python support, installation/upgrade behavior, support-window policy, or an explicit release-to-release transition.
 - Review point: Before each formal release or declared cross-release transition, and before accepting a change classified **BREAKING** or **REVIEW REQUIRED** against a declared baseline.
