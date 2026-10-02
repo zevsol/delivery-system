@@ -72,13 +72,13 @@ Every entry has Category, Status, Risk, Why deferred / rationale, Constraints pr
 - Decision/owner state: Release decision required.
 
 ### ARC-OBSERVABILITY-01 — Operator observability and recovery tooling
-- Category: Operator; Status: Open; Risk: Medium
-- Why deferred / rationale: Bounded status exists; long-lived logs, inspection, and recovery procedures do not.
-- Constraints preserved: Preserve bounded status semantics.
-- Evidence/reference: MCP status surface; runtime recovery code.
-- Reconsideration trigger: Long-lived operator deployment.
-- Review point: Before first release.
-- Decision/owner state: Operator architecture decision required.
+- Category: Operator; Status: Resolved; Risk: Medium
+- Why deferred / rationale: Resolved by the bounded V1 operator observability and recovery contract: stable startup/runtime error identities; Approval status recovery; known-ID Application status; exact approved-context Application status recovery for a lost Apply result; bounded `OutcomeUnknown` relationship observation; durable restart reconstruction; documented SQLite recovery; and Host/process stderr ownership.
+- Constraints preserved: Resolution does not add product-owned persistent logs, centralized logging, metrics, traces, alerts, health/readiness endpoints, a global Runtime status API, generic Application enumeration, automatic retry/recovery, a reusable telemetry protocol, or evidence archival/retention/deletion policy.
+- Evidence/reference: `delivery_system/execution_store.py`; `delivery_system/runtime.py`; `mcp_server/server.py`; `tests/v1/test_pc2d_application_status.py`; `skills/apply-github-work-items/SKILL.md`; `docs/user-workflow.md`; `docs/architecture-and-lifecycle.md`.
+- Reconsideration trigger: Long-lived operator deployment, a requirement for fleet monitoring or remote collection, a new recovery action, or a need to enumerate durable recovery items.
+- Review point: Before first release and before expanding beyond bounded stdio/operator recovery.
+- Decision/owner state: Bounded first-release observability is resolved. `GOV-DIAG-TELEMETRY-01` remains Deferred; `GOV-EVIDENCE-LIFECYCLE-01` remains Open; `ARC-INSTALL-LIFECYCLE-01` and `ARC-HARNESS-01` remain Deferred.
 
 ### SEC-REVOCATION-TEST-01 — Revocation 1 MiB test coverage
 - Category: Security; Status: Deferred; Risk: Low

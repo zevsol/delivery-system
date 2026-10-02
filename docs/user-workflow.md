@@ -124,6 +124,18 @@ Automatic retry is not authorized:
 
 `delivery_get_application_status` may read bounded durable application status and recovery evidence. It is read-only and does not retry, resume, reconcile, transition state, or write GitHub.
 
+### Apply response lost before Application ID handoff
+
+If the Apply response is lost or becomes ambiguous before the Application ID is safely handed off:
+
+1. Do not call Apply again.
+2. Retain the exact `preview_id`, `revision`, `approval_id`, and `approval_digest` from the approved handoff.
+3. Call the existing `delivery_get_application_status` tool with those four fields and without an `application_id`.
+4. If status is recovered, follow the existing state and recovery semantics above.
+5. If the tool returns `application_not_found`, report only that no matching durable Application was found.
+
+`application_not_found` does not prove that Apply did not run or that GitHub was not mutated. Do not enumerate workspace state, invent an Application ID, retry, resume, reconcile, or inspect raw SQLite as a product procedure.
+
 For an eligible `OutcomeUnknown` `add_sub_issue` or `add_dependency` operation, `delivery_observe_application_postcondition` may inspect the current relationship state. It is read-only, does not establish historical causal attribution, and does not authorize retry or resume.
 
 ## Terminology

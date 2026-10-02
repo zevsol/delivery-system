@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from inspect import getsource
 import json
 import sqlite3
@@ -12,10 +13,12 @@ from unittest.mock import patch
 from pydantic import ValidationError
 from mcp import Client
 
-from delivery_system.application_identity import operation_identity, request_identity
+from delivery_system.application_identity import LogicalApplicationIdentity, operation_identity, request_identity
 from delivery_system.canonical import digest
 from delivery_system.drivers.write_contract import WriteObservation, WriteObservationKind
 from delivery_system.execution_state import APPLIER_ORCHESTRATION_POLICY
+from delivery_system.execution_store import SQLiteExecutionStore
+from delivery_system.runtime import RuntimeApplicationStatusService
 from mcp_server.server import create_server, mcp
 import tests.v1.test_pc2c_mcp_write_surface as mcp_surface
 
@@ -59,6 +62,11 @@ class ApplicationStatusSurfaceTests(unittest.TestCase):
     @staticmethod
     def _app_id(result):
         return result.structured_content["application_id"]
+
+    @staticmethod
+    def _approved_context(authority):
+        values = authority.to_dict()
+        return {field: values[field] for field in ("preview_id", "revision", "approval_id", "approval_digest")}
 
     @staticmethod
     def _row_payload(path, table, application_id, operation_identity=None):
@@ -141,6 +149,128 @@ class ApplicationStatusSurfaceTests(unittest.TestCase):
             self.assertTrue(replay_calls)
             self.assertEqual(replay_calls[-1].kwargs["expected_operations"], expected_operations)
             self.assertEqual(len(driver.trace), 1)
+        finally:
+            directory.cleanup()
+
+    def test_lost_apply_response_recovers_the_same_projection_by_exact_context(self):
+        directory, context, preview, service, authority, driver, execution_store = self._configured(
+            (mcp_surface.McpWriteSurfaceTests._success(),)
+        )
+        try:
+            server = self._server(context, service, execution_store)
+            approved_context = self._approved_context(authority)
+            apply_result = mcp_surface.McpWriteSurfaceTests._call(
+                server, "delivery_apply_approved_work_items",
+                {"application_authority_id": authority.authority_id},
+            )
+            self.assertFalse(apply_result.is_error, apply_result.content)
+            del apply_result
+
+            recovered = self._call(server, approved_context)
+            self.assertFalse(recovered.is_error, recovered.content)
+            self.assertTrue(recovered.structured_content["application_id"].startswith("application-"))
+            known_id_projection = self._call(
+                server, {"application_id": recovered.structured_content["application_id"]},
+            )
+            self.assertFalse(known_id_projection.is_error, known_id_projection.content)
+            self.assertEqual(recovered.structured_content, known_id_projection.structured_content)
+            self.assertEqual(len(driver.trace), 1)
+        finally:
+            directory.cleanup()
+
+    def test_exact_context_recovery_uses_fresh_execution_store_without_authority_cache(self):
+        directory, context, preview, service, authority, driver, execution_store = self._configured(
+            (mcp_surface.McpWriteSurfaceTests._success(),)
+        )
+        try:
+            server = self._server(context, service, execution_store)
+            mcp_surface.McpWriteSurfaceTests._call(
+                server, "delivery_apply_approved_work_items",
+                {"application_authority_id": authority.authority_id},
+            )
+            execution_path = execution_store.path
+            del execution_store
+            fresh_store = SQLiteExecutionStore(execution_path, context.workspace_identity)
+            fresh_status = RuntimeApplicationStatusService(context, service.store, fresh_store)
+            status = fresh_status.get_status_by_approved_context(**self._approved_context(authority))
+            self.assertEqual(status["state"], "Applied")
+            self.assertEqual(status["application_id"], service.create_execution_context(authority.authority_id).identity.application_id)
+            self.assertFalse(hasattr(fresh_status, "_authorities"))
+        finally:
+            directory.cleanup()
+
+    def test_outcome_unknown_context_recovery_is_read_only_and_preserves_recovery_evidence(self):
+        directory, context, preview, service, authority, driver, execution_store = self._configured()
+        try:
+            runtime_context, capability, initial, now = self._pending(context, service, authority, execution_store)
+            claimed, attempt = execution_store.claim_next_operation(
+                capability, initial.application_id, initial.state_digest,
+                runtime_context, "execution-owner-" + "d" * 32, now,
+            )
+            execution_store.settle_operation(
+                capability, initial.application_id, claimed.state_digest,
+                attempt.operation_identity, attempt.attempt_digest, claimed.owner_id,
+                runtime_context, "OutcomeUnknown", "github_write_transport_ambiguous", now,
+            )
+            server = self._server(context, service, execution_store)
+            approved_context = self._approved_context(authority)
+            before = execution_store.path.read_bytes()
+            trace_before = list(driver.trace)
+            recovered = self._call(server, approved_context)
+            after = execution_store.path.read_bytes()
+            self.assertFalse(recovered.is_error, recovered.content)
+            self.assertEqual(recovered.structured_content["application_id"], initial.application_id)
+            self.assertEqual(recovered.structured_content["state"], "OutcomeUnknown")
+            self.assertEqual(recovered.structured_content["recovery_code"], "github_write_transport_ambiguous")
+            self.assertTrue(any(item["state"] == "OutcomeUnknown" for item in recovered.structured_content["attempts"]))
+            self.assertEqual(before, after)
+            self.assertEqual(list(driver.trace), trace_before)
+        finally:
+            directory.cleanup()
+
+    def test_context_without_durable_application_is_not_execution_proof_or_retry_authorization(self):
+        directory, context, preview, service, authority, driver, execution_store = self._configured()
+        try:
+            server = self._server(context, service, execution_store)
+            result = self._call(server, self._approved_context(authority))
+            self.assertTrue(result.is_error)
+            self.assertEqual(self._error_code(result), "application_not_found")
+            self.assertEqual(len(driver.trace), 0)
+        finally:
+            directory.cleanup()
+
+    def test_context_lookup_fails_closed_on_multiple_integrity_valid_matches(self):
+        directory, context, preview, service, authority, driver, execution_store = self._configured()
+        try:
+            runtime_context, capability, initial, now = self._pending(context, service, authority, execution_store)
+            values = initial.identity.values()
+            values["driver_identity"] = "alternate-driver"
+            alternate_identity = LogicalApplicationIdentity(values)
+            alternate = replace(initial, application_id=alternate_identity.application_id,
+                                identity=alternate_identity).with_digest()
+            with closing(sqlite3.connect(execution_store.path)) as connection:
+                connection.execute(
+                    "INSERT INTO application_execution(workspace_identity, application_id, payload) VALUES (?, ?, ?)",
+                    (context.workspace_identity, alternate.application_id,
+                     json.dumps(alternate.payload() | {"state_digest": alternate.state_digest}, sort_keys=True)),
+                )
+                connection.commit()
+            with self.assertRaisesRegex(ValueError, "^application_binding_conflict$"):
+                execution_store.resolve_application_id_by_approved_context(**self._approved_context(authority))
+        finally:
+            directory.cleanup()
+
+    def test_context_lookup_does_not_skip_corrupt_execution_rows(self):
+        directory, context, preview, service, authority, driver, execution_store = self._configured()
+        try:
+            with closing(sqlite3.connect(execution_store.path)) as connection:
+                connection.execute(
+                    "INSERT INTO application_execution(workspace_identity, application_id, payload) VALUES (?, ?, ?)",
+                    (context.workspace_identity, "application-corrupt", "{not-json"),
+                )
+                connection.commit()
+            with self.assertRaisesRegex(ValueError, "^state_integrity_invalid$"):
+                execution_store.resolve_application_id_by_approved_context(**self._approved_context(authority))
         finally:
             directory.cleanup()
 
@@ -238,6 +368,18 @@ class ApplicationStatusSurfaceTests(unittest.TestCase):
                 server_payload = {"application_id": "application-" + "a" * 64, "workspace": "other"}
                 from mcp_server.server import GetApplicationStatusInput
                 GetApplicationStatusInput.model_validate(server_payload)
+            from mcp_server.server import GetApplicationStatusInput
+            valid_context = self._approved_context(authority)
+            for invalid in (
+                {"application_id": "application-" + "a" * 64, **valid_context},
+                {"application_id": None, **valid_context},
+                {"application_id": "application-" + "a" * 64, "preview_id": None},
+                {"preview_id": valid_context["preview_id"], "revision": valid_context["revision"]},
+                {**valid_context, "approval_digest": ""},
+                {**valid_context, "revision": 0},
+            ):
+                with self.assertRaises(ValidationError):
+                    GetApplicationStatusInput.model_validate(invalid)
 
             missing = self._call(server, {"application_id": "application-" + "a" * 64})
             self.assertTrue(missing.is_error)
@@ -820,7 +962,9 @@ class ApplicationStatusSurfaceTests(unittest.TestCase):
         schema = status_tool.input_schema
         payload_schema = schema["$defs"][schema["properties"]["payload"]["$ref"].rsplit("/", 1)[1]]
         properties = payload_schema["properties"]
-        self.assertEqual(properties["application_id"]["pattern"], r"^application-[0-9a-f]{64}$")
+        self.assertEqual(properties["application_id"]["anyOf"][0]["pattern"], r"^application-[0-9a-f]{64}$")
+        for field in ("preview_id", "revision", "approval_id", "approval_digest"):
+            self.assertIn(field, properties)
         self.assertEqual(len(tools), 9)
 
 

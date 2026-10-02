@@ -56,6 +56,8 @@ Host composition receives and validates required configuration and protected mat
 
 `Preview → Audit → Human Approval → Application Authority → Application Execution → Operation Attempt → Operation Receipt → Application Receipt` is the execution record lifecycle. Durable intermediate authority or state may be split across boundaries only when the next phase remains legally and technically reachable, or an explicit recovery path exists.
 
+The normal Application status path uses the known `application_id`. The bounded lost-result recovery path uses the exact approved context (`preview_id`, `revision`, `approval_id`, and `approval_digest`) to resolve one integrity-validated durable Application, then delegates to the same status projection. It reads workspace-scoped `application_execution` state only; it does not recover credentials or writable authority, enumerate Applications, call GitHub, retry, resume, reconcile, or mutate durable state. Zero matches fail as `application_not_found`; multiple matches fail as `application_binding_conflict`; malformed or integrity-invalid execution fails closed.
+
 ## Evidence lifecycle
 
 Evidence follows `generation → required persistence → interpretation → report handoff → archive/delete decision`. Required evidence survives handoff before cleanup. See `GOV-EVIDENCE-LIFECYCLE-01` and `GOV-DIAG-TELEMETRY-01`.
@@ -70,7 +72,7 @@ Packaging or build evidence is not a complete install, upgrade, uninstall, or op
 
 ## Observability and recovery status
 
-Bounded Runtime status and recovery surfaces exist. Long-lived operator observability, logs, inspection, and recovery procedures remain unresolved. See `ARC-OBSERVABILITY-01`.
+First-release operator observability is bounded by stable startup/runtime errors, Approval status recovery, known-ID Application status, exact approved-context Application status recovery for a lost Apply result, bounded `OutcomeUnknown` relationship observation, durable restart reconstruction, documented SQLite recovery, and Host/process stderr ownership. The known Application ID path remains primary; exact context is only for recovering a lost Apply result. There is no global health/status API, generic Application enumeration, product-owned persistent log subsystem, centralized telemetry, metrics, tracing, alerting, or automatic recovery. See `ARC-OBSERVABILITY-01`.
 
 ## Compatibility policy surface
 

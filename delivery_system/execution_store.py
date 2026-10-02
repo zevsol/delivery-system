@@ -142,6 +142,51 @@ class SQLiteExecutionStore:
             raise ValueError("state_integrity_invalid")
         return state
 
+    def resolve_application_id_by_approved_context(
+        self, preview_id: str, revision: int, approval_id: str, approval_digest: str,
+    ) -> str:
+        """Resolve one durable Application from the exact approved Apply context.
+
+        This is intentionally a historical, read-only lookup. Every row in the
+        workspace execution domain is validated before any matching identity is
+        trusted, so malformed or conflicting durable state cannot be skipped.
+        """
+        with closing(self._connection()) as connection:
+            rows = connection.execute(
+                "SELECT application_id, payload FROM application_execution WHERE workspace_identity=?",
+                (self.workspace_identity,),
+            ).fetchall()
+
+        matches: list[str] = []
+        for row_application_id, payload in rows:
+            try:
+                state = ApplicationExecutionState(**json.loads(payload))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                raise ValueError("state_integrity_invalid") from None
+            if state.application_id != row_application_id:
+                raise ValueError("application_binding_conflict")
+            try:
+                values = state.identity.values()
+            except (AttributeError, KeyError, TypeError, ValueError):
+                raise ValueError("application_binding_conflict") from None
+            if values.get("workspace_identity") != self.workspace_identity:
+                raise ValueError("application_binding_conflict")
+            if not state.verify_integrity():
+                raise ValueError("state_integrity_invalid")
+            if (
+                values.get("preview_id") == preview_id
+                and values.get("revision") == revision
+                and values.get("approval_id") == approval_id
+                and values.get("approval_digest") == approval_digest
+            ):
+                matches.append(state.application_id)
+
+        if not matches:
+            raise ValueError("application_not_found")
+        if len(matches) != 1:
+            raise ValueError("application_binding_conflict")
+        return matches[0]
+
     def get_execution_bootstrap(self, application_id: str) -> Any:
         """Load only validated identity metadata needed to locate the Preview."""
         return self._load_execution_state(application_id).identity
