@@ -1034,7 +1034,10 @@ class SQLitePreviewStore:
         self._save_preview_revision_impl(**kwargs, promotion=promotion)
 
     def _initialize(self) -> None:
+        existing_state = self.path.exists()
         try:
+            if existing_state:
+                sqlite_schema.validate_existing_database_integrity_read_only(self.path)
             with closing(self._connect()) as connection:
                 sqlite_schema.ensure_schema_v4(
                     connection,
@@ -1042,6 +1045,7 @@ class SQLitePreviewStore:
                 )
         except sqlite_schema.SchemaOwnerError as exc:
             if exc.code in {
+                "attestation_persistence_sqlite_corrupt",
                 "attestation_persistence_schema_version_unsupported",
                 "attestation_persistence_schema_metadata_corrupt",
                 "attestation_persistence_schema_shape_mismatch",
