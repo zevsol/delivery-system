@@ -386,12 +386,11 @@ class McpWriteSurfaceTests(unittest.TestCase):
                     cwd=Path(__file__).parents[2].resolve(),
                     env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
                 )
-                async with stdio_client(params) as (read, write):
-                    async with Client(stdio_client(params), raise_exceptions=False) as client:
-                        tools = await client.list_tools()
-                        result = await client.call_tool("delivery_apply_approved_work_items",
-                                                        {"payload": {"application_authority_id": "authority"}})
-                        return tools, result
+                async with Client(stdio_client(params), raise_exceptions=False) as client:
+                    tools = await client.list_tools()
+                    result = await client.call_tool("delivery_apply_approved_work_items",
+                                                    {"payload": {"application_authority_id": "authority"}})
+                    return tools, result
             tools, result = self.run_async(exercise())
             self.assertEqual(len(tools.tools), 9)
             self.assertTrue(result.is_error)
