@@ -43,7 +43,29 @@ Restore requires:
 
 The canonical `state.sqlite3` and each active `state.sqlite3-wal`, `state.sqlite3-shm`, and `state.sqlite3-journal` path must be absent. Restore never overwrites, deletes, quarantines, or replaces an existing database or sidecar. It stages a validated database under `.delivery-system` and atomically publishes it only when the target remains absent.
 
-Restore does not migrate the artifact, rebind workspace identity, provide cross-release or cross-workspace portability, repair corruption, start the Host, or resume an interrupted application. Existing damaged-state replacement and corruption remediation remain owned by `ARC-SQLITE-RECOVERY-01`; release transition compatibility remains separately owned by `ARC-SQLITE-COMPAT-01`.
+Restore does not migrate the artifact, rebind workspace identity, provide cross-release or cross-workspace portability, repair corruption, start the Host, or resume an interrupted application. The bounded damaged-state recovery procedure is documented below; release transition compatibility remains separately owned by `ARC-SQLITE-COMPAT-01`.
+
+## Corruption recovery procedure
+
+Corruption recovery is offline and requires explicit operator action:
+
+1. Stop all Delivery System processes using the workspace.
+2. Do not attempt further Runtime writes.
+3. Preserve the damaged canonical `state.sqlite3` and any associated `state.sqlite3-wal`, `state.sqlite3-shm`, and `state.sqlite3-journal` files.
+4. Relocate or quarantine the database and associated sidecars together to an operator-owned noncanonical location using no-overwrite move/rename semantics.
+5. If any collision occurs or the move fails, stop. Do not improvise a replacement.
+6. Do not automatically delete any sidecar.
+7. Confirm that the canonical database and all canonical sidecar paths are absent.
+8. Use the existing validated `restore` command above.
+9. Restore only a valid bundle for the exact current Runtime release and exact target workspace.
+10. Allow the existing restore validation and no-replace publication to complete.
+11. Start a fresh Delivery System process.
+
+No product quarantine command is provided. The restore command never overwrites a damaged database and does not repair, salvage, migrate, or delete the quarantined artifact.
+
+## No valid backup
+
+If no valid backup exists, supported automated recovery stops. Preserve the damaged database and sidecars, keep Runtime fail-closed, and treat forensic or manual data recovery as outside the bounded first-release guarantee. Delivery System must not silently initialize an empty replacement state. A deliberate new empty state after explicit quarantine is a separate operator decision accepting loss of historical state; it is not recovery or a zero-data-loss restoration.
 
 ## Scope and limitations
 

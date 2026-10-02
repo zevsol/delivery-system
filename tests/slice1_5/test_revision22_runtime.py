@@ -626,6 +626,59 @@ class Revision22RuntimeTests(unittest.TestCase):
             context.ensure_store_ready(ignore_checker=lambda _: True, tracked_checker=lambda _: False)
             self.assertTrue(Path(context.state_path).parent.exists())
 
+    def test_existing_zero_byte_state_fails_closed_without_initialization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            context = RuntimeContext.from_workspace_root(directory)
+            state_path = Path(context.state_path)
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            state_path.write_bytes(b"")
+            before = state_path.read_bytes()
+            with self.assertRaises(StorePreflightError) as raised:
+                SQLitePreviewStore(context, ignore_checker=lambda _: True, tracked_checker=lambda _: False)
+            self.assertEqual(raised.exception.code, "store_corrupt")
+            self.assertEqual(state_path.read_bytes(), before)
+            self.assertEqual(state_path.stat().st_size, 0)
+
+    def test_existing_non_sqlite_state_is_preserved_and_sanitized(self):
+        with tempfile.TemporaryDirectory() as directory:
+            context = RuntimeContext.from_workspace_root(directory)
+            state_path = Path(context.state_path)
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            state_path.write_bytes(b"not a sqlite database")
+            before = state_path.read_bytes()
+            with patch.object(sqlite_schema, "ensure_schema_v4", side_effect=AssertionError("migration")) as migrate:
+                with self.assertRaises(StorePreflightError) as raised:
+                    SQLitePreviewStore(context, ignore_checker=lambda _: True, tracked_checker=lambda _: False)
+            self.assertEqual(raised.exception.code, "store_corrupt")
+            self.assertNotIn("sqlite3", str(raised.exception).lower())
+            self.assertNotIn("database", str(raised.exception).lower())
+            self.assertEqual(state_path.read_bytes(), before)
+            migrate.assert_not_called()
+
+    def test_existing_truncated_sqlite_state_fails_before_migration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            context = RuntimeContext.from_workspace_root(directory)
+            SQLitePreviewStore(context, ignore_checker=lambda _: True, tracked_checker=lambda _: False)
+            state_path = Path(context.state_path)
+            valid = state_path.read_bytes()
+            self.assertGreater(len(valid), 128)
+            state_path.write_bytes(valid[:128])
+            before = state_path.read_bytes()
+            with patch.object(sqlite_schema, "ensure_schema_v4", side_effect=AssertionError("migration")) as migrate:
+                with self.assertRaises(StorePreflightError) as raised:
+                    SQLitePreviewStore(context, ignore_checker=lambda _: True, tracked_checker=lambda _: False)
+            self.assertEqual(raised.exception.code, "store_corrupt")
+            self.assertEqual(state_path.read_bytes(), before)
+            migrate.assert_not_called()
+
+    def test_absent_state_keeps_first_use_initialization_without_integrity_probe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            context = RuntimeContext.from_workspace_root(directory)
+            with patch.object(sqlite_schema, "validate_existing_database_integrity_read_only") as validate:
+                SQLitePreviewStore(context, ignore_checker=lambda _: True, tracked_checker=lambda _: False)
+            validate.assert_not_called()
+            self.assertTrue(Path(context.state_path).is_file())
+
     def test_sqlite_store_records_schema_and_lineage_transactionally(self):
         with tempfile.TemporaryDirectory() as directory:
             context = RuntimeContext.from_workspace_root(directory)

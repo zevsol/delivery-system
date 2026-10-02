@@ -38,6 +38,49 @@ class SchemaOwnerError(Exception):
         super().__init__(code)
 
 
+def validate_existing_database_integrity_read_only(path: str | Path) -> None:
+    """Validate an existing SQLite image without creating or mutating it."""
+    candidate = Path(path)
+    connection: sqlite3.Connection | None = None
+    try:
+        if not candidate.exists() or not candidate.is_file():
+            raise SchemaOwnerError("attestation_persistence_sqlite_operational")
+        if candidate.stat().st_size == 0:
+            raise SchemaOwnerError("attestation_persistence_sqlite_corrupt")
+        uri = candidate.resolve(strict=True).as_uri() + "?mode=ro"
+        connection = sqlite3.connect(
+            uri,
+            uri=True,
+            timeout=5,
+            isolation_level=None,
+            check_same_thread=False,
+        )
+        connection.execute("PRAGMA busy_timeout = 5000")
+        connection.execute("PRAGMA query_only = ON")
+        integrity = list(connection.execute("PRAGMA integrity_check"))
+        if integrity != [("ok",)]:
+            raise SchemaOwnerError("attestation_persistence_sqlite_corrupt")
+    except SchemaOwnerError:
+        raise
+    except sqlite3.OperationalError as exc:
+        text = str(exc).lower()
+        if "busy" in text or "locked" in text:
+            raise SchemaOwnerError("attestation_persistence_sqlite_busy") from exc
+        if "malformed" in text or "not a database" in text or "disk image" in text:
+            raise SchemaOwnerError("attestation_persistence_sqlite_corrupt") from exc
+        raise SchemaOwnerError("attestation_persistence_sqlite_operational") from exc
+    except sqlite3.DatabaseError as exc:
+        raise SchemaOwnerError("attestation_persistence_sqlite_corrupt") from exc
+    except (OSError, ValueError) as exc:
+        raise SchemaOwnerError("attestation_persistence_sqlite_operational") from exc
+    finally:
+        if connection is not None:
+            try:
+                connection.close()
+            except sqlite3.Error:
+                pass
+
+
 def _open_connection(path: str | Path) -> sqlite3.Connection:
     """Module-private connection seam used by production and deterministic tests."""
     try:

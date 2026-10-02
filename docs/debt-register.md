@@ -62,15 +62,6 @@ Every entry has Category, Status, Risk, Why deferred / rationale, Constraints pr
 - Review point: Before portability work.
 - Decision/owner state: Architecture decision required.
 
-### ARC-SQLITE-RECOVERY-01 — SQLite corruption recovery
-- Category: Architecture; Status: Open; Risk: High
-- Why deferred / rationale: Integrity detection exists; recovery procedure does not.
-- Constraints preserved: Preserve failure-closed behavior.
-- Evidence/reference: Runtime SQLite integrity checks.
-- Reconsideration trigger: Corruption incident or first release preparation.
-- Review point: Before first release.
-- Decision/owner state: Architecture/operator decision required.
-
 ### ARC-SQLITE-COMPAT-01 — SQLite upgrade and rollback compatibility
 - Category: Architecture; Status: Open; Risk: High
 - Why deferred / rationale: Versioning/migration exists without long-term compatibility guarantees.
@@ -172,10 +163,19 @@ Every entry has Category, Status, Risk, Why deferred / rationale, Constraints pr
 
 ## Resolved and superseded entries
 
+### ARC-SQLITE-RECOVERY-01 — SQLite corruption recovery
+- Category: Architecture; Status: Resolved; Risk: High
+- Why deferred / rationale: Resolved by pre-migration read-only physical-integrity validation for existing canonical state, stable fail-closed corruption mapping, preservation/no-replacement behavior, explicit offline quarantine, reuse of validated exact-release/exact-workspace empty-slot restore, and fresh-process restart.
+- Constraints preserved: Resolution does not provide in-place repair/salvage, automatic quarantine, automatic backup selection, automatic empty-state fallback, zero-data-loss without a valid backup, backup retention/upload/encryption/authentication, cross-release or cross-workspace recovery, migration rollback/downgrade, or complete incident-response automation.
+- Evidence/reference: `delivery_system/sqlite_schema.py`; `delivery_system/runtime.py`; `docs/sqlite-backup-restore.md`; `docs/architecture-and-lifecycle.md`; `tests/slice1_5/test_revision22_runtime.py`; `tests/v1/test_sqlite_backup_restore.py`; `tests/attestation_persistence_store/test_sqlite_store.py`; D2 focused and full-suite evidence.
+- Reconsideration trigger: Any requirement for in-place repair/salvage, automatic quarantine or backup selection, automatic empty fallback, zero-data-loss recovery, cross-release/workspace recovery, migration rollback, or automated incident response.
+- Review point: Before changing the recovery boundary or before a release requiring capabilities outside this bounded contract.
+- Decision/owner state: Bounded first-release SQLite corruption recovery is resolved. `ARC-SQLITE-COMPAT-01`, `ARC-WORKSPACE-ID-01`, `ARC-INSTALL-LIFECYCLE-01`, and unrelated recovery/observability/evidence debts remain separately owned and unchanged.
+
 ### ARC-SQLITE-BACKUP-01 — SQLite backup and restore
 - Category: Architecture; Status: Resolved; Risk: High
 - Why deferred / rationale: Resolved by the bounded offline operator maintenance contract **OFFLINE VERIFIED SQLITE BACKUP BUNDLE + EMPTY-SLOT ATOMIC RESTORE**, providing source-runnable backup and restore for the complete current V7 Runtime SQLite state with independent artifact validation and fail-closed activation.
-- Constraints preserved: Backup/restore remains offline, V7-only, exact-release, exact-workspace, and empty-slot only. Restore does not overwrite or repair existing state, migrate artifacts, rebind workspace identity, provide cross-release or cross-workspace portability, resume application execution, or establish a complete disaster-recovery guarantee. Backup artifact SHA-256 detects manifest/database inconsistency but is not authentication or provenance. Existing damaged-state remediation remains owned by `ARC-SQLITE-RECOVERY-01`; release-transition compatibility remains owned by `ARC-SQLITE-COMPAT-01`; workspace portability remains owned by `ARC-WORKSPACE-ID-01`.
+- Constraints preserved: Backup/restore remains offline, V7-only, exact-release, exact-workspace, and empty-slot only. Restore does not overwrite or repair existing state, migrate artifacts, rebind workspace identity, provide cross-release or cross-workspace portability, resume application execution, or establish a complete disaster-recovery guarantee. Backup artifact SHA-256 detects manifest/database inconsistency but is not authentication or provenance. The bounded damaged-state recovery procedure is recorded by `ARC-SQLITE-RECOVERY-01`; release-transition compatibility remains owned by `ARC-SQLITE-COMPAT-01`; workspace portability remains owned by `ARC-WORKSPACE-ID-01`.
 - Evidence/reference: `delivery_system/sqlite_maintenance.py`; `delivery_system/runtime.py`; `delivery_system/sqlite_schema.py`; `docs/sqlite-backup-restore.md`; `docs/architecture-and-lifecycle.md`; `tests/v1/test_sqlite_backup_restore.py`; PR #54; PR CI run `36541468534`; post-merge main CI run `36543713298`.
 - Reconsideration trigger: Runtime SQLite state/schema ownership, backup bundle format, release identity binding, workspace identity binding, restore activation/publication semantics, supported publication platforms, or an explicit cross-release/portable restore requirement changes.
 - Review point: Before changing the backup/restore contract and before each formal release when those boundaries have changed.
