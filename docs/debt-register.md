@@ -98,15 +98,6 @@ Every entry has Category, Status, Risk, Why deferred / rationale, Constraints pr
 - Review point: Related capability reopening.
 - Decision/owner state: Security authorization required.
 
-### SEC-TOKEN-REPARSE-01 — Token-file reparse hardening
-- Category: Security; Status: Deferred; Risk: Medium
-- Why deferred / rationale: Token-file symlink/reparse protection needs platform review.
-- Constraints preserved: Never expose token contents.
-- Evidence/reference: Host revocation token loading.
-- Reconsideration trigger: Credential-file lifecycle work.
-- Review point: Before production rollout.
-- Decision/owner state: Security/operator authorization required.
-
 ### TOOL-HTTPERROR-WARNING-01 — HTTPError fixture warning
 - Category: Tooling; Status: Deferred; Risk: Low
 - Why deferred / rationale: Fixture ResourceWarning is nonblocking.
@@ -144,6 +135,15 @@ Every entry has Category, Status, Risk, Why deferred / rationale, Constraints pr
 - Decision/owner state: Product/UX decision required.
 
 ## Resolved and superseded entries
+
+### SEC-TOKEN-REPARSE-01 — Token-file reparse hardening
+- Category: Security; Status: Resolved; Risk: Medium
+- Why deferred / rationale: Resolved by Windows handle-first protected token opening, opened-file identity binding, workspace-control validation against the actual handle, regular disk-file enforcement, exactly one hard link, bounded 1..4096-byte input, complete exact read, stable post-read metadata, fail-closed workspace symlink/junction/hard-link/substitution cases, and preserved POSIX no-follow behavior with secret-safe error mapping.
+- Constraints preserved: Resolution does not establish enterprise vault integration, HSM or OS credential-manager integration, automatic token rotation, file watcher/live reload, installer-managed ACLs, general filesystem sandboxing, protected-key-loader redesign, trust-bundle policy, or SQLite path hardening. Token contents remain process-memory-only and are never exposed through errors, logs, Runtime state, or public surfaces.
+- Evidence/reference: `delivery_system/host_composition.py`; `tests/v1/test_h4_host_composition.py`; `docs/host-configuration.md`; D1 Windows threat-model/probe evidence; D2 Windows security coverage; focused `98 tests / OK`; restart/revocation `4 tests / OK`; D2 full suite `1206 tests / OK / skipped=1`.
+- Reconsideration trigger: Token live reload or rotation, multi-hard-link token support, materially different Windows filesystem behavior, a new supported production platform with incompatible protected-file primitives, installer-managed credential storage, or a different credential-source mechanism.
+- Review point: Before production rollout requiring capabilities outside this bounded contract or before any listed reconsideration trigger.
+- Decision/owner state: The bounded first-release revocation token-file hardening contract is resolved. Any broader secret-management lifecycle remains separately owned.
 
 ### ARC-OBSERVABILITY-01 — Operator observability and recovery tooling
 - Category: Operator; Status: Resolved; Risk: Medium
@@ -224,7 +224,7 @@ Every entry has Category, Status, Risk, Why deferred / rationale, Constraints pr
 - Evidence/reference: `delivery_system/ed25519_lifecycle.py`; `delivery_system/host_composition.py`; `delivery_system/github_app_bootstrap.py`; `delivery_system/github_app_credential.py`; `delivery_system/host_revocation.py`; `delivery_system/restart_credential_verification.py`; `delivery_system/runtime.py`; `docs/host-configuration.md`; `docs/architecture-and-lifecycle.md`; relevant lifecycle/Host/bootstrap/restart tests; PR #56 and its accepted PR/post-merge CI evidence; PR #58 and its accepted PR/post-merge CI evidence.
 - Reconsideration trigger: Automatic key rotation, live reload, automatic installation-token renewal/reacquisition, per-write revocation freshness, provider-side GitHub revocation integration, durable transition history, different credential-instance rebinding semantics, or a new key/trust role becomes a product requirement.
 - Review point: Before changing those lifecycle boundaries or before a production rollout that requires capabilities outside the bounded resolution.
-- Decision/owner state: The bounded first-release key/credential lifecycle contract is resolved. `ARC-INSTALL-LIFECYCLE-01`, `SEC-TOKEN-REPARSE-01`, `SEC-REVOCATION-TEST-01`, `GOV-EVIDENCE-LIFECYCLE-01`, and unrelated recovery/observability debts remain separately owned and retain their existing statuses.
+- Decision/owner state: The bounded first-release key/credential lifecycle contract is resolved. `ARC-INSTALL-LIFECYCLE-01`, `SEC-TOKEN-REPARSE-01` (resolved for bounded revocation-token file hardening), `SEC-REVOCATION-TEST-01`, `GOV-EVIDENCE-LIFECYCLE-01`, and unrelated recovery/observability debts remain separately owned and retain their existing statuses.
 
 ### GOV-CURRENT-HEAD-DATAMODEL-01 — Current implementation inspection
 - Category: Governance; Status: Resolved; Risk: Medium

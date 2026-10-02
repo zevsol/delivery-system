@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 from typing import Any, Callable, Mapping
 import uuid
 
@@ -395,7 +396,7 @@ def _workspace_opened_object_validator(context: RuntimeContext) -> Callable[[int
     return validate
 
 
-def _validate_external_key_paths(context: RuntimeContext, config: HostConfiguration) -> None:
+def _validate_external_key_paths(context: RuntimeContext, config: HostConfiguration) -> dict[str, str]:
     if type(context) is not RuntimeContext:
         raise HostCompositionError("workspace_identity_unavailable")
     root = os.path.normcase(os.path.abspath(context.normalized_workspace_root))
@@ -421,6 +422,7 @@ def _validate_external_key_paths(context: RuntimeContext, config: HostConfigurat
     if (len({lexical for lexical, _ in identities}) != len(identities) or
             len({resolved for _, resolved in identities}) != len(identities)):
         raise HostCompositionError("host_key_role_path_conflict")
+    return {path: resolved for path, (_, resolved) in zip(paths, identities)}
 
 
 def _read_external_json(
@@ -535,23 +537,182 @@ def _require_active_trusted_key(
         raise HostCompositionError(f"{role}_active_key_not_trusted")
 
 
-def _read_secret_token(path: str | None, opened_object_validator: Callable[[int], None]) -> str | None:
+_WINDOWS_FILE_TYPE_DISK = 0x0001
+_WINDOWS_FILE_ATTRIBUTE_DIRECTORY = 0x00000010
+_WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+
+
+def _windows_file_metadata(handle: int) -> tuple[tuple[int, int, int], int, int]:
+    import ctypes
+    from ctypes import wintypes
+
+    class _ByHandleFileInformation(ctypes.Structure):
+        _fields_ = (
+            ("dwFileAttributes", wintypes.DWORD),
+            ("ftCreationTime", wintypes.FILETIME),
+            ("ftLastAccessTime", wintypes.FILETIME),
+            ("ftLastWriteTime", wintypes.FILETIME),
+            ("dwVolumeSerialNumber", wintypes.DWORD),
+            ("nFileSizeHigh", wintypes.DWORD),
+            ("nFileSizeLow", wintypes.DWORD),
+            ("nNumberOfLinks", wintypes.DWORD),
+            ("nFileIndexHigh", wintypes.DWORD),
+            ("nFileIndexLow", wintypes.DWORD),
+        )
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_file_type = kernel32.GetFileType
+    get_file_type.argtypes = (wintypes.HANDLE,)
+    get_file_type.restype = wintypes.DWORD
+    get_information = kernel32.GetFileInformationByHandle
+    get_information.argtypes = (wintypes.HANDLE, ctypes.POINTER(_ByHandleFileInformation))
+    get_information.restype = wintypes.BOOL
+    information = _ByHandleFileInformation()
+    if (get_file_type(handle) != _WINDOWS_FILE_TYPE_DISK or
+            not get_information(handle, ctypes.byref(information))):
+        raise OSError("token handle metadata unavailable")
+    identity = (
+        int(information.dwVolumeSerialNumber),
+        int(information.nFileIndexHigh),
+        int(information.nFileIndexLow),
+    )
+    return identity, int(information.nNumberOfLinks), int(information.dwFileAttributes)
+
+
+def _windows_open_token_object(path: str) -> tuple[int, tuple[tuple[int, int, int], int, int]]:
+    import ctypes
+    from ctypes import wintypes
+    import msvcrt
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    generic_read = 0x80000000
+    file_share_read = 0x00000001
+    open_existing = 3
+    file_attribute_normal = 0x00000080
+    invalid_handle = ctypes.c_void_p(-1).value
+
+    handle = create_file(
+        path,
+        generic_read,
+        file_share_read,
+        None,
+        open_existing,
+        file_attribute_normal,
+        None,
+    )
+    if handle == invalid_handle:
+        raise OSError("token open failed")
+    fd: int | None = None
+    try:
+        metadata = _windows_file_metadata(handle)
+        if metadata[2] & (_WINDOWS_FILE_ATTRIBUTE_DIRECTORY | _WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT):
+            raise OSError("token object is not a regular file")
+        fd = msvcrt.open_osfhandle(int(handle), os.O_RDONLY | getattr(os, "O_BINARY", 0))
+        handle = None
+        return fd, metadata
+    finally:
+        if fd is None and handle is not None:
+            close_handle(handle)
+
+
+def _token_object_is_stable(
+    metadata: tuple[tuple[int, int, int], int, int],
+    file_stat: os.stat_result,
+) -> None:
+    if (metadata[1] != 1 or
+            metadata[2] & (_WINDOWS_FILE_ATTRIBUTE_DIRECTORY | _WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT) or
+            not stat.S_ISREG(file_stat.st_mode) or
+            file_stat.st_size <= 0 or file_stat.st_size > 4096):
+        raise ValueError
+
+
+def _read_secret_token(
+    path: str | None,
+    opened_object_validator: Callable[[int], None],
+    approved_resolved_path: str | None = None,
+) -> str | None:
     if path is None:
         return None
+    token: str | None = None
+    failed = False
     try:
-        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(path, flags)
-        try:
-            opened_object_validator(fd)
-            data = os.read(fd, 4097)
-        finally:
-            os.close(fd)
+        resolved_path = approved_resolved_path or _path_identities(path)[1]
+        if os.name == "nt":
+            import msvcrt
+
+            approved_fd, approved_metadata = _windows_open_token_object(resolved_path)
+            try:
+                opened_object_validator(approved_fd)
+                approved_stat = os.fstat(approved_fd)
+                _token_object_is_stable(approved_metadata, approved_stat)
+                approved_after = _windows_file_metadata(msvcrt.get_osfhandle(approved_fd))
+                if approved_after != approved_metadata or os.fstat(approved_fd).st_size != approved_stat.st_size:
+                    raise ValueError
+                fd, metadata = _windows_open_token_object(path)
+                try:
+                    opened_object_validator(fd)
+                    file_stat = os.fstat(fd)
+                    _token_object_is_stable(metadata, file_stat)
+                    if metadata[0] != approved_metadata[0]:
+                        raise ValueError
+                    data = os.read(fd, file_stat.st_size + 1)
+                    after = _windows_file_metadata(msvcrt.get_osfhandle(fd))
+                    after_stat = os.fstat(fd)
+                    if (after != metadata or after_stat.st_size != file_stat.st_size or
+                            len(data) != file_stat.st_size or len(data) > 4096):
+                        raise ValueError
+                finally:
+                    os.close(fd)
+            finally:
+                os.close(approved_fd)
+        else:
+            no_follow = getattr(os, "O_NOFOLLOW", None)
+            if no_follow is None:
+                raise OSError("secure no-follow open unavailable")
+            approved_stat = os.stat(resolved_path, follow_symlinks=False)
+            if (not stat.S_ISREG(approved_stat.st_mode) or approved_stat.st_nlink != 1 or
+                    approved_stat.st_size <= 0 or approved_stat.st_size > 4096):
+                raise ValueError
+            flags = os.O_RDONLY | no_follow | getattr(os, "O_CLOEXEC", 0)
+            fd = os.open(path, flags)
+            try:
+                opened_object_validator(fd)
+                file_stat = os.fstat(fd)
+                if (not stat.S_ISREG(file_stat.st_mode) or file_stat.st_nlink != 1 or
+                        file_stat.st_size <= 0 or file_stat.st_size > 4096 or
+                        (file_stat.st_dev, file_stat.st_ino) != (approved_stat.st_dev, approved_stat.st_ino)):
+                    raise ValueError
+                data = os.read(fd, file_stat.st_size + 1)
+                after_stat = os.fstat(fd)
+                if (not stat.S_ISREG(after_stat.st_mode) or after_stat.st_nlink != 1 or
+                        after_stat.st_size != file_stat.st_size or
+                        (after_stat.st_dev, after_stat.st_ino) != (file_stat.st_dev, file_stat.st_ino) or
+                        len(data) != file_stat.st_size or len(data) > 4096):
+                    raise ValueError
+            finally:
+                os.close(fd)
         token = data.decode("utf-8").strip()
-        if not token or len(data) > 4096:
+        if not token:
             raise ValueError
-        return token
     except Exception:
-        raise HostCompositionError("host_revocation_auth_invalid") from None
+        failed = True
+    if failed:
+        raise HostCompositionError("host_revocation_auth_invalid")
+    return token
 
 
 class _LeaseReadAuthView:
@@ -728,7 +889,7 @@ def _compose_write_enabled_host(
 ) -> HostComposition:
     if type(configuration) is not HostConfiguration:
         raise _configuration_error()
-    _validate_external_key_paths(context, configuration)
+    approved_resolved_paths = _validate_external_key_paths(context, configuration)
     opened_object_validator = _workspace_opened_object_validator(context)
     private_source = ed_private_source or FileEd25519PrivateKeySource(
         configuration.attestation_private_key_path,
@@ -830,7 +991,10 @@ def _compose_write_enabled_host(
     lease = bootstrap.acquire()
 
     revocation_token = _read_secret_token(
-        configuration.revocation_auth_token_path, opened_object_validator,
+        configuration.revocation_auth_token_path,
+        opened_object_validator,
+        approved_resolved_paths.get(configuration.revocation_auth_token_path)
+        if configuration.revocation_auth_token_path is not None else None,
     )
     revocation_reader = ExternalRevocationReader(
         endpoint=configuration.revocation_provider_url,

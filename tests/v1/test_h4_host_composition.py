@@ -8,6 +8,7 @@ import json
 import os
 import pickle
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
@@ -43,6 +44,7 @@ from delivery_system.host_composition import (
     compose_write_enabled_host,
     load_host_configuration,
 )
+from delivery_system import host_composition as host_composition_module
 from delivery_system.host_revocation import ExternalRevocationError, ExternalRevocationReader
 from delivery_system.runtime import RuntimeApprovalAuthorityService, RuntimeContext
 from delivery_system.ed25519_lifecycle import public_key_fingerprint
@@ -387,6 +389,191 @@ class CompositionTests(unittest.TestCase):
             nonce_factory=lambda: "nonce-" + "a" * 32,
             revocation_transport=FakeRevocationTransport(),
         )
+
+    def _read_token(self, path: Path) -> str:
+        validator = host_composition_module._workspace_opened_object_validator(self.context)
+        return host_composition_module._read_secret_token(str(path), validator)
+
+    def _assert_token_rejected(self, path: Path, *markers: str) -> None:
+        with self.assertRaises(HostCompositionError) as raised:
+            self._read_token(path)
+        self.assertEqual(raised.exception.code, "host_revocation_auth_invalid")
+        if markers:
+            _assert_secret_free_exception(self, raised.exception, *markers)
+
+    def _make_directory_symlink(self, link: Path, target: Path) -> None:
+        try:
+            link.symlink_to(target, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"directory symlink unavailable: {exc}")
+
+    def _make_junction(self, link: Path, target: Path) -> None:
+        result = subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            self.skipTest("Windows junction unavailable in this environment")
+
+    def test_revocation_token_normal_external_file_composes_and_is_retained_once(self) -> None:
+        token_path = Path(self.keys.name) / "revocation.token"
+        token = "REVOCATION_TOKEN_COMPOSITION_SENTINEL"
+        token_path.write_text(token, encoding="utf-8")
+        candidate = dict(self.environment)
+        candidate["DELIVERY_SYSTEM_REVOCATION_AUTH_TOKEN_PATH"] = str(token_path)
+        composition = None
+        with patch.object(
+            type(self.context),
+            "ensure_store_ready",
+            lambda self, **kwargs: Path(self.state_path).parent.mkdir(parents=True, exist_ok=True),
+        ):
+            composition = self._compose(FakeBootstrapTransport(), lambda: str(uuid.uuid4()), candidate)
+        try:
+            self.assertEqual(composition.revocation_reader._auth_token, token)
+            self.assertNotIn(token, repr(composition))
+        finally:
+            composition.close()
+
+    def test_revocation_token_workspace_hard_link_alias_is_rejected(self) -> None:
+        workspace_token = Path(self.workspace.name) / "workspace-token"
+        workspace_token.write_bytes(b"WORKSPACE_TOKEN_SENTINEL")
+        alias = Path(self.keys.name) / "external-token-alias"
+        try:
+            os.link(workspace_token, alias)
+        except OSError as exc:
+            self.skipTest(f"same-volume hard link unavailable: {exc}")
+        candidate = dict(self.environment)
+        candidate["DELIVERY_SYSTEM_REVOCATION_AUTH_TOKEN_PATH"] = str(alias)
+        transport = FakeBootstrapTransport()
+        with patch.object(
+            type(self.context),
+            "ensure_store_ready",
+            lambda self, **kwargs: Path(self.state_path).parent.mkdir(parents=True, exist_ok=True),
+        ):
+            with self.assertRaises(HostCompositionError) as raised:
+                self._compose(transport, lambda: str(uuid.uuid4()), candidate)
+        self.assertEqual(raised.exception.code, "host_composition_failed")
+        _assert_secret_free_exception(self, raised.exception, "WORKSPACE_TOKEN_SENTINEL")
+
+    @unittest.skipUnless(os.name == "nt", "Windows external reparse contract")
+    def test_revocation_token_external_symlink_parent_symlink_and_junction_are_accepted(self) -> None:
+        target_dir = Path(self.keys.name) / "external-token-target"
+        target_dir.mkdir()
+        token = "EXTERNAL_REPARSE_TOKEN_SENTINEL"
+        target = target_dir / "token"
+        target.write_text(token, encoding="utf-8")
+
+        file_link = Path(self.keys.name) / "external-token-file-link"
+        try:
+            file_link.symlink_to(target)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"file symlink unavailable: {exc}")
+        self.assertEqual(self._read_token(file_link), token)
+
+        parent_link = Path(self.keys.name) / "external-token-parent-link"
+        self._make_directory_symlink(parent_link, target_dir)
+        self.assertEqual(self._read_token(parent_link / "token"), token)
+
+        parent_junction = Path(self.keys.name) / "external-token-parent-junction"
+        self._make_junction(parent_junction, target_dir)
+        self.assertEqual(self._read_token(parent_junction / "token"), token)
+
+    @unittest.skipUnless(os.name == "nt", "Windows workspace reparse contract")
+    def test_revocation_token_workspace_symlink_and_junction_targets_are_rejected(self) -> None:
+        workspace = Path(self.workspace.name)
+        workspace_target = workspace / "workspace-token"
+        workspace_target.write_bytes(b"WORKSPACE_REPARSE_TOKEN_SENTINEL")
+
+        file_link = Path(self.keys.name) / "workspace-token-file-link"
+        try:
+            file_link.symlink_to(workspace_target)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"file symlink unavailable: {exc}")
+        self._assert_token_rejected(file_link, "WORKSPACE_REPARSE_TOKEN_SENTINEL")
+
+        parent_link = Path(self.keys.name) / "workspace-token-parent-link"
+        self._make_directory_symlink(parent_link, workspace)
+        self._assert_token_rejected(parent_link / "workspace-token", "WORKSPACE_REPARSE_TOKEN_SENTINEL")
+
+        parent_junction = Path(self.keys.name) / "workspace-token-parent-junction"
+        self._make_junction(parent_junction, workspace)
+        self._assert_token_rejected(parent_junction / "workspace-token", "WORKSPACE_REPARSE_TOKEN_SENTINEL")
+
+    def test_revocation_token_invalid_input_and_single_link_matrix(self) -> None:
+        root = Path(self.keys.name)
+        self._assert_token_rejected(root / "missing-token")
+        empty = root / "empty-token"; empty.write_bytes(b"")
+        self._assert_token_rejected(empty)
+        whitespace = root / "whitespace-token"; whitespace.write_bytes(b" \r\n\t")
+        self._assert_token_rejected(whitespace)
+        directory = root / "token-directory"; directory.mkdir()
+        self._assert_token_rejected(directory)
+        oversized = root / "oversized-token"; oversized.write_bytes(b"x" * 4097)
+        self._assert_token_rejected(oversized)
+        invalid = root / "invalid-token"; invalid.write_bytes(b"\xff")
+        self._assert_token_rejected(invalid)
+
+        linked = root / "linked-token"; linked.write_bytes(b"MULTI_LINK_TOKEN_SENTINEL")
+        alias = root / "linked-token-alias"
+        try:
+            os.link(linked, alias)
+        except OSError as exc:
+            self.skipTest(f"same-volume hard link unavailable: {exc}")
+        self._assert_token_rejected(linked, "MULTI_LINK_TOKEN_SENTINEL")
+
+    @unittest.skipUnless(os.name == "nt", "Windows handle validation")
+    def test_revocation_token_non_disk_handle_branch_is_rejected(self) -> None:
+        class _Api:
+            def __init__(self, value):
+                self.value = value
+
+            def __call__(self, *args):
+                return self.value
+
+        class _Kernel:
+            GetFileType = _Api(0)
+            GetFileInformationByHandle = _Api(False)
+
+        with patch("ctypes.WinDLL", return_value=_Kernel()):
+            with self.assertRaises(OSError):
+                host_composition_module._windows_file_metadata(1)
+
+    def test_revocation_token_direct_workspace_path_is_rejected(self) -> None:
+        workspace_token = Path(self.workspace.name) / "direct-workspace-token"
+        workspace_token.write_bytes(b"DIRECT_WORKSPACE_TOKEN_SENTINEL")
+        self._assert_token_rejected(workspace_token, "DIRECT_WORKSPACE_TOKEN_SENTINEL")
+
+    @unittest.skipUnless(os.name == "nt", "Windows opened-object identity contract")
+    def test_revocation_token_external_object_substitution_is_rejected(self) -> None:
+        first = Path(self.keys.name) / "token-a"
+        second = Path(self.keys.name) / "token-b"
+        first.write_bytes(b"TOKEN_A_SENTINEL")
+        second.write_bytes(b"TOKEN_B_SENTINEL")
+        original = host_composition_module._windows_open_token_object
+        calls = 0
+
+        def substitute(path: str):
+            nonlocal calls
+            calls += 1
+            return original(path if calls == 1 else str(second))
+
+        with patch.object(host_composition_module, "_windows_open_token_object", side_effect=substitute):
+            self._assert_token_rejected(first, "TOKEN_A_SENTINEL", "TOKEN_B_SENTINEL")
+        self.assertEqual(calls, 2)
+
+    @unittest.skipUnless(os.name == "nt", "Windows handle replacement contract")
+    def test_revocation_token_open_handle_prevents_path_replacement_during_read(self) -> None:
+        path = Path(self.keys.name) / "handle-stability-token"
+        path.write_bytes(b"HANDLE_STABILITY_TOKEN_SENTINEL")
+        fd, _metadata = host_composition_module._windows_open_token_object(str(path))
+        try:
+            replacement = path.with_name("handle-stability-replacement")
+            with self.assertRaises(OSError):
+                os.replace(path, replacement)
+            os.lseek(fd, 0, os.SEEK_SET)
+            self.assertEqual(os.read(fd, 4097), b"HANDLE_STABILITY_TOKEN_SENTINEL")
+        finally:
+            os.close(fd)
 
     def _composition_rejects_parent_swap(self, role: str, target_bytes: bytes, *, expected_posts: int) -> None:
         workspace = Path(self.workspace.name)
