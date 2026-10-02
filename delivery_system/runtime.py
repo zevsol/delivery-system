@@ -3772,6 +3772,15 @@ class RuntimeApplicationStatusService:
             "integrity_status": "verified",
         }
 
+    def get_status_by_approved_context(
+        self, preview_id: str, revision: int, approval_id: str, approval_digest: str,
+    ) -> dict[str, Any]:
+        """Recover the existing status projection from the exact Apply context."""
+        application_id = self.execution_store.resolve_application_id_by_approved_context(
+            preview_id, revision, approval_id, approval_digest,
+        )
+        return self.get_status(application_id)
+
 
 class ApplicationPostconditionObservation:
     """Runtime-owned, read-only observation of an OutcomeUnknown relationship."""

@@ -19,7 +19,7 @@ dependencies:
       transport: "stdio"
     - type: "mcp"
       value: "delivery_get_application_status"
-      description: "Read bounded durable Application status and recovery evidence; it does not retry, resume, reconcile, or write to GitHub"
+      description: "Read bounded durable Application status and recovery evidence; recover a lost Apply result from exact approved context; it does not retry, resume, reconcile, or write to GitHub"
       transport: "stdio"
     - type: "mcp"
       value: "delivery_observe_application_postcondition"

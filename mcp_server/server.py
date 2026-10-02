@@ -13,7 +13,7 @@ from mcp.server.mcpserver.context import Context
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.shared.exceptions import MCPError
 from mcp.types import INVALID_PARAMS, CallToolRequestParams, CallToolResult, TextContent, ToolAnnotations
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, StrictInt, StrictStr, ValidationError
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, StrictInt, StrictStr, ValidationError, model_validator
 
 from delivery_system.runtime import (
     ApplicationPostconditionObservation, AuditContextService, RuntimeApplicationStatusService,
@@ -338,7 +338,28 @@ class AttemptStatusOutput(StrictModel):
 
 
 class GetApplicationStatusInput(StrictModel):
-    application_id: ApplicationIdInput
+    application_id: ApplicationIdInput | None = None
+    preview_id: StrictStr | None = Field(default=None, min_length=1)
+    revision: StrictInt | None = Field(default=None, ge=1)
+    approval_id: StrictStr | None = Field(default=None, min_length=1)
+    approval_digest: StrictStr | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def validate_lookup_mode(self) -> "GetApplicationStatusInput":
+        context_fields = ("preview_id", "revision", "approval_id", "approval_digest")
+        context_present = all(
+            value is not None
+            for value in (self.preview_id, self.revision, self.approval_id, self.approval_digest)
+        )
+        application_field_present = "application_id" in self.model_fields_set
+        context_field_present = any(field in self.model_fields_set for field in context_fields)
+        if self.application_id is not None:
+            if context_field_present:
+                raise ValueError("application_status_input_invalid")
+            return self
+        if application_field_present or not context_present:
+            raise ValueError("application_status_input_invalid")
+        return self
 
 
 class ObserveApplicationPostconditionInput(StrictModel):
@@ -620,16 +641,22 @@ def create_server(context: RuntimeContext | None = None, store: Any | None = Non
 
     @mcp.tool(
         name="delivery_get_application_status",
-        description=("Read durable application execution status and bounded recovery evidence for an existing "
-                      "application; it never retries, resumes, reobserves GitHub, transitions application state, "
-                      "or performs a GitHub write."),
+        description=("Read durable application execution status and bounded recovery evidence by known Application "
+                      "ID or exact approved context after a lost Apply result; it never retries, resumes, "
+                      "reconciles, reobserves GitHub, transitions application state, or performs a GitHub write."),
         annotations=ToolAnnotations(read_only_hint=True, destructive_hint=False, open_world_hint=False),
         structured_output=True,
     )
     def delivery_get_application_status(payload: GetApplicationStatusInput) -> ApplicationStatusOutput:
         if context is None or store is None or execution_store is None:
             raise ValueError("application_status_boundary_unavailable")
-        status = RuntimeApplicationStatusService(context, store, execution_store).get_status(payload.application_id)
+        service = RuntimeApplicationStatusService(context, store, execution_store)
+        if payload.application_id is not None:
+            status = service.get_status(payload.application_id)
+        else:
+            status = service.get_status_by_approved_context(
+                payload.preview_id, payload.revision, payload.approval_id, payload.approval_digest,
+            )
         return ApplicationStatusOutput.model_validate(status)
 
     @mcp.tool(
