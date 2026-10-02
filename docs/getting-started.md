@@ -1,6 +1,14 @@
 # Getting Started
 
-This guide is for a developer using a source checkout of Delivery System with a local stdio MCP host. The first objective is a safe, Preview-only planning result. It does not establish Install Tested, Host Tested, Integration Tested, or Released evidence.
+This guide is for a developer using a source checkout of Delivery System with a local stdio MCP host. The first objective is a safe, Preview-only planning result. This source-checkout path does not itself establish Host Tested, external Integration Tested, or Released evidence.
+
+## First-release artifact model
+
+The bounded first-release artifact model is Install Tested on Windows 11 / CPython 3.14.6. The Python Runtime is delivered in a `delivery-system` wheel, while the four user-facing Skills are delivered in a release-owned Skills plugin artifact. The plugin artifact owns Skill instructions and plugin identity; it does not deploy the Runtime or contain credentials.
+
+The selected MCP Host will separately connect the installed `delivery-system-mcp` console entrypoint through local stdio configuration. The plugin artifact does not contain a portable local executable command or remote MCP configuration. Public Plugin Directory publication is not required for the local/self-hosted first release.
+
+The repository remains source-usable prototype software. The artifact/install boundary is evidenced at the stated Windows/Python environment, while Host Tested, external Integration Tested, and formal Released status remain pending. No downloadable or published artifact is claimed.
 
 ## Prerequisites
 
@@ -132,6 +140,6 @@ The optional `--host-profile github-app-write` server argument selects that writ
 
 ## Evidence boundary
 
-Source code and deterministic local tests establish the source-run path. They do not establish a published package, formal installer, upgrade/uninstall lifecycle, Host Tested integration, external Integration Tested release, or formal Release status.
+Source code and deterministic local tests establish the source-run path. The separately verified artifact boundary establishes Install Tested evidence for the stated Windows/Python environment, but does not establish a published package, Host Tested integration, external Integration Tested release, or formal Release status.
 
 For maintainer context, see [Architecture and lifecycle](architecture-and-lifecycle.md) and the [Debt register](debt-register.md).

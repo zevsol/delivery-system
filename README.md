@@ -40,7 +40,7 @@ ApplicationAuthority, attestation, receipts, digests, and other integrity detail
 
 ## Current status
 
-Delivery System is currently source-usable prototype software. It is not currently claimed as Install Tested, Host Tested, an externally Integration Tested release, or formally Released. Host credential/bootstrap configuration, installation lifecycle, and formal release packaging remain outside the verified capability boundary.
+Delivery System remains source-usable prototype software. Its bounded first-release artifact model is Install Tested on Windows 11 / CPython 3.14.6 for the Runtime wheel and release-owned Skills/plugin artifact. It is not Host Tested, not externally Integration Tested, and not formally Released. Host credential/bootstrap configuration, Host evidence, external integration evidence, and formal release authorization remain outside the verified boundary.
 
 ## Compatibility
 

@@ -243,7 +243,9 @@ class ReleaseCompatibilityContractTests(unittest.TestCase):
         self.assertIn("[Release compatibility](docs/release-compatibility.md)", readme)
         self.assertIn("[Release compatibility](release-compatibility.md)", architecture)
         self.assertIn("source-usable prototype software", readme)
-        self.assertIn("not currently claimed as Install Tested", readme)
+        self.assertIn("Install Tested on Windows 11 / CPython 3.14.6", readme)
+        self.assertIn("not Host Tested", readme)
+        self.assertIn("not externally Integration Tested", readme)
         self.assertIn("not formally Released", readme)
 
 

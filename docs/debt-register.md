@@ -62,15 +62,6 @@ Every entry has Category, Status, Risk, Why deferred / rationale, Constraints pr
 - Review point: Before portability work.
 - Decision/owner state: Architecture decision required.
 
-### ARC-INSTALL-LIFECYCLE-01 — Install, upgrade, uninstall
-- Category: Release/CI; Status: Deferred; Risk: Medium
-- Why deferred / rationale: Packaging is not a complete operator lifecycle.
-- Constraints preserved: Do not claim install testing or release readiness.
-- Evidence/reference: `pyproject.toml`; README evidence-level policy.
-- Reconsideration trigger: Release preparation.
-- Review point: Before first release.
-- Decision/owner state: Release decision required.
-
 ### SEC-REVOCATION-TEST-01 — Revocation 1 MiB test coverage
 - Category: Security; Status: Deferred; Risk: Low
 - Why deferred / rationale: Boundary exists; maximum-payload automated coverage remains absent.
@@ -136,6 +127,15 @@ Every entry has Category, Status, Risk, Why deferred / rationale, Constraints pr
 
 ## Resolved and superseded entries
 
+### ARC-INSTALL-LIFECYCLE-01 — Install, upgrade, uninstall
+- Category: Release/CI; Status: Resolved; Risk: Medium
+- Why deferred / rationale: Resolved for the bounded first-release MODEL B artifact/install lifecycle: Runtime wheel plus release-owned Skills/plugin artifact, metadata-owned installed identity, deterministic artifact construction, real wheel/sdist/plugin production, extracted Official Validator success (4/4), clean wheel installation, stdio initialize, exact nine-tool discovery, Preview-only operation, same-release SQLite backup/restore, Runtime uninstall with workspace/plugin preservation, exact-wheel reinstall, and same-workspace reopen on Windows 11 / CPython 3.14.6.
+- Constraints preserved: This resolution does not establish a formal release declaration, publication/upload, public Plugin Directory distribution, Host Tested, external Integration Tested, cross-release upgrade, downgrade, workspace portability, cross-machine restore, broader OS/Python support, or installer-owned credential/ACL lifecycle.
+- Evidence/reference: `delivery_system/release_identity.py`; `delivery_system/sqlite_maintenance.py`; `mcp_server/server.py`; `tools/build_release_artifacts.py`; `tests/v1/test_release_identity_contract.py`; `tests/v1/test_release_artifact_contract.py`; `tests/v1/test_release_compatibility_contract.py`; `docs/getting-started.md`; `docs/release-compatibility.md`; D3 real artifact, Official Validator, install, backup/restore, uninstall, reinstall, and reopen evidence.
+- Reconsideration trigger: Release artifact model change, installer technology introduction, supported OS/Python matrix expansion, cross-release upgrade support, workspace relocation or portable restore, plugin ownership-model change, or Runtime/plugin uninstall ownership change.
+- Review point: Before changing the bounded first-release artifact/install contract or activating Host Tested, external Integration Tested, or formal release work.
+- Decision/owner state: The bounded first-release installation lifecycle is resolved and closed. Broader release, Host, integration, portability, upgrade, and publication decisions remain separately owned.
+
 ### SEC-TOKEN-REPARSE-01 — Token-file reparse hardening
 - Category: Security; Status: Resolved; Risk: Medium
 - Why deferred / rationale: Resolved by Windows handle-first protected token opening, opened-file identity binding, workspace-control validation against the actual handle, regular disk-file enforcement, exactly one hard link, bounded 1..4096-byte input, complete exact read, stable post-read metadata, fail-closed workspace symlink/junction/hard-link/substitution cases, and preserved POSIX no-follow behavior with secret-safe error mapping.
@@ -152,7 +152,7 @@ Every entry has Category, Status, Risk, Why deferred / rationale, Constraints pr
 - Evidence/reference: `delivery_system/execution_store.py`; `delivery_system/runtime.py`; `mcp_server/server.py`; `tests/v1/test_pc2d_application_status.py`; `skills/apply-github-work-items/SKILL.md`; `docs/user-workflow.md`; `docs/architecture-and-lifecycle.md`.
 - Reconsideration trigger: Long-lived operator deployment, a requirement for fleet monitoring or remote collection, a new recovery action, or a need to enumerate durable recovery items.
 - Review point: Before first release and before expanding beyond bounded stdio/operator recovery.
-- Decision/owner state: Bounded first-release observability is resolved. `GOV-DIAG-TELEMETRY-01` remains Deferred; `GOV-EVIDENCE-LIFECYCLE-01` remains Open; `ARC-INSTALL-LIFECYCLE-01` and `ARC-HARNESS-01` remain Deferred.
+- Decision/owner state: Bounded first-release observability is resolved. `GOV-DIAG-TELEMETRY-01` remains Deferred; `GOV-EVIDENCE-LIFECYCLE-01` remains Open; `ARC-INSTALL-LIFECYCLE-01` is resolved for bounded first-release install/uninstall/same-release reinstall; `ARC-HARNESS-01` remains Deferred.
 
 ### ARC-SQLITE-COMPAT-01 — SQLite upgrade and rollback compatibility
 - Category: Architecture; Status: Resolved; Risk: High
@@ -224,7 +224,7 @@ Every entry has Category, Status, Risk, Why deferred / rationale, Constraints pr
 - Evidence/reference: `delivery_system/ed25519_lifecycle.py`; `delivery_system/host_composition.py`; `delivery_system/github_app_bootstrap.py`; `delivery_system/github_app_credential.py`; `delivery_system/host_revocation.py`; `delivery_system/restart_credential_verification.py`; `delivery_system/runtime.py`; `docs/host-configuration.md`; `docs/architecture-and-lifecycle.md`; relevant lifecycle/Host/bootstrap/restart tests; PR #56 and its accepted PR/post-merge CI evidence; PR #58 and its accepted PR/post-merge CI evidence.
 - Reconsideration trigger: Automatic key rotation, live reload, automatic installation-token renewal/reacquisition, per-write revocation freshness, provider-side GitHub revocation integration, durable transition history, different credential-instance rebinding semantics, or a new key/trust role becomes a product requirement.
 - Review point: Before changing those lifecycle boundaries or before a production rollout that requires capabilities outside the bounded resolution.
-- Decision/owner state: The bounded first-release key/credential lifecycle contract is resolved. `ARC-INSTALL-LIFECYCLE-01`, `SEC-TOKEN-REPARSE-01` (resolved for bounded revocation-token file hardening), `SEC-REVOCATION-TEST-01`, `GOV-EVIDENCE-LIFECYCLE-01`, and unrelated recovery/observability debts remain separately owned and retain their existing statuses.
+- Decision/owner state: The bounded first-release key/credential lifecycle contract is resolved. `ARC-INSTALL-LIFECYCLE-01` is resolved for bounded first-release install/uninstall/same-release reinstall; `SEC-TOKEN-REPARSE-01` is resolved for bounded revocation-token file hardening; `SEC-REVOCATION-TEST-01`, `GOV-EVIDENCE-LIFECYCLE-01`, and unrelated recovery/observability debts remain separately owned with their existing statuses.
 
 ### GOV-CURRENT-HEAD-DATAMODEL-01 — Current implementation inspection
 - Category: Governance; Status: Resolved; Risk: Medium
