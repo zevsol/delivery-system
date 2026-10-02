@@ -140,6 +140,7 @@ class HostConfigurationContractTests(unittest.TestCase):
     def test_github_app_fresh_composition_continuity_contract_is_documented(self) -> None:
         host_document = Path("docs/host-configuration.md").read_text(encoding="utf-8")
         architecture_document = Path("docs/architecture-and-lifecycle.md").read_text(encoding="utf-8")
+        debt_document = Path("docs/debt-register.md").read_text(encoding="utf-8")
         host_document = host_document.lower()
         for phrase in (
             "github app fresh-composition continuity",
@@ -154,17 +155,39 @@ class HostConfigurationContractTests(unittest.TestCase):
             with self.subTest(document="host", phrase=phrase):
                 self.assertIn(phrase, host_document)
         architecture_document = architecture_document.lower()
+        debt_document = debt_document.lower()
         for phrase in (
             "fresh-composition github app continuity is supported",
-            "no persistent github app key lifecycle state",
+            "no persistent app-key history",
             "no simultaneous multi-key runtime",
             "no universal keymanager",
-            "no provider-revocation redesign",
-            "installation-token lifecycle remains separately owned",
-            "`arc-key-lifecycle-01` remains open",
+            "no live reload",
+            "no automatic app-key rotation",
+            "no automatic rollback or failover",
+            "one acquisition per fresh composition",
+            "expired lease fails closed before write dispatch",
+            "no automatic renewal or reacquisition",
+            "fresh composition obtains a fresh lease and credential instance",
+            "initial attestation checks external revocation status",
+            "restart reconstruction checks it again",
+            "do not promise per-write external revocation polling",
+            "does not revoke a github installation token through github",
+            "delete or revoke an app private key",
+            "durable key-transition history is not required",
+            "no transition ledger is introduced",
+            "`arc-key-lifecycle-01` is resolved for this bounded first-release contract",
         ):
             with self.subTest(document="architecture", phrase=phrase):
                 self.assertIn(phrase, architecture_document)
+        self.assertNotIn("`arc-key-lifecycle-01` remains open", architecture_document)
+        self.assertRegex(
+            debt_document,
+            r"### arc-key-lifecycle-01 — key rotation and recovery\s+- category: security; status: resolved;",
+        )
+        self.assertNotRegex(
+            debt_document,
+            r"### arc-key-lifecycle-01 — key rotation and recovery\s+- category: security; status: open;",
+        )
 
 
 if __name__ == "__main__":

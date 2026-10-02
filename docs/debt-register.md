@@ -80,15 +80,6 @@ Every entry has Category, Status, Risk, Why deferred / rationale, Constraints pr
 - Review point: Before first release.
 - Decision/owner state: Architecture decision required.
 
-### ARC-KEY-LIFECYCLE-01 — Key rotation and recovery
-- Category: Security; Status: Open; Risk: High
-- Why deferred / rationale: Key roles and trust validation exist; rotation/replacement/recovery does not.
-- Constraints preserved: Never record secrets in documentation.
-- Evidence/reference: `delivery_system/host_composition.py`.
-- Reconsideration trigger: Production operator rollout or key change.
-- Review point: Before production rollout.
-- Decision/owner state: Security/operator decision required.
-
 ### ARC-INSTALL-LIFECYCLE-01 — Install, upgrade, uninstall
 - Category: Release/CI; Status: Deferred; Risk: Medium
 - Why deferred / rationale: Packaging is not a complete operator lifecycle.
@@ -225,6 +216,15 @@ Every entry has Category, Status, Risk, Why deferred / rationale, Constraints pr
 - Reconsideration trigger: Changes to production Host startup/run/shutdown ownership, composition resource lifetime, restart semantics, or the server execution boundary.
 - Review point: Before changing those lifecycle boundaries.
 - Decision/owner state: The bounded Host process lifecycle contract is resolved. Remaining deployment/install, observability, key, SQLite disaster-recovery, reusable harness, and diagnostic telemetry concerns remain with their existing debt owners.
+
+### ARC-KEY-LIFECYCLE-01 — Key rotation and recovery
+- Category: Security; Status: Resolved; Risk: High
+- Why deferred / rationale: Resolved by the bounded first-release key and credential lifecycle contract comprising role-scoped Ed25519 lifecycle policy and trust projection, GitHub App fresh-composition replacement-key continuity, fail-closed installation-token expiry, credential-instance-bound authority/provenance, external revocation checks during initial attestation and restart reconstruction, and explicit secret non-persistence boundaries.
+- Constraints preserved: Resolution does not establish automatic Ed25519 or GitHub App key rotation, live key reload, automatic failover or rollback, automatic installation-token renewal/reacquisition, provider-side GitHub key/token revocation, per-write external revocation polling, durable key-transition history, secret persistence, a universal KeyManager, or complete incident-response automation.
+- Evidence/reference: `delivery_system/ed25519_lifecycle.py`; `delivery_system/host_composition.py`; `delivery_system/github_app_bootstrap.py`; `delivery_system/github_app_credential.py`; `delivery_system/host_revocation.py`; `delivery_system/restart_credential_verification.py`; `delivery_system/runtime.py`; `docs/host-configuration.md`; `docs/architecture-and-lifecycle.md`; relevant lifecycle/Host/bootstrap/restart tests; PR #56 and its accepted PR/post-merge CI evidence; PR #58 and its accepted PR/post-merge CI evidence.
+- Reconsideration trigger: Automatic key rotation, live reload, automatic installation-token renewal/reacquisition, per-write revocation freshness, provider-side GitHub revocation integration, durable transition history, different credential-instance rebinding semantics, or a new key/trust role becomes a product requirement.
+- Review point: Before changing those lifecycle boundaries or before a production rollout that requires capabilities outside the bounded resolution.
+- Decision/owner state: The bounded first-release key/credential lifecycle contract is resolved. `ARC-INSTALL-LIFECYCLE-01`, `SEC-TOKEN-REPARSE-01`, `SEC-REVOCATION-TEST-01`, `GOV-EVIDENCE-LIFECYCLE-01`, and unrelated recovery/observability debts remain separately owned and retain their existing statuses.
 
 ### GOV-CURRENT-HEAD-DATAMODEL-01 — Current implementation inspection
 - Category: Governance; Status: Resolved; Risk: Medium
