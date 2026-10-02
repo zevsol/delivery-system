@@ -75,6 +75,16 @@ Without a lifecycle manifest, bounded legacy mode derives the configured active 
 
 Lifecycle activation is fresh-process-only. Pure Ed25519 material/trust preflight performs parsing, public/private matching, lifecycle validation, effective trust projection, role checks, and a non-secret sign/verify self-check. It does not start a second Host, open SQLite, acquire an installation lease, or reload a running process. A failed preflight stops the new composition closed. Only when the previous process is still running and healthy, its material remains usable, and that material has not been compromised may an operator use it as a manual rollback boundary; no automatic fallback or rollback occurs.
 
+## GitHub App fresh-composition continuity
+
+The bounded `G1 → G2` procedure supports normal GitHub App key rotation through a fresh process composition. The GitHub App owner or administrator provisions G2 and owns provider-side deletion or revocation of G1. During normal rotation, G1 should remain available while the operator validates G2; this is an operator-controlled continuity boundary, not a Delivery System failover mechanism.
+
+The operator must configure a fresh Delivery System process with G2's protected key path. G2 is validated through the complete existing GitHub App bootstrap path: App identity, owner and repository identity, installation identity, repository scope, required permissions, token scope, and lease expiry are checked. A successful installation lease must be acquired before the new Host becomes operational. Failed G2 composition fails closed, with no operational HostComposition and no automatic fallback to G1 or to the disabled/default profile.
+
+Normal rotation and compromise are different operator situations. For normal rotation, a previously healthy G1 process may remain available while its existing lease remains valid. If G1 is compromised, do not use that process as a continuity boundary; the GitHub App owner or administrator must handle provider-side containment and deletion. Delivery System does not claim full provider-side compromise recovery, does not invoke provider installation-token revocation, and does not guarantee that deleting G1 immediately invalidates an already-issued installation token. An installation token is distinct from the App private key.
+
+This contract is fresh-composition-only. There is no live reload, automatic App-key rotation, App-key history, or automatic rollback or failover. There is no automatic installation-token renewal/reacquisition loop. RSA private-key material remains external and non-persistent; installation-token secret material is likewise not persisted in Runtime or workspace state. No claim is made that an already-issued token is revoked merely because provider-side key state changed.
+
 ## Composition result
 
 Successful composition means that inputs were validated, the installation lease was acquired and verified, signing and trust roles were validated, Runtime services were composed, and a sealed `HostComposition` was returned. It does not mean that a GitHub Issue write occurred.

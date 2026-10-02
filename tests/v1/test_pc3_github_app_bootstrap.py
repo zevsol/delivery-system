@@ -367,6 +367,49 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(snapshot.credential_instance_id, instance)
         self.assertEqual([call[0] for call in transport.calls], ["get_app", "get_installation", "create_token", "get_scope", "get_repository"])
 
+    def test_distinct_file_backed_g2_signs_bootstrap_jwt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            g1 = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+            g2 = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+            g1_path = root / "g1.pem"
+            g2_path = root / "g2.pem"
+            g1_path.write_bytes(g1.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.PKCS8,
+                serialization.NoEncryption(),
+            ))
+            g2_path.write_bytes(g2.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.PKCS8,
+                serialization.NoEncryption(),
+            ))
+            config = GitHubAppBootstrapConfig(CONFIG.app_id, CONFIG.repository_identity, CONFIG.repository_id, g2_path)
+            transport = FakeTransport()
+            lease = bootstrap(
+                FileGitHubAppPrivateKeySource(g2_path),
+                transport,
+                config=config,
+                instance_factory=lambda: str(uuid.uuid4()),
+            ).acquire()
+
+            self.assertIs(type(lease), GitHubAppInstallationCredentialLease)
+            app_jwt = transport.calls[0][1]
+            claims = jwt.decode(
+                app_jwt,
+                g2.public_key(),
+                algorithms=["RS256"],
+                options={"verify_exp": False, "verify_iat": False},
+            )
+            self.assertEqual(claims["iss"], str(CONFIG.app_id))
+            with self.assertRaises(jwt.InvalidTokenError):
+                jwt.decode(
+                    app_jwt,
+                    g1.public_key(),
+                    algorithms=["RS256"],
+                    options={"verify_exp": False, "verify_iat": False},
+                )
+
     def test_jwt_claims_are_exact_and_verifiable(self):
         key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         source = FakeSource(key)
