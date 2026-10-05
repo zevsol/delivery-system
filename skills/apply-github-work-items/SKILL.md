@@ -10,19 +10,22 @@ Apply one exact Delivery System Sealed Preview and its approved operation set. A
 ## Preconditions and handoff
 
 - Require the exact `preview_id` and positive integer `revision`.
-- Require the exact successful Human Approval context for that Preview and Revision, including the Runtime-returned `approval_id` and `approval_digest`. Retain the exact `preview_id`, positive `revision`, `approval_id`, and `approval_digest` before invoking Apply. Do not infer approval from conversation agreement, a prior Preview, or a semantic match. If the exact approval context is unavailable, stop and ask the user to complete or provide the approval handoff.
+- Require the exact successful Human Approval context for that Preview and Revision, including the Runtime-returned `approval_id`. Human Approval handoff does not supply `approval_digest`; do not require a caller-known digest at Skill entry. Do not infer approval from conversation agreement, a prior Preview, or a semantic match. If the exact approval context is unavailable, stop and ask the user to complete or provide the approval handoff.
+- Never calculate or derive `approval_digest`, hash an ApprovalRecord outside Runtime, ask the user for it, read raw SQLite to obtain it, or use a model- or Host-generated value.
 - Treat the approval context as proof of which object was approved, not as executable authority. Human Approval remains distinct from ApplicationAuthority and application.
 - Do not ask the user to construct, copy, or manipulate an `ApplicationAuthority` ID. The Skill owns the internal handoff to the existing Runtime support path.
 
 ## Workflow
 
-1. Resolve the exact approved `preview_id`, `revision`, and approval context. Never substitute “latest”, “that one”, or a guessed identifier.
+1. Resolve the exact approved `preview_id`, `revision`, and Runtime-returned `approval_id`. Never substitute “latest”, “that one”, or a guessed identifier.
 2. Call `delivery_get_audit_context` for the exact Preview and Revision. Stop if the context is missing, stale, integrity-invalid, or not suitable for the existing Runtime gate.
-3. Call `delivery_issue_application_authority` internally with the exact approved context. This issues the protected executable authority; it is not a separate user objective and it does not write GitHub.
-4. Pass only the Runtime-returned authority to `delivery_apply_approved_work_items` and invoke the existing bounded Apply path.
-5. Use the returned durable application state and receipt exactly as returned. Do not calculate, replace, or invent Runtime-owned identifiers, digests, states, or recovery values.
+3. Call `delivery_issue_application_authority` internally using exactly `preview_id`, `revision`, and `approval_id`; do not supply `approval_digest`. Runtime independently resolves and validates the durable Approval and its full Preview/Audit binding. This issues the protected executable authority; it is not a separate user objective and it does not write GitHub.
+4. Require a complete, valid Runtime-returned ApplicationAuthority receipt containing a non-empty `approval_digest`. If Authority issuance fails, is stale or integrity-invalid, or the receipt is incomplete or lacks `approval_digest`, stop without calling Apply. Do not derive or substitute a digest.
+5. Immediately after successful Authority issuance and before calling `delivery_apply_approved_work_items`, retain the exact Runtime-owned `preview_id`, `revision`, `approval_id`, and `approval_digest`. The digest source is the Runtime-returned ApplicationAuthority output, not the Approval receipt/status, model or Host calculation, user input, or SQLite inspection. Retain these four values as the lost-result recovery context.
+6. Pass only the Runtime-returned ApplicationAuthority to `delivery_apply_approved_work_items` and invoke the existing bounded Apply path.
+7. Use the returned durable application state and receipt exactly as returned. Do not calculate, replace, or invent Runtime-owned identifiers, digests, states, or recovery values.
 
-If the Apply response is lost or ambiguous before the Application ID is safely handed off, do not invoke Apply again. Call `delivery_get_application_status` with the retained exact `preview_id`, `revision`, `approval_id`, and `approval_digest`. Interpret the returned Runtime-owned status without retry, resume, or reconciliation. Do not invent an Application ID, enumerate workspace state, or inspect raw SQLite. If the lookup returns `application_not_found`, state only that no matching durable Application was found; do not claim that Apply did not run or that GitHub was not mutated.
+If the Apply response is lost or ambiguous before the Application ID is safely handed off, do not invoke Apply again. Use the exact `preview_id`, `revision`, `approval_id`, and `approval_digest` retained immediately after successful ApplicationAuthority issuance and before Apply dispatch. Call `delivery_get_application_status` with exactly those four values. Interpret the returned Runtime-owned status without retry, resume, or reconciliation. Do not derive the digest later, issue another Authority merely to recover it, invent an Application ID, enumerate workspace state, or inspect raw SQLite. If the lookup returns `application_not_found`, state only that no matching durable Application was found; do not claim that Apply did not run or that GitHub was not mutated.
 
 ## Responsibility boundary
 
@@ -46,7 +49,7 @@ The user-facing result must distinguish Approval from Application, and definitiv
 
 ## Status inspection
 
-- When a user asks to inspect an existing application or its retained recovery evidence, call `delivery_get_application_status` with the exact Runtime-returned `application_id`. If the Apply result was lost before that ID was handed off, use the retained exact approved context (`preview_id`, `revision`, `approval_id`, and `approval_digest`) with the same status tool.
+- When a user asks to inspect an existing application or its retained recovery evidence, call `delivery_get_application_status` with the exact Runtime-returned `application_id`. If the Apply result was lost before that ID was handed off, use the exact four-field context (`preview_id`, `revision`, `approval_id`, and `approval_digest`) retained from the Runtime ApplicationAuthority receipt before Apply dispatch with the same status tool.
 - Report only the Runtime-owned safe projection. Do not expose raw remote results, canonical operations, authority or credential data, or arbitrary persisted payloads.
 - Status inspection is read-only. Never retry, resume, reobserve GitHub, reconcile, transition application state, or mutate remote state.
 - A missing context match means only that no matching durable Application was found. It does not prove that the remote operation did not occur and does not authorize another Apply attempt.
