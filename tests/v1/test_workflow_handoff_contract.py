@@ -11,6 +11,7 @@ class WorkflowHandoffContractTests(unittest.TestCase):
         cls.readme = (ROOT / "README.md").read_text(encoding="utf-8")
         cls.getting_started = (ROOT / "docs" / "getting-started.md").read_text(encoding="utf-8")
         cls.workflow = (ROOT / "docs" / "user-workflow.md").read_text(encoding="utf-8")
+        cls.architecture = (ROOT / "docs" / "architecture-and-lifecycle.md").read_text(encoding="utf-8")
 
     def test_public_workflow_owner_and_entry_links(self):
         self.assertTrue((ROOT / "docs" / "user-workflow.md").is_file())
@@ -88,6 +89,35 @@ class WorkflowHandoffContractTests(unittest.TestCase):
             "批准写入 {preview_id} {revision}",
         ):
             self.assertIn(phrase, self.workflow)
+
+    def test_approval_and_authority_digest_handoffs_are_distinct(self):
+        approval = self.workflow[
+            self.workflow.index("## 3. Human Approval"):
+            self.workflow.index("## 4. Apply")
+        ]
+        apply = self.workflow[
+            self.workflow.index("## 4. Apply"):
+            self.workflow.index("## Result and Recovery")
+        ]
+        self.assertIn("Human Approval handoff consists of `preview_id`, `revision`, and `approval_id`", apply)
+        self.assertIn("it does not supply `approval_digest`", apply)
+        self.assertIn("Runtime-returned ApplicationAuthority receipt supplies the Runtime-owned `approval_digest`", apply)
+        self.assertIn("before Apply dispatch", apply)
+        self.assertIn("model, Host, and user do not calculate or provide it", apply)
+        self.assertIn("do not expect or request `approval_digest`", approval)
+        self.assertIn("ApplicationAuthority is internal to the Skill, not a separate user-facing stage", apply)
+        self.assertIn("Runtime ApplicationAuthority issuance independently resolves and validates the durable Approval", self.architecture)
+        self.assertIn("canonical source for retaining the digest before Apply dispatch", self.architecture)
+
+    def test_lost_apply_uses_retained_four_field_authority_context_without_retry(self):
+        recovery = self.workflow[
+            self.workflow.index("### Apply response lost before Application ID handoff"):
+            self.workflow.index("## Terminology")
+        ]
+        self.assertIn("Do not call Apply again", recovery)
+        self.assertIn("`preview_id`, `revision`, `approval_id`, and `approval_digest` retained from the Runtime-returned ApplicationAuthority receipt before Apply dispatch", recovery)
+        self.assertIn("with those four fields and without an `application_id`", recovery)
+        self.assertNotIn("from the approved handoff", recovery)
 
     def test_effect_boundaries_and_apply_scope_are_explicit(self):
         for phrase in (

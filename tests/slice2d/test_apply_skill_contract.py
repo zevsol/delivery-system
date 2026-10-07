@@ -73,6 +73,13 @@ class ApplySkillContractTests(unittest.TestCase):
         preconditions = self.section(self.skill, "Preconditions and handoff")
         self.assertIn("exact `preview_id` and positive integer `revision`", preconditions)
         self.assertIn("exact successful Human Approval context", preconditions)
+        self.assertIn("Runtime-returned `approval_id`", preconditions)
+        self.assertIn("Human Approval handoff does not supply `approval_digest`", preconditions)
+        self.assertNotIn("`approval_id` and `approval_digest`", preconditions)
+        self.assertIn("Never calculate or derive `approval_digest`", preconditions)
+        self.assertIn("hash an ApprovalRecord outside Runtime", preconditions)
+        self.assertIn("ask the user for it", preconditions)
+        self.assertIn("model- or Host-generated value", preconditions)
         self.assertNotIn("Require the exact `application_authority_id`", preconditions)
         self.assertNotIn("Ask the user to construct", preconditions)
 
@@ -84,7 +91,16 @@ class ApplySkillContractTests(unittest.TestCase):
         self.assertLess(context, issue)
         self.assertLess(issue, apply)
         self.assertIn("Call `delivery_issue_application_authority` internally", workflow)
-        self.assertIn("Pass only the Runtime-returned authority", workflow)
+        authority_call = workflow[issue:]
+        self.assertIn("using exactly `preview_id`, `revision`, and `approval_id`", authority_call)
+        self.assertIn("do not supply `approval_digest`", authority_call)
+        self.assertIn("Require a complete, valid Runtime-returned ApplicationAuthority receipt", authority_call)
+        self.assertIn("non-empty `approval_digest`", authority_call)
+        self.assertIn("stop without calling Apply", authority_call)
+        self.assertIn("Immediately after successful Authority issuance", authority_call)
+        self.assertIn("before calling `delivery_apply_approved_work_items`", authority_call)
+        self.assertIn("Runtime-returned ApplicationAuthority output", authority_call)
+        self.assertIn("Pass only the Runtime-returned ApplicationAuthority", authority_call)
         self.assertIn("Do not ask the user to construct, copy, or manipulate an `ApplicationAuthority` ID", self.skill)
         self.assertIn("not a separate user objective", workflow)
         self.assertNotIn("delivery_record_approval", self.metadata)
@@ -137,6 +153,9 @@ class ApplySkillContractTests(unittest.TestCase):
             "Do not perform built-in remote reconciliation or remote reobservation",
         ):
             self.assertIn(phrase, recovery)
+        self.assertIn("Call `delivery_get_application_status` with exactly those four values", self.skill)
+        self.assertIn("`preview_id`, `revision`, `approval_id`, and `approval_digest` retained immediately after successful ApplicationAuthority issuance", self.skill)
+        self.assertIn("do not invoke Apply again", self.skill)
 
     def test_status_inspection_is_read_only_and_non_reconciling(self):
         status = self.section(self.skill, "Status inspection")
@@ -195,8 +214,14 @@ class ApplySkillContractTests(unittest.TestCase):
 
     def test_approval_remains_separate_and_recovery_is_not_application(self):
         preconditions = self.section(self.skill, "Preconditions and handoff")
+        workflow = self.section(self.skill, "Workflow")
         recovery = self.section(self.skill, "Result and recovery")
         self.assertIn("Human Approval remains distinct from ApplicationAuthority and application", preconditions)
+        self.assertLess(workflow.index("retain the exact Runtime-owned"), workflow.rindex("delivery_apply_approved_work_items"))
+        self.assertIn("retained immediately after successful ApplicationAuthority issuance", self.skill)
+        self.assertIn("Do not derive the digest later", self.skill)
+        self.assertIn("issue another Authority merely to recover it", self.skill)
+        self.assertIn("do not invoke Apply again", self.skill)
         self.assertIn("distinguish Approval from Application", self.skill)
         self.assertIn("definitive success or failure from recovery-required", self.skill)
         self.assertNotIn("OutcomeUnknown result is Applied", recovery)

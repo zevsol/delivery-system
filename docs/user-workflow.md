@@ -93,6 +93,7 @@ After successful Approval:
 - state that no GitHub mutation occurred;
 - state that ApplicationAuthority was not issued;
 - preserve the exact `approval_id`, `preview_id`, and `revision`;
+- do not expect or request `approval_digest` from the Approval receipt or Approval Status;
 - explain that Apply is a separate user job.
 
 If the user explicitly chooses to execute the approved work, the next user-facing Skill is:
@@ -105,7 +106,9 @@ Do not invoke Apply automatically because Approval succeeded.
 
 Apply is the GitHub-write boundary. It may mutate GitHub Issues only within the exact operation set represented by the current approved Preview and validated by Runtime.
 
-Apply requires the exact approved Preview, Revision, and successful Approval context. The Skill obtains ApplicationAuthority internally through Runtime. Users must not construct, copy, or manipulate ApplicationAuthority identifiers.
+Apply requires the exact approved Preview, Revision, and successful Human Approval context. The Human Approval handoff consists of `preview_id`, `revision`, and `approval_id`; it does not supply `approval_digest`. The Apply Skill calls Runtime with those three values to obtain ApplicationAuthority. Runtime independently validates the durable Approval and its bindings. ApplicationAuthority is internal to the Skill, not a separate user-facing stage, and users must not construct, copy, or manipulate ApplicationAuthority identifiers.
+
+The Runtime-returned ApplicationAuthority receipt supplies the Runtime-owned `approval_digest`. Immediately after Authority issuance and before Apply dispatch, the Skill retains the exact `preview_id`, `revision`, `approval_id`, and `approval_digest`. The Authority receipt is the source of the digest; the model, Host, and user do not calculate or provide it.
 
 Apply does not authorize arbitrary GitHub writes and does not expand the approved operation set.
 
@@ -129,7 +132,7 @@ Automatic retry is not authorized:
 If the Apply response is lost or becomes ambiguous before the Application ID is safely handed off:
 
 1. Do not call Apply again.
-2. Retain the exact `preview_id`, `revision`, `approval_id`, and `approval_digest` from the approved handoff.
+2. Use the exact `preview_id`, `revision`, `approval_id`, and `approval_digest` retained from the Runtime-returned ApplicationAuthority receipt before Apply dispatch.
 3. Call the existing `delivery_get_application_status` tool with those four fields and without an `application_id`.
 4. If status is recovered, follow the existing state and recovery semantics above.
 5. If the tool returns `application_not_found`, report only that no matching durable Application was found.
