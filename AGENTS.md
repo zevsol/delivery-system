@@ -355,9 +355,28 @@ At completion of every gate, including read-only gates:
 3. Flush/close the file successfully.
 4. Read the file back from disk.
 5. Verify the read-back report contains the current exact gate ID and final verdict.
-6. Emit the read-back file contents as the final console response.
 
-The console final report and `.dev/codex-last-report.md` MUST NOT be independently generated.
+### Canonical report ownership
+
+The complete, independently reviewable final gate report MUST exist in:
+
+`.dev/codex-last-report.md`
+
+The report MUST contain all material findings, evidence, validation results, blockers, mutation inventory, and next-gate recommendation. Material findings and reconciliation evidence MUST NOT appear exclusively in the console response.
+
+### Console output
+
+After successful persistence and verification, the final console response MUST be short and contain only:
+
+```text
+GATE: <gate-id>
+VERDICT: <verdict>
+REPORT: <absolute canonical report path>
+SHA256: <verified report SHA-256>
+READBACK: VERIFIED
+```
+
+Do not duplicate the full Markdown report in the console. Do not append substantive findings, separate review evidence, or a second report after this handoff. The console summary MUST be derived from the verified on-disk report, not independently composed with different findings.
 
 `.dev/codex-last-report.md`:
 
@@ -370,6 +389,16 @@ The console final report and `.dev/codex-last-report.md` MUST NOT be independent
 If write, flush, or read-back verification fails, the gate MUST NOT return its normal PASS verdict. Instead return:
 
 `<CURRENT-GATE-ID> BLOCKED — FINAL REPORT PERSISTENCE FAILED`
+
+Provide the minimum diagnostic information required to identify the persistence failure. Do not falsely claim that a file exists or was verified.
+
+### Intermediate execution output
+
+Tool or command progress may still appear during execution. All decision-relevant results must be captured in the canonical report. Do not rely on transient console output as the only copy of required audit evidence. Do not persist credentials, secrets, or unrestricted raw logs.
+
+### Session boundary
+
+Changes to this `AGENTS.md` govern subsequent Codex sessions. After this governance change, stop and require a new Codex session before resuming Delivery System development.
 
 Any older instruction saying report persistence is merely “permitted”, “optional”, or an allowed handoff is superseded by this contract.
 
