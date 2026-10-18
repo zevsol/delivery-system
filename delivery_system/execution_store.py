@@ -660,3 +660,27 @@ class SQLiteExecutionStore:
         if not receipt.verify_integrity():
             raise ValueError("application_receipt_integrity_invalid")
         return receipt
+
+
+class ReadOnlyExecutionProjectionStore:
+    """Reuse validated execution reads without a writable Store constructor."""
+
+    _load_execution_state = SQLiteExecutionStore._load_execution_state
+    resolve_application_id_by_approved_context = SQLiteExecutionStore.resolve_application_id_by_approved_context
+    get_execution_bootstrap = SQLiteExecutionStore.get_execution_bootstrap
+    get_execution = SQLiteExecutionStore.get_execution
+    get_attempt = SQLiteExecutionStore.get_attempt
+    get_operation_receipt = SQLiteExecutionStore.get_operation_receipt
+    get_application_receipt = SQLiteExecutionStore.get_application_receipt
+
+    def __init__(self, state: Any, workspace_identity: str) -> None:
+        from .read_only_state import ReadOnlyState
+        if (not isinstance(state, ReadOnlyState) or
+                workspace_identity != state.manifest.workspace_identity):
+            raise ValueError("read_only_state_unavailable")
+        self._state = state
+        self.workspace_identity = workspace_identity
+
+    def _connection(self) -> Any:
+        from .read_only_state import _ReadOnlyQueryAdapter
+        return _ReadOnlyQueryAdapter(self._state)

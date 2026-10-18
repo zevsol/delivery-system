@@ -4126,3 +4126,125 @@ class ApplicationPostconditionObservation:
             raise
         except Exception:
             raise ValueError("state_integrity_invalid") from None
+
+
+class ReadOnlyPreviewProjectionStore:
+    """Only the validated SQLite Preview/Audit/Approval read interface."""
+
+    get_preview = SQLitePreviewStore.get_preview
+    get_evidence_records = SQLitePreviewStore.get_evidence_records
+    get_audit = SQLitePreviewStore.get_audit
+    _current_audits = SQLitePreviewStore._current_audits
+    list_active_audits = SQLitePreviewStore.list_active_audits
+    get_approval = SQLitePreviewStore.get_approval
+    validate_approval_current = SQLitePreviewStore.validate_approval_current
+
+    def __init__(self, context: RuntimeContext, state: Any, *, trust_context: Any = None,
+                 custody_policy: Callable[[Any, Mapping[str, Any]], bool] | None = None) -> None:
+        from .read_only_state import ReadOnlyState
+        if (not isinstance(context, RuntimeContext) or not isinstance(state, ReadOnlyState) or
+                context.workspace_identity != state.manifest.workspace_identity or
+                (trust_context is not None and not isinstance(trust_context, DriverTrustContext)) or
+                (custody_policy is not None and not callable(custody_policy))):
+            raise ValueError("read_only_state_unavailable")
+        self.context = context
+        self.state = state
+        self.trust_context = trust_context
+        self._custody_policy = custody_policy
+
+    def _connect(self) -> Any:
+        from .read_only_state import _ReadOnlyQueryAdapter
+        return _ReadOnlyQueryAdapter(self.state)
+
+    def _require_custody(self, preview: Mapping[str, Any]) -> None:
+        canonical = preview.get("canonical_payload")
+        if (not isinstance(canonical, Mapping) or canonical.get("preview_level") not in
+                {PreviewLevel.REPOSITORY_AWARE.value, PreviewLevel.WRITE_ELIGIBLE.value}):
+            return
+        if self.trust_context is None:
+            raise ValueError("driver_trust_context_required")
+        try:
+            approved = self._custody_policy is not None and self._custody_policy(self.state.manifest, canonical) is True
+        except Exception as exc:
+            raise ValueError("repository_aware_promotion_required") from exc
+        if not approved:
+            raise ValueError("repository_aware_promotion_required")
+
+    def get_preview_revision(self, workspace_identity: str, preview_id: str,
+                             revision: int | None = None) -> dict[str, object]:
+        preview = SQLitePreviewStore.get_preview_revision(self, workspace_identity, preview_id, revision)
+        self._require_custody(preview)
+        return preview
+
+    def _read_preview_revision_for_status(self, workspace_identity: str, preview_id: str,
+                                          revision: int) -> dict[str, object]:
+        preview = SQLitePreviewStore._read_preview_revision_for_status(self, workspace_identity, preview_id, revision)
+        self._require_custody(preview)
+        return preview
+
+
+class ReadOnlyAuditContextProjection:
+    def __init__(self, context: RuntimeContext, store: ReadOnlyPreviewProjectionStore,
+                 registry: RuleRegistry) -> None:
+        if (not isinstance(store, ReadOnlyPreviewProjectionStore) or
+                context.workspace_identity != store.context.workspace_identity or
+                not isinstance(registry, RuleRegistry)):
+            raise ValueError("read_only_state_unavailable")
+        self.context = context
+        self.store = store
+        self.registry = registry
+
+    def get_context(self, preview_id: str, revision: int) -> dict[str, Any]:
+        from .auditor import RuntimeAuditor
+        with self.store.state.snapshot():
+            return RuntimeAuditor(self.context, self.store, self.registry).get_context(preview_id, revision)
+
+
+class ReadOnlyApprovalStatusProjection:
+    _resolve_audit = RuntimeApprovalAuthorityService._resolve_audit
+    _approval_id = staticmethod(RuntimeApprovalAuthorityService._approval_id)
+
+    def __init__(self, context: RuntimeContext, store: ReadOnlyPreviewProjectionStore) -> None:
+        if (not isinstance(store, ReadOnlyPreviewProjectionStore) or
+                context.workspace_identity != store.context.workspace_identity):
+            raise ValueError("read_only_state_unavailable")
+        self.context = context
+        self.store = store
+        self._lock = threading.RLock()
+
+    def get_status(self, preview_id: str, revision: int) -> dict[str, Any]:
+        if (not isinstance(preview_id, str) or not preview_id or
+                not isinstance(revision, int) or isinstance(revision, bool) or revision < 1):
+            raise ValueError("approval_invalid")
+        with self.store.state.snapshot():
+            # The ordinary status method validates Audit/Approval bindings, but
+            # its no-approval result does not itself validate sealed Preview data.
+            try:
+                AuditContextService(self.context, self.store).get(preview_id, revision)
+            except ValueError as exc:
+                if str(exc) == "context_stale":
+                    raise ValueError("preview_stale") from exc
+                raise
+            return RuntimeApprovalAuthorityService.get_approval_status(self, preview_id, revision)
+
+
+class ReadOnlyApplicationStatusProjection:
+    def __init__(self, context: RuntimeContext, store: ReadOnlyPreviewProjectionStore,
+                 execution_store: Any) -> None:
+        from .execution_store import ReadOnlyExecutionProjectionStore
+        if (not isinstance(store, ReadOnlyPreviewProjectionStore) or
+                not isinstance(execution_store, ReadOnlyExecutionProjectionStore) or
+                execution_store._state is not store.state or
+                context.workspace_identity != store.context.workspace_identity):
+            raise ValueError("read_only_state_unavailable")
+        self.store = store
+        self._service = RuntimeApplicationStatusService(context, store, execution_store)
+
+    def get_status(self, application_id: str) -> dict[str, Any]:
+        with self.store.state.snapshot():
+            return self._service.get_status(application_id)
+
+    def get_status_by_approved_context(self, preview_id: str, revision: int,
+                                       approval_id: str, approval_digest: str) -> dict[str, Any]:
+        with self.store.state.snapshot():
+            return self._service.get_status_by_approved_context(preview_id, revision, approval_id, approval_digest)
