@@ -110,3 +110,114 @@ jobs:
 
       - name: Run repository tests
         run: python -B -m unittest discover -v
+
+  test-linux-read-only:
+    name: Linux read-only runtime tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      PIP_CONFIG_FILE: /dev/null
+      PYTHONUTF8: '1'
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14.6'
+          check-latest: false
+
+      - name: Bootstrap pip
+        run: >-
+          python -m pip --isolated install
+          --no-user
+          --no-cache-dir
+          --index-url https://pypi.org/simple
+          "pip==26.2.1"
+
+      - name: Prepare Linux dependency pins from lock files
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          packages = {}
+          for lock_path in (Path("pylock.toml"), Path("pylock.test.toml")):
+              lock = tomllib.loads(lock_path.read_text(encoding="utf-8"))
+              for package in lock.get("packages", []):
+                  name = package["name"]
+                  version = package.get("version")
+                  if name == "delivery-system":
+                      continue  # Tests import the checkout directly; no build is needed.
+                  if name.casefold().replace("_", "-") == "pywin32":
+                      continue  # This locked dependency is Windows-only.
+                  if not version:
+                      raise SystemExit(f"Missing locked version for {name}")
+                  key = name.casefold().replace("_", "-")
+                  if key in packages and packages[key][1] != version:
+                      raise SystemExit(f"Conflicting locked versions for {name}")
+                  packages[key] = (name, version)
+
+          requirements = "\n".join(
+              f"{name}=={version}"
+              for name, version in sorted(packages.values(), key=lambda item: item[0].casefold())
+          ) + "\n"
+          output = Path(os.environ["RUNNER_TEMP"]) / "read-only-linux-requirements.txt"
+          output.write_text(requirements, encoding="utf-8")
+          print(f"Wrote {len(packages)} locked package version pins to {output}")
+          PY
+
+      - name: Install locked package versions
+        shell: bash
+        run: >-
+          python -m pip --isolated install
+          --no-user
+          --no-cache-dir
+          --index-url https://pypi.org/simple
+          --no-deps
+          --requirement "$RUNNER_TEMP/read-only-linux-requirements.txt"
+
+      - name: Check dependency consistency
+        run: python -m pip --isolated check
+
+      - name: Provision official Skill Validator
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          validator_uri='https://raw.githubusercontent.com/openai/codex/84aa75204ad604bcf498df180d128181c89b2f0b/codex-rs/skills/src/assets/samples/skill-creator/scripts/quick_validate.py'
+          expected_sha256='EE6DBA90F44D37171C5A6EDB8095979C54919FF6822C1A907AFCA2E78C48738C'
+          validator_directory="$RUNNER_TEMP/delivery-system-official-validator"
+          validator_path="$validator_directory/quick_validate.py"
+
+          mkdir -p "$validator_directory"
+          curl --fail --location --silent --show-error "$validator_uri" --output "$validator_path"
+          printf '%s  %s\n' "$expected_sha256" "$validator_path" | sha256sum --check --status
+
+          first_line="$(head -n 1 "$validator_path")"
+          if [[ "$first_line" != '#!/usr/bin/env python3' ]]; then
+            echo 'Validator shebang verification failed' >&2
+            exit 1
+          fi
+
+          printf 'SKILL_CREATOR_VALIDATOR=%s\n' "$validator_path" >> "$GITHUB_ENV"
+
+      - name: Run Linux read-only tests
+        shell: bash
+        run: |
+          set -o pipefail
+          test_log="$RUNNER_TEMP/read-only-tests.log"
+          python -B -m unittest -v \
+            tests.test_read_only_state \
+            tests.test_read_only_projections \
+            tests.test_read_only_composition \
+            tests.test_read_only_mcp_server 2>&1 | tee "$test_log"
+
+          if grep -Fq "skipped 'Linux proc fd required'" "$test_log"; then
+            echo "Linux-only tests were unexpectedly skipped: Linux proc fd required" >&2
+            exit 1
+          fi
