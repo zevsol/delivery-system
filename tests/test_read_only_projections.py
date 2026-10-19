@@ -131,6 +131,19 @@ class ReadOnlyProjectionTests(unittest.TestCase):
             ReadOnlyApplicationStatusProjection(self.context, store, execution),
         )
 
+    def assert_preview_status_read_rejected_without_mutation(
+        self, preview, *, trust, policy, expected_error,
+    ):
+        database_path = Path(self.context.state_path)
+        before = database_path.read_bytes()
+        with self.open_state() as state:
+            store, _, _, _ = self.projections(state, trust=trust, policy=policy)
+            with self.assertRaisesRegex(ValueError, expected_error):
+                store._read_preview_revision_for_status(
+                    self.context.workspace_identity, preview["preview_id"], preview["revision"],
+                )
+        self.assertEqual(database_path.read_bytes(), before)
+
     def add_repository_preview(self, *, with_operation=False):
         store = SQLitePreviewStore(
             self.context, ignore_checker=lambda _path: True,
@@ -319,6 +332,89 @@ class ReadOnlyProjectionTests(unittest.TestCase):
             _, audit, _, _ = self.projections(state, trust=other, policy=lambda _manifest, _canonical: True)
             with self.assertRaisesRegex(ValueError, "driver_trust_context_mismatch"):
                 audit.get_context(preview["preview_id"], 1)
+
+    def test_repository_status_read_binds_driver_and_remote_authority(self):
+        preview = self.add_repository_preview()
+        self.assert_preview_status_read_rejected_without_mutation(
+            preview, trust=None, policy=lambda _manifest, _canonical: True,
+            expected_error="driver_trust_context_required",
+        )
+
+        for trust in (
+            DriverTrustContext("other-driver", TRUST.origin, TRUST.contract_version),
+            DriverTrustContext(TRUST.trusted_driver_identity, "offline://other", TRUST.contract_version),
+        ):
+            policy_calls = []
+
+            def approve(_manifest, _canonical):
+                policy_calls.append(True)
+                return True
+
+            with self.subTest(trust=trust):
+                self.assert_preview_status_read_rejected_without_mutation(
+                    preview, trust=trust, policy=approve,
+                    expected_error="driver_trust_context_mismatch",
+                )
+                self.assertEqual(policy_calls, [])
+
+    def test_repository_status_read_requires_literal_policy_approval(self):
+        preview = self.add_repository_preview()
+        self.assert_preview_status_read_rejected_without_mutation(
+            preview, trust=TRUST, policy=None,
+            expected_error="repository_aware_promotion_required",
+        )
+        for result in (False, None, 1):
+            with self.subTest(policy_result=result):
+                self.assert_preview_status_read_rejected_without_mutation(
+                    preview, trust=TRUST,
+                    policy=lambda _manifest, _canonical, result=result: result,
+                    expected_error="repository_aware_promotion_required",
+                )
+
+    def test_repository_status_read_sanitizes_policy_exception(self):
+        preview = self.add_repository_preview()
+
+        def fail_policy(_manifest, _canonical):
+            raise RuntimeError("CUSTODY_SECRET_SENTINEL")
+
+        database_path = Path(self.context.state_path)
+        before = database_path.read_bytes()
+        with self.open_state() as state:
+            store, _, _, _ = self.projections(state, trust=TRUST, policy=fail_policy)
+            with self.assertRaisesRegex(ValueError, "repository_aware_promotion_required") as raised:
+                store._read_preview_revision_for_status(
+                    self.context.workspace_identity, preview["preview_id"], preview["revision"],
+                )
+            self.assertNotIn("CUSTODY_SECRET_SENTINEL", str(raised.exception))
+            self.assertTrue(raised.exception.__suppress_context__)
+        self.assertEqual(database_path.read_bytes(), before)
+
+    def test_write_eligible_status_read_enforces_trust_and_policy(self):
+        preview, _audit_record = self.add_write_preview_and_audit()
+        self.assert_preview_status_read_rejected_without_mutation(
+            preview, trust=None, policy=lambda _manifest, _canonical: True,
+            expected_error="driver_trust_context_required",
+        )
+        wrong_authority = DriverTrustContext(
+            TRUST.trusted_driver_identity, TRUST.origin, "other-contract-version",
+        )
+        self.assert_preview_status_read_rejected_without_mutation(
+            preview, trust=wrong_authority, policy=lambda _manifest, _canonical: True,
+            expected_error="driver_trust_context_mismatch",
+        )
+        self.assert_preview_status_read_rejected_without_mutation(
+            preview, trust=TRUST, policy=None,
+            expected_error="repository_aware_promotion_required",
+        )
+
+        with self.open_state() as state:
+            store, _, _, _ = self.projections(
+                state, trust=TRUST, policy=lambda _manifest, _canonical: True,
+            )
+            loaded = store._read_preview_revision_for_status(
+                self.context.workspace_identity, preview["preview_id"], preview["revision"],
+            )
+            self.assertEqual(loaded["canonical_payload"]["preview_level"], "WriteEligible")
 
     def test_repository_evidence_tampering_fails_closed(self):
         preview = self.add_repository_preview()
@@ -519,6 +615,31 @@ class ReadOnlyProjectionTests(unittest.TestCase):
             _, _, _, application = self.projections(state, trust=TRUST)
             with self.assertRaisesRegex(ValueError, "repository_aware_promotion_required"):
                 application.get_status(execution.application_id)
+
+    def test_approval_and_application_status_cannot_bypass_trust_binding(self):
+        preview, _audit_record = self.add_write_preview_and_audit()
+        execution = self.add_pending_application(preview)
+        wrong_authority = DriverTrustContext(
+            TRUST.trusted_driver_identity, "offline://different-origin", TRUST.contract_version,
+        )
+        database_path = Path(self.context.state_path)
+        before = database_path.read_bytes()
+        with self.open_state() as state:
+            _, _, approval, application = self.projections(
+                state, trust=wrong_authority,
+                policy=lambda _manifest, _canonical: True,
+            )
+            with self.assertRaisesRegex(ValueError, "driver_trust_context_mismatch"):
+                approval.get_status(preview["preview_id"], preview["revision"])
+            with self.assertRaisesRegex(ValueError, "driver_trust_context_mismatch"):
+                application.get_status(execution.application_id)
+            values = execution.identity.values()
+            with self.assertRaisesRegex(ValueError, "driver_trust_context_mismatch"):
+                application.get_status_by_approved_context(
+                    values["preview_id"], values["revision"],
+                    values["approval_id"], values["approval_digest"],
+                )
+        self.assertEqual(database_path.read_bytes(), before)
 
     def test_applied_application_validates_attempts_and_both_receipt_levels(self):
         preview = self.add_repository_preview(with_operation=True)

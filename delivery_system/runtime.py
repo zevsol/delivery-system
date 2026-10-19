@@ -4163,10 +4163,15 @@ class ReadOnlyPreviewProjectionStore:
             return
         if self.trust_context is None:
             raise ValueError("driver_trust_context_required")
+        evidence_ids = canonical.get("evidence_ids")
+        if not isinstance(evidence_ids, list):
+            raise ValueError("repository_aware_promotion_required")
+        evidence = self.get_evidence_records(self.context.workspace_identity, evidence_ids)
+        _reload_promotion(self, canonical, evidence)
         try:
             approved = self._custody_policy is not None and self._custody_policy(self.state.manifest, canonical) is True
-        except Exception as exc:
-            raise ValueError("repository_aware_promotion_required") from exc
+        except Exception:
+            raise ValueError("repository_aware_promotion_required") from None
         if not approved:
             raise ValueError("repository_aware_promotion_required")
 
