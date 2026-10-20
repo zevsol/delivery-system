@@ -81,7 +81,7 @@ def legacy_registry() -> RuleRegistry:
 
 
 class OperationalApprovalAuthorityTests(unittest.TestCase):
-    def _setup(self, kind: str, *, audit_registry=None, service_registry=None):
+    def _setup(self, kind: str, *, audit_registry=None, service_registry=None, driver="default"):
         directory = tempfile.TemporaryDirectory()
         context = RuntimeContext.from_workspace_root(directory.name)
         if kind == "memory":
@@ -91,7 +91,8 @@ class OperationalApprovalAuthorityTests(unittest.TestCase):
                 context, ignore_checker=lambda path: True,
                 tracked_checker=lambda path: False, trust_context=TRUST,
             )
-        preview = RuntimePlanner(context, store, FakeReadOnlyDriver(node_id="node-1"), TRUST).preview(plan())
+        planner_driver = FakeReadOnlyDriver(node_id="node-1") if driver == "default" else driver
+        preview = RuntimePlanner(context, store, planner_driver, TRUST if planner_driver is not None else None).preview(plan())
         audit_registry = audit_registry or build_registry_v1()
         service_registry = service_registry or build_registry_v1()
         auditor = RuntimeAuditor(context, store, audit_registry, TRUST)
@@ -206,6 +207,47 @@ class OperationalApprovalAuthorityTests(unittest.TestCase):
                 service.get_approval_status(preview["preview_id"], 2)
             store._audits[(context.workspace_identity, "extra")] = audit
             with self.assertRaisesRegex(ValueError, "^approval_audit_ambiguous$"):
+                service.get_approval_status(preview["preview_id"], 1)
+        finally:
+            directory.cleanup()
+
+    def test_conceptual_passed_active_audit_is_not_stale_or_approval_eligible(self):
+        directory, context, store, preview, audit, service = self._setup("memory", driver=None)
+        try:
+            self.assertEqual(preview["preview_level"], "Conceptual")
+            self.assertEqual(audit.result, AuditResult.PASSED)
+            self.assertEqual(audit.status, AuditStatus.ACTIVE)
+            self.assertTrue(audit.verify_digest())
+            self.assertFalse(audit.approval_eligible)
+            with self.assertRaisesRegex(ValueError, "^audit_not_approval_eligible$"):
+                service.get_approval_status(preview["preview_id"], 1)
+            with self.assertRaisesRegex(ValueError, "^audit_not_approval_eligible$"):
+                service.record_approval(
+                    preview["preview_id"], 1,
+                    f"批准写入 {preview['preview_id']} 1", "human",
+                )
+            self.assertEqual(store._approvals, {})
+        finally:
+            directory.cleanup()
+
+    def test_approval_status_preserves_audit_digest_and_staleness_errors(self):
+        directory, context, store, preview, audit, service = self._setup("memory")
+        try:
+            store._audits[(context.workspace_identity, audit.audit_id)] = replace(audit, audit_digest="sha256:invalid")
+            with self.assertRaisesRegex(ValueError, "^audit_stale$"):
+                service.get_approval_status(preview["preview_id"], 1)
+
+            store._audits[(context.workspace_identity, audit.audit_id)] = audit
+            stored_preview = store.get_preview(context.workspace_identity, preview["preview_id"])
+            store._previews[(context.workspace_identity, preview["preview_id"])] = {
+                **stored_preview, "revision": 2,
+            }
+            with self.assertRaisesRegex(ValueError, "^preview_stale$"):
+                service.get_approval_status(preview["preview_id"], 1)
+
+            store._previews[(context.workspace_identity, preview["preview_id"])] = stored_preview
+            store.transition_audit_status(audit.audit_id, AuditStatus.STALE, "re-audit")
+            with self.assertRaisesRegex(ValueError, "^audit_not_found$"):
                 service.get_approval_status(preview["preview_id"], 1)
         finally:
             directory.cleanup()

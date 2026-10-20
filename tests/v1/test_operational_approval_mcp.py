@@ -64,11 +64,12 @@ class OperationalApprovalMcpTests(unittest.TestCase):
     def run_async(coroutine):
         return asyncio.run(coroutine)
 
-    def _setup(self, *, with_attestation: bool):
+    def _setup(self, *, with_attestation: bool, driver="default"):
         directory = tempfile.TemporaryDirectory()
         context = RuntimeContext.from_workspace_root(directory.name)
         store = InMemoryPreviewStore(context.workspace_identity, TRUST)
-        preview = RuntimePlanner(context, store, FakeReadOnlyDriver(node_id="node-1"), TRUST).preview(plan())
+        planner_driver = FakeReadOnlyDriver(node_id="node-1") if driver == "default" else driver
+        preview = RuntimePlanner(context, store, planner_driver, TRUST if planner_driver is not None else None).preview(plan())
         auditor = RuntimeAuditor(context, store, build_registry_v1(), TRUST)
         audit_context = auditor.get_context(preview["preview_id"], 1)
         evaluations = [
@@ -221,6 +222,33 @@ class OperationalApprovalMcpTests(unittest.TestCase):
             })
             self.assertTrue(stale.is_error)
             self.assertEqual(self._error_code(stale), "preview_stale")
+        finally:
+            directory.cleanup()
+
+    def test_conceptual_audit_ineligibility_is_a_distinct_public_error(self):
+        directory, context, store, preview, audit, service = self._setup(
+            with_attestation=False, driver=None,
+        )
+        try:
+            server = create_server(context, store, approval_authority_service=service)
+            status = self._call(server, "delivery_get_approval_status", {
+                "preview_id": preview["preview_id"], "revision": 1,
+            })
+            self.assertTrue(status.is_error)
+            self.assertEqual(self._error_code(status), "audit_not_approval_eligible")
+            self.assertEqual(
+                status.content[0].text,
+                "audit_not_approval_eligible: The current Audit does not qualify for Approval.",
+            )
+            attempted_approval = self._call(server, "delivery_record_approval", {
+                "preview_id": preview["preview_id"],
+                "revision": 1,
+                "approval_command": f"批准写入 {preview['preview_id']} 1",
+                "approver_claim": "human",
+            })
+            self.assertTrue(attempted_approval.is_error)
+            self.assertEqual(self._error_code(attempted_approval), "audit_not_approval_eligible")
+            self.assertEqual(store._approvals, {})
         finally:
             directory.cleanup()
 
