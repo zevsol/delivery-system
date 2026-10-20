@@ -200,6 +200,11 @@ _REGISTRY = {
         RecoveryAction.ESTABLISH_CURRENT_AUDIT_CONTEXT,
         "audit_not_found: The required Audit was not found.",
     ),
+    "audit_not_approval_eligible": _descriptor(
+        "audit_not_approval_eligible", PublicErrorCategory.DOMAIN_BUSINESS,
+        RecoveryAction.ESTABLISH_CURRENT_PREVIEW_THEN_RESTART_CEREMONY,
+        "audit_not_approval_eligible: The current Audit does not qualify for Approval.",
+    ),
     "audit_stale": _descriptor(
         "audit_stale", PublicErrorCategory.CURRENTNESS_STALENESS,
         RecoveryAction.ESTABLISH_CURRENT_AUDIT_CONTEXT,

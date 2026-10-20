@@ -42,6 +42,7 @@ EXPECTED_CODES = frozenset({
     "attempt_integrity_invalid",
     "attestation_service_unavailable",
     "audit_context_stale",
+    "audit_not_approval_eligible",
     "audit_not_found",
     "audit_stale",
     "authority_issuance_requires_recovery",
@@ -116,7 +117,7 @@ class PublicErrorContractTests(unittest.TestCase):
                 "ESCALATE_TO_HOST_OPERATOR",
             },
         )
-        self.assertEqual(len(PUBLIC_ERROR_REGISTRY), 48)
+        self.assertEqual(len(PUBLIC_ERROR_REGISTRY), 49)
         self.assertEqual(set(PUBLIC_ERROR_REGISTRY), EXPECTED_CODES)
         for code, descriptor in PUBLIC_ERROR_REGISTRY.items():
             with self.subTest(code=code):
@@ -148,6 +149,9 @@ class PublicErrorContractTests(unittest.TestCase):
             "workspace_identity_unavailable": ("PERSISTENCE_WORKSPACE", "RESTORE_WORKSPACE_CONTEXT"),
             "preview_stale": ("CURRENTNESS_STALENESS", "ESTABLISH_CURRENT_PREVIEW_THEN_RESTART_CEREMONY"),
             "audit_not_found": ("CURRENTNESS_STALENESS", "ESTABLISH_CURRENT_AUDIT_CONTEXT"),
+            "audit_not_approval_eligible": (
+                "DOMAIN_BUSINESS", "ESTABLISH_CURRENT_PREVIEW_THEN_RESTART_CEREMONY",
+            ),
             "approval_audit_ambiguous": ("IDENTITY_BINDING", "INVESTIGATE_APPROVAL_STATE"),
             "approval_binding_conflict": ("IDENTITY_BINDING", "INVESTIGATE_APPROVAL_STATE"),
             "approval_binding_mismatch": ("IDENTITY_BINDING", "INVESTIGATE_APPROVAL_STATE"),

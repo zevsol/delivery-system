@@ -2221,8 +2221,10 @@ class RuntimeApprovalAuthorityService:
         if len(audits) != 1:
             raise ValueError("approval_audit_ambiguous")
         audit = audits[0]
-        if not audit.verify_digest() or not audit.approval_eligible:
+        if not audit.verify_digest():
             raise ValueError("audit_stale")
+        if not audit.approval_eligible:
+            raise ValueError("audit_not_approval_eligible")
         return preview, audit
 
     def record_approval(self, preview_id: str, revision: int, approval_command: str,
