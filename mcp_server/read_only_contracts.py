@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import logging
+import os
 import re
+import traceback
 from typing import Annotated, Any, Literal
 
 from mcp.server import MCPServer
@@ -164,6 +167,15 @@ class ApplicationStatusOutput(StrictModel):
 
 
 _PUBLIC_ERROR_META_KEY = "com.delivery-system/public-tool-error"
+_logger = logging.getLogger(__name__)
+_SAFE_AUDIT_ERROR_CODES = frozenset({
+    "audit_commit_boundary_required", "audit_context_stale", "audit_coverage_incomplete",
+    "audit_stale",
+    "audit_persistence_failed", "audit_record_invalid", "audit_scope_invalid",
+    "audit_scope_mismatch", "evidence_not_found", "invalid_input",
+    "invalid_not_applicable_submission", "invalid_runtime_rule_submission",
+    "preview_not_found", "sealed_preview_unavailable", "workspace_identity_mismatch",
+})
 
 
 def _exception_chain(error: BaseException):
@@ -173,6 +185,70 @@ def _exception_chain(error: BaseException):
         seen.add(id(current))
         yield current
         current = current.__cause__ or current.__context__
+
+
+def _log_audit_tool_failure(request_id: Any, error: BaseException) -> None:
+    """Log safe correlation and stack frames without exception messages or payloads."""
+    chain = list(_exception_chain(error))
+    error_types = " -> ".join(f"{type(value).__module__}.{type(value).__qualname__}" for value in chain)
+    reason_codes = [
+        value.args[0]
+        for value in chain
+        if isinstance(value, ValueError)
+        and len(value.args) == 1
+        and type(value.args[0]) is str
+        and value.args[0] in _SAFE_AUDIT_ERROR_CODES
+    ]
+    reason = reason_codes[0] if reason_codes else "unclassified_exception"
+    if isinstance(request_id, (str, int)) and re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", str(request_id)):
+        correlation_id = str(request_id)
+    else:
+        correlation_id = "unavailable"
+    frames = []
+    for value in chain:
+        if value.__traceback__ is None:
+            continue
+        for frame in traceback.extract_tb(value.__traceback__):
+            filename = frame.filename.replace("\\", "/").rsplit("/", 1)[-1]
+            frames.append(f"{filename}:{frame.lineno}:{frame.name}")
+    _logger.error(
+        "Audit MCP request failed request_id=%s exception_types=%s reason=%s traceback_frames=%s",
+        correlation_id, error_types, reason, " <- ".join(frames),
+    )
+
+
+def _log_audit_tool_failure_safely(request_id: Any, error: BaseException) -> None:
+    """Keep logging failures from changing the tool's established error response."""
+    try:
+        _log_audit_tool_failure(request_id, error)
+    except Exception:
+        try:
+            chain = list(_exception_chain(error))
+            origin = chain[-1] if chain else error
+            exception_type = f"{type(origin).__module__}.{type(origin).__qualname__}"
+            exception_type = re.sub(r"[^A-Za-z0-9_.]", "_", exception_type)[:160] or "unknown"
+            reason_codes = [
+                value.args[0]
+                for value in chain
+                if isinstance(value, ValueError)
+                and len(value.args) == 1
+                and type(value.args[0]) is str
+                and value.args[0] in _SAFE_AUDIT_ERROR_CODES
+            ]
+            reason = reason_codes[0] if reason_codes else "unclassified_exception"
+            if isinstance(request_id, (str, int)) and re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", str(request_id)):
+                correlation_id = str(request_id)
+            else:
+                correlation_id = "unavailable"
+            diagnostic = (
+                "Audit MCP fallback diagnostic "
+                f"request_id={correlation_id} exception_type={exception_type} "
+                f"reason={reason} logger_handler_failure=true\n"
+            )
+            os.write(2, diagnostic.encode("ascii"))
+        except Exception:
+            # Neither diagnostic channel may replace the original tool error.
+            pass
 
 
 def _specific_validation_code(error: ValidationError) -> str | None:
@@ -245,8 +321,12 @@ class DeliverySystemMCPServer(MCPServer):
         except ToolError as error:
             if error.__cause__ is None:
                 raise MCPError(code=INVALID_PARAMS, message="Unknown tool") from None
+            if params.name == "delivery_record_audit":
+                _log_audit_tool_failure_safely(ctx.request_id, error)
             return _error_result(_descriptor_for_tool_error(error))
-        except Exception:
+        except Exception as error:
+            if params.name == "delivery_record_audit":
+                _log_audit_tool_failure_safely(ctx.request_id, error)
             return _error_result(descriptor_for_code(INTERNAL_ERROR_CODE))
 
 

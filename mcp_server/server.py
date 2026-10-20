@@ -330,7 +330,7 @@ def create_server(context: RuntimeContext | None = None, store: Any | None = Non
     def delivery_plan_preview(payload: PreviewRequestInput) -> PreviewOutput:
         if context is None:
             raise ValueError("workspace_identity_unavailable")
-        service = RuntimePlanner(context, store, driver, trust_context)
+        service = RuntimePlanner(context, store, driver, trust_context, registry)
         if store is None:
             raise ValueError("store_unavailable")
         return PreviewOutput.model_validate(service.preview(_runtime_plan_payload(payload), payload.previous_preview_id))
