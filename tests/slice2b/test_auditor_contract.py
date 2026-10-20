@@ -295,6 +295,24 @@ class AuditorContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.store.get_audit(self.context.workspace_identity, "missing")
 
+    def test_old_preview_context_is_rejected_after_revision_update(self):
+        old_context = self._context()
+        changed_plan = plan_payload()
+        changed_plan["work_items"][0]["acceptance_criteria"] = sourced(["Updated acceptance criteria"])
+        updated = RuntimePlanner(self.context, self.store, rule_registry=self.registry).preview(
+            changed_plan, self.preview["preview_id"],
+        )
+        self.assertEqual(updated["revision"], 2)
+        with self.assertRaisesRegex(ValueError, "^context_stale$"):
+            self.auditor.record_audit(
+                self.preview["preview_id"], 1, old_context["audit_context_digest"],
+                self._passed_evaluations(), [],
+            )
+        self.assertEqual(
+            self.store.list_active_audits(self.context.workspace_identity, self.preview["preview_id"], 1),
+            [],
+        )
+
     def test_passed_conceptual_audit_is_not_approval_eligible(self):
         context = self._context()
         audit = self.auditor.record_audit(

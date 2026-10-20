@@ -1,6 +1,7 @@
 import asyncio
 import json
 import sqlite3
+from dataclasses import replace
 from contextlib import closing
 import tempfile
 import unittest
@@ -9,6 +10,7 @@ from typing import Any, cast
 
 from mcp import Client
 
+from delivery_system.auditor import RuntimeAuditor
 from delivery_system.protocol import canonical_payload, digest
 from delivery_system.runtime import (
     ApprovalRecord,
@@ -26,6 +28,7 @@ from delivery_system.runtime import (
     compute_audit_context_digest,
 )
 from mcp_server.server import create_server
+from delivery_system.rules import RuleRegistry, build_registry_v1
 
 
 def sourced(value, source="user_asserted"):
@@ -54,13 +57,32 @@ def plan_payload(repository_claim=None):
 
 
 class Slice2ASealedPreviewTests(unittest.TestCase):
-    def test_planner_and_audit_context_use_identical_digest(self):
+    def test_planner_and_runtime_auditor_use_identical_digest(self):
         with tempfile.TemporaryDirectory() as directory:
             context = RuntimeContext.from_workspace_root(directory)
             store = InMemoryPreviewStore()
-            result = RuntimePlanner(context, store).preview(plan_payload())
-            context_result = AuditContextService(context, store).get(result["preview_id"], result["revision"])
+            registry = build_registry_v1()
+            result = RuntimePlanner(context, store, rule_registry=registry).preview(plan_payload())
+            context_result = RuntimeAuditor(context, store, registry).get_context(result["preview_id"], result["revision"])
             self.assertEqual(result["audit_context_digest"], context_result["audit_context_digest"])
+
+    def test_planner_audit_context_digest_binds_registry_version_and_rules(self):
+        with tempfile.TemporaryDirectory() as directory:
+            context = RuntimeContext.from_workspace_root(directory)
+            base = build_registry_v1()
+            changed_version = RuleRegistry("2.0", base.rules)
+            changed_rule = replace(base.rules[0], evaluation_contract="Changed runtime validation contract")
+            changed_digest = RuleRegistry(base.registry_version, (changed_rule, *base.rules[1:]))
+            digests = []
+            for registry in (base, changed_version, changed_digest):
+                store = InMemoryPreviewStore()
+                preview = RuntimePlanner(context, store, rule_registry=registry).preview(plan_payload())
+                audit_context = RuntimeAuditor(context, store, registry).get_context(
+                    preview["preview_id"], preview["revision"],
+                )
+                self.assertEqual(preview["audit_context_digest"], audit_context["audit_context_digest"])
+                digests.append(preview["audit_context_digest"])
+            self.assertEqual(len(set(digests)), 3)
 
     def test_audit_context_digest_is_order_independent_but_content_sensitive(self):
         records = [

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import FrozenInstanceError, fields
+import logging
 import unittest
+from unittest.mock import patch
 
 from mcp import Client
 
@@ -218,6 +220,124 @@ class PublicErrorContractTests(unittest.TestCase):
         self.assertNotIn("FAKE_PATH", str(result.meta))
         self.assertNotIn("fake-token-marker", str(result.meta))
         self.assertNotIn("fake-http-body", str(result.meta))
+
+    def test_audit_storage_and_commit_boundary_codes_remain_private(self):
+        for internal_code in ("audit_persistence_failed", "audit_commit_boundary_required"):
+            with self.subTest(internal_code=internal_code):
+                server = DeliverySystemMCPServer("audit-error-contract-test")
+
+                @server.tool(name="delivery_record_audit", structured_output=False)
+                def fail_audit():
+                    raise ValueError(internal_code)
+
+                with self.assertLogs("mcp_server.read_only_contracts", level="ERROR") as captured:
+                    result = self._call(server, "delivery_record_audit", {})
+                self.assertTrue(result.is_error)
+                self.assertEqual(result.meta[META_KEY]["code"], "internal_error")
+                self.assertNotIn(internal_code, result.content[0].text)
+                self.assertNotIn(internal_code, str(result.meta))
+                self.assertIn(internal_code, "\n".join(captured.output))
+
+    def test_audit_log_handler_failure_preserves_original_public_error(self):
+        server = DeliverySystemMCPServer("audit-error-log-failure-test")
+        tool_calls = 0
+        log_failures = 0
+        original_marker = "original-audit-stale-marker"
+        logger_failure_marker = "logger-failure-sensitive-marker"
+
+        class AuditStaleError(ValueError):
+            def __str__(self):
+                return original_marker
+
+        @server.tool(name="delivery_record_audit", structured_output=False)
+        def fail_audit():
+            nonlocal tool_calls
+            tool_calls += 1
+            raise AuditStaleError("audit_stale")
+
+        class FailingHandler(logging.Handler):
+            def emit(self, record):
+                nonlocal log_failures
+                log_failures += 1
+                raise RuntimeError(logger_failure_marker)
+
+        logger = logging.getLogger("mcp_server.read_only_contracts")
+        old_level = logger.level
+        handler = FailingHandler()
+        logger.setLevel(logging.ERROR)
+        logger.addHandler(handler)
+        fallback_records = []
+
+        def capture_fallback(file_descriptor, payload):
+            fallback_records.append((file_descriptor, payload))
+            return len(payload)
+
+        try:
+            with patch("mcp_server.read_only_contracts.os.write", side_effect=capture_fallback):
+                result = self._call(server, "delivery_record_audit", {})
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(old_level)
+
+        self.assertTrue(result.is_error)
+        self.assertEqual(result.meta[META_KEY]["code"], "audit_stale")
+        self.assertEqual(result.content[0].text, descriptor_for_code("audit_stale").safe_text)
+        self.assertNotIn(original_marker, result.content[0].text)
+        self.assertNotIn(logger_failure_marker, result.content[0].text)
+        self.assertNotIn(original_marker, str(result.meta))
+        self.assertNotIn(logger_failure_marker, str(result.meta))
+        self.assertEqual(tool_calls, 1)
+        self.assertEqual(log_failures, 1)
+        self.assertEqual(len(fallback_records), 1)
+        self.assertEqual(fallback_records[0][0], 2)
+        fallback_output = fallback_records[0][1].decode("ascii")
+        self.assertIn("request_id=", fallback_output)
+        self.assertIn("exception_type=tests.v1.test_public_error_contract", fallback_output)
+        self.assertIn("AuditStaleError", fallback_output)
+        self.assertIn("reason=audit_stale", fallback_output)
+        self.assertIn("logger_handler_failure=true", fallback_output)
+        self.assertNotIn(original_marker, fallback_output)
+        self.assertNotIn(logger_failure_marker, fallback_output)
+
+    def test_audit_fallback_diagnostic_failure_preserves_public_error(self):
+        server = DeliverySystemMCPServer("audit-error-fallback-failure-test")
+        tool_calls = 0
+        logger_failure_marker = "logger-failure-sensitive-marker"
+        fallback_failure_marker = "fallback-failure-sensitive-marker"
+
+        @server.tool(name="delivery_record_audit", structured_output=False)
+        def fail_audit():
+            nonlocal tool_calls
+            tool_calls += 1
+            raise ValueError("audit_stale")
+
+        class FailingHandler(logging.Handler):
+            def emit(self, record):
+                raise RuntimeError(logger_failure_marker)
+
+        logger = logging.getLogger("mcp_server.read_only_contracts")
+        old_level = logger.level
+        handler = FailingHandler()
+        logger.setLevel(logging.ERROR)
+        logger.addHandler(handler)
+        try:
+            with patch(
+                "mcp_server.read_only_contracts.os.write",
+                side_effect=OSError(fallback_failure_marker),
+            ):
+                result = self._call(server, "delivery_record_audit", {})
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(old_level)
+
+        self.assertTrue(result.is_error)
+        self.assertEqual(result.meta[META_KEY]["code"], "audit_stale")
+        self.assertEqual(result.content[0].text, descriptor_for_code("audit_stale").safe_text)
+        self.assertNotIn(logger_failure_marker, result.content[0].text)
+        self.assertNotIn(fallback_failure_marker, result.content[0].text)
+        self.assertNotIn(logger_failure_marker, str(result.meta))
+        self.assertNotIn(fallback_failure_marker, str(result.meta))
+        self.assertEqual(tool_calls, 1)
 
     def test_arbitrary_code_attribute_does_not_select_public_recovery(self):
         class SpoofedCodeError(RuntimeError):

@@ -1493,11 +1493,15 @@ class SQLitePreviewStore:
 class RuntimePlanner:
     """Shared Runtime planning boundary consumed by the MCP adapter."""
 
-    def __init__(self, context: RuntimeContext, store: Any, driver: Any = None, trust_context: Any = None):
+    def __init__(self, context: RuntimeContext, store: Any, driver: Any = None, trust_context: Any = None,
+                 rule_registry: RuleRegistry | None = None):
         self.context = context
         self.store = store
         self.driver = driver
         self.trust_context = trust_context
+        self.rule_registry = rule_registry or build_registry_v1()
+        if not isinstance(self.rule_registry, RuleRegistry):
+            raise ValueError("rule_registry_invalid")
         if driver is not None and not hasattr(driver, "read_repository"):
             raise TypeError("untrusted_driver_adapter")
         if driver is not None and self.trust_context is None:
@@ -1524,12 +1528,20 @@ class RuntimePlanner:
         fallback = next((item.get("failure_fingerprint") for item in canonical.get("planner_observations", []) if item.get("kind") == "driver_preflight_failure"), None)
         return (canonical.get("plan_digest"), canonical.get("operation_set_digest"), remote_digest, fallback)
 
+    def _audit_context_digest(self, preview_id: str, revision: int, sealed_preview_digest: str,
+                              evidence_records: Sequence[Mapping[str, Any]], audit_scope: str) -> str:
+        return compute_audit_context_digest(
+            self.context.workspace_identity, preview_id, revision, sealed_preview_digest,
+            evidence_records, self.rule_registry.registry_version,
+            self.rule_registry.registry_digest, audit_scope,
+        )
+
     def _return_existing_candidate(self, preview: Mapping[str, Any]) -> dict[str, Any]:
         canonical = dict(preview["canonical_payload"])
         evidence = self.store.get_evidence_records(self.context.workspace_identity, list(canonical.get("evidence_ids", [])))
-        audit_digest = compute_audit_context_digest(
-            self.context.workspace_identity, canonical["preview_id"], canonical["revision"],
-            canonical["sealed_preview_digest"], evidence,
+        audit_digest = self._audit_context_digest(
+            canonical["preview_id"], canonical["revision"], canonical["sealed_preview_digest"],
+            evidence, canonical["preview_level"],
         )
         result = dict(canonical)
         result.update({
@@ -1668,7 +1680,7 @@ class RuntimePlanner:
         else:
             self.store.save_preview_revision(**save_args)
         result = dict(canonical)
-        result.update({"remote_snapshot": None, "findings": [], "stale": False, "write_eligible": preview_level == PreviewLevel.WRITE_ELIGIBLE, "audit_context_digest": compute_audit_context_digest(self.context.workspace_identity, preview_id, revision, canonical["sealed_preview_digest"], [record.to_dict() for record in evidence])})
+        result.update({"remote_snapshot": None, "findings": [], "stale": False, "write_eligible": preview_level == PreviewLevel.WRITE_ELIGIBLE, "audit_context_digest": self._audit_context_digest(preview_id, revision, canonical["sealed_preview_digest"], [record.to_dict() for record in evidence], preview_level.value)})
         return result
 
     def preview(self, plan: Mapping[str, Any], previous_preview_id: str | None = None) -> dict[str, Any]:
@@ -1876,9 +1888,9 @@ class RuntimePlanner:
             if self._state_fingerprint(canonical, [record.to_dict() for record in evidence]) != self._state_fingerprint(winner_canonical, winner_evidence):
                 raise
             return self._return_existing_candidate(winner)
-        canonical["audit_context_digest"] = compute_audit_context_digest(
-            self.context.workspace_identity, preview_id, revision,
-            canonical["sealed_preview_digest"], [record.to_dict() for record in evidence],
+        canonical["audit_context_digest"] = self._audit_context_digest(
+            preview_id, revision, canonical["sealed_preview_digest"],
+            [record.to_dict() for record in evidence], canonical["preview_level"],
         )
         result = dict(canonical)
         result.update({
