@@ -1597,6 +1597,48 @@ class RuntimePlanner:
         plan_digest = digest({"canonical_version": "2", "semantic_payload": semantic})
         operation_set_digest = digest(operation_set_digest_payload_v2(operation_intents))
         request_id = self._id("request"); preview_id = self._id("preview"); revision = 1
+        prior_items: dict[str, dict[str, Any]] = {}
+        prior_revision: int | None = None
+        if previous_preview_id is not None:
+            prior = self.store.get_preview(self.context.workspace_identity, previous_preview_id)
+            prior_canonical = prior.get("canonical_payload")
+            if (not isinstance(prior_canonical, Mapping)
+                    or prior.get("preview_id") != previous_preview_id
+                    or not isinstance(prior.get("request_id"), str)
+                    or not prior.get("request_id")
+                    or prior_canonical.get("request_id") != prior.get("request_id")
+                    or prior_canonical.get("preview_id") != previous_preview_id
+                    or prior_canonical.get("workspace_identity") != self.context.workspace_identity):
+                raise ValueError("preview_lineage_invalid")
+            prior_revision = prior.get("revision")
+            if not isinstance(prior_revision, int) or isinstance(prior_revision, bool) or prior_revision < 1:
+                raise ValueError("preview_lineage_invalid")
+            canonical_revision = prior_canonical.get("revision")
+            if (not isinstance(canonical_revision, int) or isinstance(canonical_revision, bool)
+                    or canonical_revision != prior_revision):
+                raise ValueError("preview_lineage_invalid")
+            stored_items = prior_canonical.get("items")
+            if not isinstance(stored_items, list):
+                raise ValueError("preview_lineage_invalid")
+            stored_item_ids: set[str] = set()
+            for stored_item in stored_items:
+                if (not isinstance(stored_item, Mapping)
+                        or not isinstance(stored_item.get("client_ref"), str)
+                        or not stored_item.get("client_ref")
+                        or not isinstance(stored_item.get("item_id"), str)
+                        or not stored_item.get("item_id")
+                        or stored_item["client_ref"] in prior_items
+                        or stored_item["item_id"] in stored_item_ids):
+                    raise ValueError("preview_lineage_ambiguous")
+                prior_items[stored_item["client_ref"]] = dict(stored_item)
+                stored_item_ids.add(stored_item["item_id"])
+            request_id = prior["request_id"]
+            preview_id = previous_preview_id
+            if (prior_canonical.get("plan_digest") != plan_digest
+                    or prior_canonical.get("operation_set_digest") != operation_set_digest):
+                revision = prior_revision + 1
+            else:
+                revision = prior_revision
         validated_facts = None; failures: tuple[Any, ...] = (); promotion = None
         query_scope = {
             "api_origin": getattr(self.trust_context, "origin", "offline://driver"), "api_version": "2026-03-10",
@@ -1606,8 +1648,56 @@ class RuntimePlanner:
         }
         if repository_name is not None and self.driver is not None:
             validated_facts, failures = validate_driver_facts(self.driver, repository_name, query_scope, self.trust_context.trusted_driver_identity)
+        current_failure_codes = tuple(sorted({failure.code for failure in failures}))
+        current_failure_fingerprint = digest({
+            "domain": "delivery-system:driver-preflight-failure:v1",
+            "repository": repository_name,
+            "query_scope": query_scope,
+            "failure_codes": list(current_failure_codes),
+        }) if current_failure_codes else None
+        if previous_preview_id is not None and revision == prior_revision:
+            prior_evidence_ids = list(prior_canonical.get("evidence_ids", []))
+            prior_remote_content_digest = None
+            if prior_evidence_ids:
+                prior_evidence = self.store.get_evidence_records(self.context.workspace_identity, prior_evidence_ids)
+                driver_evidence = [record for record in prior_evidence if record.get("source_kind") == "driver"]
+                if len(driver_evidence) == 1:
+                    prior_remote_content_digest = digest(driver_evidence[0].get("payload"))
+            prior_observations = prior_canonical.get("planner_observations", [])
+            prior_failure_fingerprint = next((
+                observation.get("failure_fingerprint")
+                for observation in prior_observations
+                if observation.get("kind") == "driver_preflight_failure"
+            ), None)
+            current_remote_content_digest = validated_facts.remote_content_digest if validated_facts is not None else None
+            if (prior_remote_content_digest != current_remote_content_digest
+                    or prior_failure_fingerprint != current_failure_fingerprint):
+                revision = prior_revision + 1
         blockers = [failure.code for failure in failures]
-        sealed_items = [{"client_ref": item["client_ref"], "previous_client_ref": item.get("previous_client_ref"), "item_id": self._id("item")} for item in work_items]
+        sealed_items = []
+        for item in work_items:
+            ref = item["client_ref"]
+            previous_ref = item.get("previous_client_ref")
+            if ref in prior_items:
+                item_id = prior_items[ref]["item_id"]
+                if previous_ref is not None:
+                    inherited_item_id = self.store.resolve_item_id(
+                        self.context.workspace_identity, previous_preview_id or "", previous_ref, prior_revision,
+                    )
+                    if inherited_item_id != item_id:
+                        raise ValueError("preview_lineage_ambiguous")
+            elif previous_ref is not None:
+                if previous_preview_id is None or not isinstance(previous_ref, str) or not previous_ref:
+                    raise ValueError("lineage_not_found")
+                item_id = self.store.resolve_item_id(
+                    self.context.workspace_identity, previous_preview_id, previous_ref, prior_revision,
+                )
+            else:
+                item_id = self._id("item")
+            sealed_items.append({"client_ref": ref, "previous_client_ref": previous_ref, "item_id": item_id})
+        item_ids = [item["item_id"] for item in sealed_items]
+        if len(item_ids) != len(set(item_ids)):
+            raise ValueError("preview_lineage_ambiguous")
         snapshot_payload = None; snapshot_digest = None; repository_identity = None; remote_authority = None
         endpoint_bindings: list[dict[str, Any]] = []
         if validated_facts is not None:
@@ -1662,7 +1752,12 @@ class RuntimePlanner:
             "remote_authority": remote_authority, "semantic_payload": semantic, "operation_intents": list(operation_evaluation.operations or operation_intents),
             "plan_digest": plan_digest, "operation_set_digest": operation_set_digest, "remote_snapshot": snapshot_payload,
             "remote_snapshot_digest": snapshot_digest, "items": sealed_items, "evidence_ids": [], "blockers": sorted(set(blockers)),
-            "planner_observations": [], "canonical_version": "2", "existing_endpoint_bindings": endpoint_bindings,
+            "planner_observations": ([{
+                "kind": "driver_preflight_failure",
+                "failure_codes": list(current_failure_codes),
+                "failure_fingerprint": current_failure_fingerprint,
+            }] if current_failure_codes else []),
+            "canonical_version": "2", "existing_endpoint_bindings": endpoint_bindings,
         }
         evidence = []
         for sealed_item in semantic["work_items"]:

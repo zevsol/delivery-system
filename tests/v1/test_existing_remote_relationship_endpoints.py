@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import sqlite3
+from contextlib import closing
 from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -28,7 +30,7 @@ from delivery_system.remote_snapshot import RemoteIssueRecordV2
 from delivery_system.receipts import ApplicationReceipt
 from delivery_system.auditor import RuleEvaluationDraft, RuntimeAuditor
 from delivery_system.rules import SemanticOutcome, build_registry_v1
-from delivery_system.runtime import ApplicationPostconditionObservation, InMemoryPreviewStore, RuntimeApplicationStatusService, RuntimeApprovalAuthorityService, RuntimeContext, RuntimePlanner
+from delivery_system.runtime import ApplicationPostconditionObservation, InMemoryPreviewStore, SQLitePreviewStore, RuntimeApplicationStatusService, RuntimeApprovalAuthorityService, RuntimeContext, RuntimePlanner
 from tests.attestation_contract.test_attestation_contract import FakeCapabilityPolicy, FakeIssuer
 from tests.fakes.attestation_provider import FakeCapabilityResolver, FakeCredentialCapabilityProvider
 from tests.v1 import test_operational_approval_authority as approval_fixture
@@ -36,6 +38,8 @@ from tests.v1 import test_pc2b_applier_orchestration as applier_fixture
 from tests.v1.test_operational_approval_authority import i3b_dependencies
 from delivery_system.write_operations import evaluate_write_operations_v2, operation_set_digest_payload
 from delivery_system.preview_validation import _validate_v2_endpoint_authority
+from delivery_system.drivers.preflight import _remote_content_payload
+from delivery_system.drivers.preflight import validate_driver_facts as _validate_driver_facts
 
 
 TRUST = DriverTrustContext("fixture-driver", "offline://fixture", "fixture-v1")
@@ -89,6 +93,31 @@ class _Driver:
         return DriverReadResponse(**payload, remote_content_digest=digest(payload))
 
 
+class _MutableDriver(_Driver):
+    def __init__(self):
+        self.changed = False
+
+    def read_repository(self, repository, query_scope):
+        response = super().read_repository(repository, query_scope)
+        if not self.changed:
+            return response
+        issue_records = [dict(record) for record in response.issue_records]
+        issue_records[0]["updated_at"] = "2026-08-14T00:00:00+00:00"
+        evidence_material = [dict(record) for record in response.evidence_material]
+        evidence_material[0]["payload"] = {
+            "issue_records": issue_records,
+            "relationship_records": list(response.relationship_records),
+        }
+        changed_response = replace(
+            response, issue_records=issue_records, evidence_material=evidence_material,
+        )
+        remote_digest = digest(_remote_content_payload(
+            changed_response, changed_response.canonical_repository,
+            TRUST.trusted_driver_identity,
+        ))
+        return replace(changed_response, remote_content_digest=remote_digest)
+
+
 def _mixed_plan(kind="planned_parent"):
     return {
         "repository_claim": {"owner": "Owner", "name": "Repo"},
@@ -111,6 +140,25 @@ def _mixed_plan(kind="planned_parent"):
     }
 
 
+def _two_work_item_plan():
+    plan = _mixed_plan()
+    plan["work_items"].append(_item("second-child"))
+    plan["planned_relationships"].append({
+        "kind": "planned_parent",
+        "from_endpoint": {"endpoint_type": "work_item", "client_ref": "second-child"},
+        "to_endpoint": {"endpoint_type": "existing_issue", "endpoint_ref": "existing-parent"},
+        "rationale": _s("The second item also belongs under the existing outcome."),
+    })
+    plan["operation_intents"].extend([
+        {"operation_kind": "create_issue", "endpoint": {"endpoint_type": "work_item", "client_ref": "second-child"}, "depends_on": []},
+        {"operation_kind": "add_sub_issue", "operands": [
+            {"endpoint_type": "work_item", "client_ref": "second-child"},
+            {"endpoint_type": "existing_issue", "endpoint_ref": "existing-parent"},
+        ], "depends_on": []},
+    ])
+    return plan
+
+
 def _mixed_plan_shape(kind, source_type, target_type):
     plan = _mixed_plan(kind)
     source = {"endpoint_type": source_type}
@@ -130,6 +178,319 @@ def _mixed_plan_shape(kind, source_type, target_type):
 
 
 class ExistingRemoteRelationshipEndpointTests(unittest.TestCase):
+    def _passed_audit(self, context, store, preview):
+        auditor = RuntimeAuditor(context, store, build_registry_v1(), TRUST)
+        audit_context = auditor.get_context(preview["preview_id"], preview["revision"])
+        evaluations = [
+            RuleEvaluationDraft(rule["rule_id"], rule["rule_version"], SemanticOutcome.PASSED, "verified")
+            for rule in audit_context["semantic_rule_contexts"] if rule["applicability"] == "Applicable"
+        ]
+        return auditor.record_audit(
+            preview["preview_id"], preview["revision"], audit_context["audit_context_digest"], evaluations, [],
+        )
+
+    @staticmethod
+    def _sqlite_store(context):
+        return SQLitePreviewStore(
+            context, trust_context=TRUST, ignore_checker=lambda _: True, tracked_checker=lambda _: False,
+        )
+
+    @staticmethod
+    def _sqlite_preview_counts(store, preview_id):
+        with closing(store._connect()) as connection:
+            preview_count = connection.execute(
+                "SELECT COUNT(*) FROM records WHERE workspace_identity=? AND record_type='preview' AND record_id=?",
+                (store.context.workspace_identity, preview_id),
+            ).fetchone()[0]
+            lineage_count = connection.execute(
+                "SELECT COUNT(*) FROM item_lineage WHERE workspace_identity=? AND preview_id=?",
+                (store.context.workspace_identity, preview_id),
+            ).fetchone()[0]
+        return preview_count, lineage_count
+
+    def test_v2_preflight_failure_change_advances_revision_and_stales_audit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            context = RuntimeContext.from_workspace_root(directory)
+            store = InMemoryPreviewStore(context.workspace_identity, TRUST)
+            planner = RuntimePlanner(context, store, _Driver(), TRUST)
+            failure_a = (None, (SimpleNamespace(code="failure-b"), SimpleNamespace(code="failure-a")))
+            failure_b = (None, (SimpleNamespace(code="failure-c"),))
+            with patch("delivery_system.runtime.validate_driver_facts", side_effect=[failure_a, failure_b]):
+                first = planner.preview(_two_work_item_plan())
+                audit = self._passed_audit(context, store, first)
+                first_observation = first["planner_observations"][0]
+                expected_fingerprint = digest({
+                    "domain": "delivery-system:driver-preflight-failure:v1",
+                    "repository": "Owner/Repo",
+                    "query_scope": _Driver.fixed_query_scope,
+                    "failure_codes": ["failure-a", "failure-b"],
+                })
+                self.assertEqual(first_observation["failure_codes"], ["failure-a", "failure-b"])
+                self.assertEqual(first_observation["failure_fingerprint"], expected_fingerprint)
+                second = planner.preview(_two_work_item_plan(), first["preview_id"])
+            self.assertEqual(second["revision"], first["revision"] + 1)
+            self.assertEqual(second["planner_observations"][0]["failure_codes"], ["failure-c"])
+            self.assertEqual(store.get_audit(context.workspace_identity, audit.audit_id).status.value, "Stale")
+
+    def test_v2_repeated_preflight_failure_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            context = RuntimeContext.from_workspace_root(directory)
+            store = InMemoryPreviewStore(context.workspace_identity, TRUST)
+            planner = RuntimePlanner(context, store, _Driver(), TRUST)
+            failure_a = (None, (SimpleNamespace(code="failure-a"),))
+            with patch("delivery_system.runtime.validate_driver_facts", side_effect=[failure_a, failure_a]):
+                first = planner.preview(_two_work_item_plan())
+                second = planner.preview(_two_work_item_plan(), first["preview_id"])
+            self.assertEqual(second["revision"], first["revision"])
+            self.assertEqual(second["preview_id"], first["preview_id"])
+            self.assertEqual(second["planner_observations"], first["planner_observations"])
+
+    def test_v2_preflight_recovery_advances_revision_and_stales_audit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            context = RuntimeContext.from_workspace_root(directory)
+            store = InMemoryPreviewStore(context.workspace_identity, TRUST)
+            driver = _Driver()
+            planner = RuntimePlanner(context, store, driver, TRUST)
+            failure_a = (None, (SimpleNamespace(code="failure-a"),))
+            recovered = _validate_driver_facts(driver, "Owner/Repo", _Driver.fixed_query_scope, TRUST.trusted_driver_identity)
+            with patch("delivery_system.runtime.validate_driver_facts", side_effect=[failure_a, recovered]):
+                first = planner.preview(_two_work_item_plan())
+                audit = self._passed_audit(context, store, first)
+                second = planner.preview(_two_work_item_plan(), first["preview_id"])
+            self.assertEqual(second["revision"], first["revision"] + 1)
+            self.assertEqual(second["planner_observations"], [])
+            self.assertEqual(store.get_audit(context.workspace_identity, audit.audit_id).status.value, "Stale")
+
+    def test_sqlite_v2_multi_item_lineage_and_client_ref_rename(self):
+        with tempfile.TemporaryDirectory() as directory:
+            context = RuntimeContext.from_workspace_root(directory)
+            store = self._sqlite_store(context)
+            planner = RuntimePlanner(context, store, _Driver(), TRUST)
+            initial_plan = _two_work_item_plan()
+            first = planner.preview(initial_plan)
+            first_ids = {item["client_ref"]: item["item_id"] for item in first["items"]}
+
+            revised = deepcopy(initial_plan)
+            revised["work_items"][0]["title"] = _s("SQLite revised title")
+            second = planner.preview(revised, first["preview_id"])
+            self.assertEqual(second["revision"], first["revision"] + 1)
+            self.assertEqual({item["client_ref"]: item["item_id"] for item in second["items"]}, first_ids)
+            self.assertEqual(second["semantic_payload"]["planned_relationships"], first["semantic_payload"]["planned_relationships"])
+
+            renamed = deepcopy(revised)
+            renamed["work_items"][0]["client_ref"] = "renamed-child"
+            renamed["work_items"][0]["previous_client_ref"] = "new-child"
+            third = planner.preview(renamed, first["preview_id"])
+            self.assertEqual(third["revision"], second["revision"] + 1)
+            self.assertEqual(third["items"][0]["item_id"], first_ids["new-child"])
+            self.assertEqual(third["items"][1]["item_id"], first_ids["second-child"])
+
+    def test_sqlite_v2_remote_content_change_increments_revision_and_stales_audit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            context = RuntimeContext.from_workspace_root(directory)
+            store = self._sqlite_store(context)
+            driver = _MutableDriver()
+            planner = RuntimePlanner(context, store, driver, TRUST)
+            first = planner.preview(_two_work_item_plan())
+            audit = self._passed_audit(context, store, first)
+            driver.changed = True
+            second = planner.preview(_two_work_item_plan(), first["preview_id"])
+            self.assertEqual(second["revision"], first["revision"] + 1)
+            self.assertEqual(store.get_audit(context.workspace_identity, audit.audit_id).status.value, "Stale")
+
+    def test_sqlite_v2_duplicate_and_contradictory_lineage_fail_without_partial_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            context = RuntimeContext.from_workspace_root(directory)
+            store = self._sqlite_store(context)
+            planner = RuntimePlanner(context, store, _Driver(), TRUST)
+            original_plan = _two_work_item_plan()
+            first = planner.preview(original_plan)
+            before_counts = self._sqlite_preview_counts(store, first["preview_id"])
+
+            duplicate = deepcopy(original_plan)
+            duplicate_item = _item("duplicate-child")
+            duplicate_item["previous_client_ref"] = "new-child"
+            duplicate["work_items"].append(duplicate_item)
+            duplicate["planned_relationships"].append({
+                "kind": "planned_parent",
+                "from_endpoint": {"endpoint_type": "work_item", "client_ref": "duplicate-child"},
+                "to_endpoint": {"endpoint_type": "existing_issue", "endpoint_ref": "existing-parent"},
+                "rationale": _s("The duplicate lineage must be rejected."),
+            })
+            duplicate["operation_intents"].extend([
+                {"operation_kind": "create_issue", "endpoint": {"endpoint_type": "work_item", "client_ref": "duplicate-child"}, "depends_on": []},
+                {"operation_kind": "add_sub_issue", "operands": [
+                    {"endpoint_type": "work_item", "client_ref": "duplicate-child"},
+                    {"endpoint_type": "existing_issue", "endpoint_ref": "existing-parent"},
+                ], "depends_on": []},
+            ])
+            with self.assertRaisesRegex(ValueError, "preview_lineage_ambiguous"):
+                planner.preview(duplicate, first["preview_id"])
+            self.assertEqual(self._sqlite_preview_counts(store, first["preview_id"]), before_counts)
+
+            contradictory = deepcopy(original_plan)
+            contradictory["work_items"][0]["previous_client_ref"] = "second-child"
+            with self.assertRaisesRegex(ValueError, "preview_lineage_ambiguous"):
+                planner.preview(contradictory, first["preview_id"])
+            self.assertEqual(self._sqlite_preview_counts(store, first["preview_id"]), before_counts)
+
+    def test_v2_existing_client_ref_cannot_claim_a_different_previous_item(self):
+        with tempfile.TemporaryDirectory() as directory:
+            context = RuntimeContext.from_workspace_root(directory)
+            store = InMemoryPreviewStore(context.workspace_identity, TRUST)
+            planner = RuntimePlanner(context, store, _Driver(), TRUST)
+            first = planner.preview(_two_work_item_plan())
+            contradictory = _two_work_item_plan()
+            contradictory["work_items"][0]["previous_client_ref"] = "second-child"
+            with self.assertRaisesRegex(ValueError, "preview_lineage_ambiguous"):
+                planner.preview(contradictory, first["preview_id"])
+            self.assertEqual(store.get_preview(context.workspace_identity, first["preview_id"])["revision"], first["revision"])
+
+    def test_v2_multi_item_revision_preserves_preview_item_and_relationship_lineage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            context = RuntimeContext.from_workspace_root(directory)
+            store = InMemoryPreviewStore(context.workspace_identity, TRUST)
+            planner = RuntimePlanner(context, store, _Driver(), TRUST)
+            first_plan = _two_work_item_plan()
+            first = planner.preview(first_plan)
+            first_ids = {item["client_ref"]: item["item_id"] for item in first["items"]}
+            changed = deepcopy(first_plan)
+            changed["work_items"][0]["title"] = _s("Revised first issue")
+            second = planner.preview(changed, first["preview_id"])
+            self.assertEqual(second["preview_id"], first["preview_id"])
+            self.assertEqual(second["request_id"], first["request_id"])
+            self.assertEqual(second["revision"], first["revision"] + 1)
+            self.assertEqual({item["client_ref"]: item["item_id"] for item in second["items"]}, first_ids)
+            self.assertEqual(second["existing_endpoint_bindings"], first["existing_endpoint_bindings"])
+            self.assertEqual(second["operation_intents"], first["operation_intents"])
+            self.assertEqual(second["semantic_payload"]["planned_relationships"], first["semantic_payload"]["planned_relationships"])
+
+    def test_v2_revision_resolves_new_ref_from_previous_client_ref_and_rejects_unknown_ref(self):
+        with tempfile.TemporaryDirectory() as directory:
+            context = RuntimeContext.from_workspace_root(directory)
+            store = InMemoryPreviewStore(context.workspace_identity, TRUST)
+            planner = RuntimePlanner(context, store, _Driver(), TRUST)
+            first = planner.preview(_two_work_item_plan())
+            first_ids = {item["client_ref"]: item["item_id"] for item in first["items"]}
+            revised = _two_work_item_plan()
+            revised["work_items"][0]["client_ref"] = "renamed-child"
+            revised["work_items"][0]["previous_client_ref"] = "new-child"
+            result = planner.preview(revised, first["preview_id"])
+            self.assertEqual(result["items"][0]["item_id"], first_ids["new-child"])
+            self.assertEqual(result["preview_id"], first["preview_id"])
+            self.assertEqual(result["revision"], first["revision"] + 1)
+
+            invalid = _two_work_item_plan()
+            invalid["work_items"][0]["client_ref"] = "unknown-child"
+            invalid["work_items"][0]["previous_client_ref"] = "missing"
+            with self.assertRaisesRegex(ValueError, "lineage_not_found|previous_client_ref"):
+                planner.preview(invalid, first["preview_id"])
+
+    def test_v2_revision_rejects_two_items_inheriting_one_prior_item_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            context = RuntimeContext.from_workspace_root(directory)
+            store = InMemoryPreviewStore(context.workspace_identity, TRUST)
+            planner = RuntimePlanner(context, store, _Driver(), TRUST)
+            first = planner.preview(_two_work_item_plan())
+            revised = _two_work_item_plan()
+            duplicate = _item("duplicate-child")
+            duplicate["previous_client_ref"] = "new-child"
+            revised["work_items"].append(duplicate)
+            revised["planned_relationships"].append({
+                "kind": "planned_parent",
+                "from_endpoint": {"endpoint_type": "work_item", "client_ref": "duplicate-child"},
+                "to_endpoint": {"endpoint_type": "existing_issue", "endpoint_ref": "existing-parent"},
+                "rationale": _s("This item must not duplicate prior lineage."),
+            })
+            revised["operation_intents"].extend([
+                {"operation_kind": "create_issue", "endpoint": {"endpoint_type": "work_item", "client_ref": "duplicate-child"}, "depends_on": []},
+                {"operation_kind": "add_sub_issue", "operands": [
+                    {"endpoint_type": "work_item", "client_ref": "duplicate-child"},
+                    {"endpoint_type": "existing_issue", "endpoint_ref": "existing-parent"},
+                ], "depends_on": []},
+            ])
+            with self.assertRaisesRegex(ValueError, "preview_lineage_ambiguous"):
+                planner.preview(revised, first["preview_id"])
+            self.assertEqual(store.get_preview(context.workspace_identity, first["preview_id"])["revision"], first["revision"])
+
+    def test_v2_missing_preview_lineage_fails_without_creating_preview(self):
+        with tempfile.TemporaryDirectory() as directory:
+            context = RuntimeContext.from_workspace_root(directory)
+            store = InMemoryPreviewStore(context.workspace_identity, TRUST)
+            planner = RuntimePlanner(context, store, _Driver(), TRUST)
+            with self.assertRaisesRegex(ValueError, "preview_not_found"):
+                planner.preview(_two_work_item_plan(), "missing-preview")
+
+    def test_v2_ambiguous_stored_item_lineage_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            context = RuntimeContext.from_workspace_root(directory)
+            store = InMemoryPreviewStore(context.workspace_identity, TRUST)
+            planner = RuntimePlanner(context, store, _Driver(), TRUST)
+            first = planner.preview(_two_work_item_plan())
+            stored = store._previews[(context.workspace_identity, first["preview_id"])]
+            stored["canonical_payload"]["items"].append(deepcopy(stored["canonical_payload"]["items"][0]))
+            revised = _two_work_item_plan()
+            revised["work_items"][0]["title"] = _s("Revised title")
+            with self.assertRaisesRegex(ValueError, "preview_lineage_ambiguous"):
+                planner.preview(revised, first["preview_id"])
+
+    def test_v2_revision_marks_prior_audit_stale(self):
+        with tempfile.TemporaryDirectory() as directory:
+            context = RuntimeContext.from_workspace_root(directory)
+            store = InMemoryPreviewStore(context.workspace_identity, TRUST)
+            planner = RuntimePlanner(context, store, _Driver(), TRUST)
+            first = planner.preview(_two_work_item_plan())
+            auditor = RuntimeAuditor(context, store, build_registry_v1(), TRUST)
+            audit_context = auditor.get_context(first["preview_id"], first["revision"])
+            evaluations = [
+                RuleEvaluationDraft(rule["rule_id"], rule["rule_version"], SemanticOutcome.PASSED, "verified")
+                for rule in audit_context["semantic_rule_contexts"] if rule["applicability"] == "Applicable"
+            ]
+            audit = auditor.record_audit(first["preview_id"], first["revision"], audit_context["audit_context_digest"], evaluations, [])
+            changed = _two_work_item_plan()
+            changed["work_items"][0]["title"] = _s("Revised title")
+            second = planner.preview(changed, first["preview_id"])
+            self.assertEqual(second["revision"], first["revision"] + 1)
+            self.assertEqual(store.get_audit(context.workspace_identity, audit.audit_id).status.value, "Stale")
+
+    def test_v2_remote_content_change_increments_revision_and_stales_prior_audit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            context = RuntimeContext.from_workspace_root(directory)
+            store = InMemoryPreviewStore(context.workspace_identity, TRUST)
+            driver = _MutableDriver()
+            planner = RuntimePlanner(context, store, driver, TRUST)
+            first = planner.preview(_two_work_item_plan())
+            auditor = RuntimeAuditor(context, store, build_registry_v1(), TRUST)
+            audit_context = auditor.get_context(first["preview_id"], first["revision"])
+            evaluations = [
+                RuleEvaluationDraft(rule["rule_id"], rule["rule_version"], SemanticOutcome.PASSED, "verified")
+                for rule in audit_context["semantic_rule_contexts"] if rule["applicability"] == "Applicable"
+            ]
+            audit = auditor.record_audit(
+                first["preview_id"], first["revision"], audit_context["audit_context_digest"], evaluations, [],
+            )
+            driver.changed = True
+            second = planner.preview(_two_work_item_plan(), first["preview_id"])
+            self.assertEqual(second["preview_id"], first["preview_id"])
+            self.assertEqual(second["revision"], first["revision"] + 1)
+            self.assertEqual(store.get_audit(context.workspace_identity, audit.audit_id).status.value, "Stale")
+
+    def test_v1_revision_lineage_remains_unchanged(self):
+        from tests.local_rest_offline.test_repository_aware_runtime import plan as v1_plan
+        with tempfile.TemporaryDirectory() as directory:
+            context = RuntimeContext.from_workspace_root(directory)
+            store = InMemoryPreviewStore(context.workspace_identity)
+            planner = RuntimePlanner(context, store, None, None)
+            original = v1_plan()
+            original["operation_intents"] = [{"operation_kind": "create_issue", "client_refs": ["item"], "depends_on": []}]
+            first = planner.preview(original)
+            changed = deepcopy(original)
+            changed["work_items"][0]["title"] = _s("V1 revised title")
+            second = planner.preview(changed, first["preview_id"])
+            self.assertEqual(second["preview_id"], first["preview_id"])
+            self.assertEqual(second["revision"], first["revision"] + 1)
+            self.assertEqual(second["items"][0]["item_id"], first["items"][0]["item_id"])
+
     @staticmethod
     def _record(**overrides):
         record = {
