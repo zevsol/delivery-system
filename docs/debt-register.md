@@ -46,12 +46,12 @@ Every entry has Category, Status, Risk, Why deferred / rationale, Constraints pr
 
 ### ARC-HARNESS-01 — Tested integration harness
 - Category: Architecture; Status: Deferred; Risk: Medium
-- Why deferred / rationale: Reusable responsibilities are demonstrated; framework implementation is premature.
+- Why deferred / rationale: The reusable offline harness is implemented and deterministically tested. External GitHub Apply acceptance remains deferred because the current Host App/repository configuration is unavailable and a live canary was not authorized in this work unit.
 - Constraints preserved: Native product boundaries remain unmodified.
-- Evidence/reference: V1-INT1 retained evidence family.
-- Reconsideration trigger: Comparable live integration.
-- Review point: Before comparable integration.
-- Decision/owner state: Separate implementation authorization required.
+- Evidence/reference: `tests/integration/github_apply_harness.py`; `tests/integration/test_github_apply_harness.py`; CORE-GITHUB-APPLY-INTEGRATION-01 validation evidence.
+- Reconsideration trigger: One exact sandbox App/repository identity is configured and a live canary is separately authorized.
+- Review point: Before the first live GitHub Apply canary.
+- Decision/owner state: Offline harness implemented and tested; external acceptance remains blocked on Host readiness and separate live authorization.
 
 ### ARC-WORKSPACE-ID-01 — Workspace identity portability
 - Category: Architecture; Status: Open; Risk: Medium
