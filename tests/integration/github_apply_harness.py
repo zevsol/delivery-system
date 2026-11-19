@@ -233,8 +233,14 @@ def verify_checkout_provenance(
         ).stdout.strip().rstrip("/")
     except (OSError, subprocess.SubprocessError):
         raise HarnessConfigurationError("provenance_invalid") from None
+    accepted_origins = {
+        EXPECTED_ORIGIN_URL,
+        "https://github.com/zevsol/delivery-system",
+        "git@github.com:zevsol/delivery-system.git",
+        "git@github.com:zevsol/delivery-system",
+    }
     if (Path(actual_root).resolve() != root or actual_commit != expected_commit
-            or actual_origin not in {EXPECTED_ORIGIN_URL, "git@github.com:zevsol/delivery-system.git"}):
+            or actual_origin not in accepted_origins):
         raise HarnessConfigurationError("provenance_invalid")
     return actual_commit
 

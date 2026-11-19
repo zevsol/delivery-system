@@ -238,6 +238,29 @@ class GitHubApplyHarnessTests(unittest.TestCase):
         with self.assertRaisesRegex(HarnessConfigurationError, "provenance_invalid"):
             verify_checkout_provenance(checkout, "0" * 40, run=fake_run)
 
+    def test_provenance_accepts_canonical_origin_spellings(self) -> None:
+        checkout = Path(__file__).resolve().parents[2]
+        current_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=checkout, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+        for origin in (
+            "https://github.com/zevsol/delivery-system.git",
+            "https://github.com/zevsol/delivery-system",
+            "git@github.com:zevsol/delivery-system.git",
+            "git@github.com:zevsol/delivery-system",
+        ):
+            outputs = [str(checkout), current_head, origin]
+
+            def fake_run(*args, **kwargs):
+                return subprocess.CompletedProcess(args[0], 0, outputs.pop(0), "")
+
+            with self.subTest(origin=origin):
+                self.assertEqual(
+                    verify_checkout_provenance(checkout, current_head, run=fake_run),
+                    current_head,
+                )
+
     def test_subprocess_timeout_terminates_child_and_does_not_retry(self) -> None:
         started: list[subprocess.Popen[bytes]] = []
 
