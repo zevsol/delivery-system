@@ -6,14 +6,22 @@ from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
+import select
+import socket
+import socketserver
+import ssl
 import tempfile
+import threading
 import unittest
 import uuid
 from unittest.mock import patch
 
 import jwt
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec, ed25519, rsa
+from cryptography.x509.oid import NameOID
 
 from delivery_system.attestation_github_app import GitHubAppInstallationCapabilityEvidence
 from delivery_system.github_app_bootstrap import (
@@ -35,7 +43,7 @@ from delivery_system.github_app_credential import GitHubAppInstallationCredentia
 
 
 NOW = datetime(2026, 9, 6, 12, tzinfo=timezone.utc)
-CONFIG = GitHubAppBootstrapConfig(12345, "owner/repo", 67890, "C:\\outside\\app.pem")
+CONFIG = GitHubAppBootstrapConfig(12345, "owner/repo", 67890, "/outside/app.pem")
 TOKEN = "synthetic-installation-token"
 INSTALLATION_ID = 54321
 INSTANCE_IDS = iter((str(uuid.uuid4()), str(uuid.uuid4())))
@@ -234,6 +242,35 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(source.calls, 0)
         self.assertEqual(transport.calls, [])
         self.assertNotIn(TOKEN, repr(bootstrapper))
+
+    def test_proxy_configuration_is_explicit_and_fail_closed(self):
+        def config(proxy):
+            return GitHubAppBootstrapConfig(
+                CONFIG.app_id, CONFIG.repository_identity, CONFIG.repository_id,
+                CONFIG.private_key_path, proxy,
+            )
+
+        self.assertEqual(
+            config("http://127.0.0.1:7897").https_proxy,
+            "http://127.0.0.1:7897",
+        )
+        invalid = (
+            "https://proxy.example:8443",
+            "ftp://proxy.example:21",
+            "http://user:password@proxy.example:8080",
+            "http://proxy.example:8080/path",
+            "http://proxy.example:8080?x=1",
+            "http://proxy.example:8080#fragment",
+            "http://:8080",
+            "http://proxy.example:0",
+            "http://proxy.example:65536",
+            "http://proxy.example:not-a-port",
+        )
+        for proxy in invalid:
+            with self.subTest(proxy=proxy), self.assertRaisesRegex(
+                GitHubAppBootstrapError, "credential_configuration_invalid"
+            ):
+                config(proxy)
 
 
 class KeySourceTests(unittest.TestCase):
@@ -462,7 +499,7 @@ class BootstrapTests(unittest.TestCase):
                     bootstrap(transport=transport).acquire()
 
     def test_remote_boolean_ids_are_rejected(self):
-        config = GitHubAppBootstrapConfig(1, "owner/repo", 1, "C:\\outside\\app.pem")
+        config = GitHubAppBootstrapConfig(1, "owner/repo", 1, "/outside/app.pem")
 
         def matching_transport():
             return FakeTransport(
@@ -704,6 +741,290 @@ class BootstrapTests(unittest.TestCase):
 
 
 class TransportTests(unittest.TestCase):
+    def test_local_proxy_connect_keeps_tls_end_to_end_and_cleans_up(self):
+        """Exercise the real CONNECT path against loopback-only test servers."""
+        now = datetime.now(timezone.utc)
+        ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "local test CA")])
+        ca_certificate = (
+            x509.CertificateBuilder()
+            .subject_name(ca_name)
+            .issuer_name(ca_name)
+            .public_key(ca_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - timedelta(minutes=1))
+            .not_valid_after(now + timedelta(hours=1))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+            .sign(ca_key, hashes.SHA256())
+        )
+        server_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        server_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, API_HOST)])
+        server_certificate = (
+            x509.CertificateBuilder()
+            .subject_name(server_name)
+            .issuer_name(ca_name)
+            .public_key(server_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - timedelta(minutes=1))
+            .not_valid_after(now + timedelta(hours=1))
+            .add_extension(x509.SubjectAlternativeName([x509.DNSName(API_HOST)]), critical=False)
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .sign(ca_key, hashes.SHA256())
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            ca_path = directory / "ca.pem"
+            certificate_path = directory / "server.pem"
+            key_path = directory / "server-key.pem"
+            ca_bytes = ca_certificate.public_bytes(serialization.Encoding.PEM)
+            ca_path.write_bytes(ca_bytes)
+            certificate_path.write_bytes(server_certificate.public_bytes(serialization.Encoding.PEM))
+            key_path.write_bytes(
+                server_key.private_bytes(
+                    serialization.Encoding.PEM,
+                    serialization.PrivateFormat.TraditionalOpenSSL,
+                    serialization.NoEncryption(),
+                )
+            )
+
+            destination_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            destination_listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            destination_listener.bind(("127.0.0.1", 0))
+            destination_listener.listen(1)
+            destination_port = destination_listener.getsockname()[1]
+            destination_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            destination_context.load_cert_chain(certificate_path, key_path)
+            destination_request = {}
+            destination_done = threading.Event()
+
+            def serve_destination():
+                try:
+                    destination_listener.settimeout(10)
+                    raw_connection, _ = destination_listener.accept()
+                    with destination_context.wrap_socket(raw_connection, server_side=True) as connection:
+                        request = bytearray()
+                        while b"\r\n\r\n" not in request and len(request) <= MAX_REQUEST_BYTES:
+                            chunk = connection.recv(4096)
+                            if not chunk:
+                                break
+                            request.extend(chunk)
+                        destination_request["bytes"] = bytes(request)
+                        connection.sendall(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                            b"Content-Length: 2\r\nConnection: close\r\n\r\n{}"
+                        )
+                finally:
+                    destination_done.set()
+
+            destination_thread = threading.Thread(target=serve_destination, daemon=True)
+            destination_thread.start()
+            proxy_state = {}
+
+            class ProxyHandler(socketserver.BaseRequestHandler):
+                def handle(self):
+                    request = bytearray()
+                    while b"\r\n\r\n" not in request and len(request) <= MAX_REQUEST_BYTES:
+                        chunk = self.request.recv(4096)
+                        if not chunk:
+                            return
+                        request.extend(chunk)
+                    proxy_state["connect_headers"] = bytes(request)
+                    first_line = bytes(request).split(b"\r\n", 1)[0]
+                    parts = first_line.split()
+                    proxy_state["target"] = parts[1].decode("ascii") if len(parts) >= 2 else None
+                    if proxy_state["target"] != f"{API_HOST}:443":
+                        self.request.sendall(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                        return
+                    upstream = socket.create_connection(("127.0.0.1", destination_port), timeout=10)
+                    try:
+                        self.request.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                        sockets = (self.request, upstream)
+                        while True:
+                            readable, _, _ = select.select(sockets, (), (), 10)
+                            if not readable:
+                                return
+                            for source in readable:
+                                payload = source.recv(65536)
+                                if not payload:
+                                    return
+                                target = upstream if source is self.request else self.request
+                                target.sendall(payload)
+                    finally:
+                        upstream.close()
+
+            class LocalProxy(socketserver.ThreadingTCPServer):
+                allow_reuse_address = True
+                daemon_threads = True
+
+            proxy_server = LocalProxy(("127.0.0.1", 0), ProxyHandler)
+            proxy_thread = threading.Thread(target=proxy_server.serve_forever, daemon=True)
+            proxy_thread.start()
+            proxy_port = proxy_server.server_address[1]
+            try:
+                original_context_factory = ssl.create_default_context
+
+                def test_context_factory(*args, **kwargs):
+                    context = original_context_factory(*args, **kwargs)
+                    context.load_verify_locations(cafile=ca_path)
+                    return context
+
+                with patch("delivery_system.github_app_bootstrap.ssl.create_default_context", test_context_factory):
+                    response = HttpsGitHubAppBootstrapTransport(
+                        f"http://127.0.0.1:{proxy_port}"
+                    ).get_app("synthetic-jwt")
+                self.assertEqual(response.status, 200)
+                self.assertEqual(proxy_state["target"], f"{API_HOST}:443")
+                self.assertNotIn(b"authorization:", proxy_state["connect_headers"].lower())
+                self.assertIn(b"Authorization: Bearer synthetic-jwt", destination_request["bytes"])
+                self.assertTrue(destination_done.wait(2))
+            finally:
+                proxy_server.shutdown()
+                proxy_server.server_close()
+                proxy_thread.join(timeout=2)
+                destination_listener.close()
+                destination_thread.join(timeout=2)
+            self.assertFalse(proxy_thread.is_alive())
+            self.assertFalse(destination_thread.is_alive())
+
+    def test_proxy_uses_exact_connect_target_and_end_to_end_tls_context(self):
+        calls = {}
+
+        class Sock:
+            def settimeout(self, value):
+                calls["socket_timeout"] = value
+
+        class Response:
+            status = 200
+
+            def getheaders(self):
+                return [("Content-Type", "application/vnd.github+json")]
+
+            def read(self, amount):
+                return b"{}"
+
+        class ProxyConnection:
+            sock = Sock()
+
+            def __init__(self, host, port, timeout, context):
+                calls["connection"] = (host, port, timeout, context)
+
+            def set_tunnel(self, host, port, headers=None):
+                calls["tunnel"] = (host, port, headers)
+
+            def connect(self):
+                calls["connected"] = True
+
+            def request(self, method, path, body, headers):
+                calls["request"] = (method, path, body, headers)
+
+            def getresponse(self):
+                return Response()
+
+            def close(self):
+                calls["closed"] = True
+
+        with patch("delivery_system.github_app_bootstrap.http.client.HTTPSConnection", ProxyConnection):
+            response = HttpsGitHubAppBootstrapTransport("http://127.0.0.1:7897").get_app("jwt")
+        self.assertEqual(response.status, 200)
+        self.assertEqual(calls["connection"][:3], ("127.0.0.1", 7897, 10))
+        context = calls["connection"][3]
+        self.assertTrue(context.check_hostname)
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertEqual(calls["tunnel"], (API_HOST, 443, None))
+        self.assertEqual(calls["request"][0:2], ("GET", "/app"))
+        self.assertEqual(calls["request"][3]["Authorization"], "Bearer jwt")
+        self.assertTrue(calls["connected"])
+        self.assertTrue(calls["closed"])
+
+    def test_ambient_proxy_environment_does_not_change_direct_mode(self):
+        calls = {}
+
+        class Response:
+            status = 200
+
+            def getheaders(self):
+                return [("Content-Type", "application/vnd.github+json")]
+
+            def read(self, amount):
+                return b"{}"
+
+        class DirectConnection:
+            sock = None
+
+            def __init__(self, host, timeout, context):
+                calls["connection"] = (host, timeout, context)
+
+            def connect(self):
+                pass
+
+            def request(self, *args, **kwargs):
+                pass
+
+            def getresponse(self):
+                return Response()
+
+            def close(self):
+                calls["closed"] = True
+
+        with patch.dict(os.environ, {"HTTP_PROXY": "http://proxy.example:8080", "HTTPS_PROXY": "http://proxy.example:8080"}), patch(
+            "delivery_system.github_app_bootstrap.http.client.HTTPSConnection", DirectConnection
+        ):
+            HttpsGitHubAppBootstrapTransport().get_app("jwt")
+        self.assertEqual(calls["connection"][0], API_HOST)
+        self.assertTrue(calls["closed"])
+
+    def test_proxy_connect_tls_and_upstream_failures_close_connection(self):
+        for failure in (OSError("connect rejected"), TimeoutError("connect timeout"), ssl.SSLCertVerificationError("certificate failed")):
+            calls = {"closed": False}
+
+            class Connection:
+                sock = None
+
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                def set_tunnel(self, *args, **kwargs):
+                    pass
+
+                def connect(self):
+                    raise failure
+
+                def close(self):
+                    calls["closed"] = True
+
+            with self.subTest(failure=type(failure).__name__), patch(
+                "delivery_system.github_app_bootstrap.http.client.HTTPSConnection", Connection
+            ), self.assertRaisesRegex(GitHubAppBootstrapError, "credential_acquisition_failed"):
+                HttpsGitHubAppBootstrapTransport("http://proxy.example:8080").get_app("jwt")
+            self.assertTrue(calls["closed"])
+
+        calls = {"closed": False}
+
+        class UpstreamTimeoutConnection:
+            sock = None
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def set_tunnel(self, *args, **kwargs):
+                pass
+
+            def connect(self):
+                pass
+
+            def request(self, *args, **kwargs):
+                raise TimeoutError("upstream timeout")
+
+            def close(self):
+                calls["closed"] = True
+
+        with patch(
+            "delivery_system.github_app_bootstrap.http.client.HTTPSConnection", UpstreamTimeoutConnection
+        ), self.assertRaisesRegex(GitHubAppBootstrapError, "credential_acquisition_failed"):
+            HttpsGitHubAppBootstrapTransport("http://proxy.example:8080").get_app("jwt")
+        self.assertTrue(calls["closed"])
+
     def test_direct_transport_operations_have_secret_free_tracebacks(self):
         app_jwt = "SENTINEL_APP_JWT_DO_NOT_LEAK"
         installation_token = "SENTINEL_INSTALLATION_TOKEN_DO_NOT_LEAK"

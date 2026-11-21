@@ -56,6 +56,7 @@ class HostConfigurationContractTests(unittest.TestCase):
             "DELIVERY_SYSTEM_REVOCATION_AUTH_TOKEN_PATH",
             "DELIVERY_SYSTEM_ATTESTATION_LIFECYCLE_PATH",
             "DELIVERY_SYSTEM_AUTHORITY_BINDING_LIFECYCLE_PATH",
+            "DELIVERY_SYSTEM_GITHUB_HTTPS_PROXY",
         })
         self.assertEqual(forbidden, {"DELIVERY_SYSTEM_GITHUB_INSTALLATION_ID"})
         self.assertEqual(required & optional, set())

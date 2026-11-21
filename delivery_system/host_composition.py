@@ -141,6 +141,7 @@ _HOST_ENVIRONMENT_FIELDS = (
     _HostEnvironmentField("DELIVERY_SYSTEM_GITHUB_REPOSITORY", "github_repository", "required", "non-secret"),
     _HostEnvironmentField("DELIVERY_SYSTEM_GITHUB_REPOSITORY_ID", "github_repository_id", "required", "non-secret"),
     _HostEnvironmentField("DELIVERY_SYSTEM_GITHUB_APP_PRIVATE_KEY_PATH", "github_app_private_key_path", "required", "protected-reference"),
+    _HostEnvironmentField("DELIVERY_SYSTEM_GITHUB_HTTPS_PROXY", "github_https_proxy", "optional", "non-secret"),
     _HostEnvironmentField("DELIVERY_SYSTEM_ATTESTATION_ISSUER_ID", "attestation_issuer_id", "required", "non-secret"),
     _HostEnvironmentField("DELIVERY_SYSTEM_ATTESTATION_KEY_ID", "attestation_key_id", "required", "non-secret"),
     _HostEnvironmentField("DELIVERY_SYSTEM_ATTESTATION_PRIVATE_KEY_PATH", "attestation_private_key_path", "required", "protected-reference"),
@@ -260,6 +261,7 @@ class HostConfiguration:
             repository_identity=_required_text(values, "github_repository"),
             repository_id=_required_id(values, "github_repository_id"),
             private_key_path=_required_path(values, "github_app_private_key_path"),
+            https_proxy=values.get("github_https_proxy"),
         )
         issuer_id = _required_text(values, "attestation_issuer_id")
         key_id = _required_text(values, "attestation_key_id")
