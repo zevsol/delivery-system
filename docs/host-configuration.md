@@ -56,6 +56,7 @@ The following inputs are optional:
 | `DELIVERY_SYSTEM_REVOCATION_AUTH_TOKEN_PATH` | optional revocation authentication token reference | absolute path | protected reference |
 | `DELIVERY_SYSTEM_ATTESTATION_LIFECYCLE_PATH` | optional attestation Ed25519 lifecycle manifest | absolute path | non-secret lifecycle-policy reference |
 | `DELIVERY_SYSTEM_AUTHORITY_BINDING_LIFECYCLE_PATH` | optional authority-binding Ed25519 lifecycle manifest | absolute path | non-secret lifecycle-policy reference |
+| `DELIVERY_SYSTEM_GITHUB_HTTPS_PROXY` | optional HTTPS proxy for GitHub App transport | `http://host[:port]` URL without credentials, query, or fragment | non-secret |
 
 The following operator authority input is forbidden:
 

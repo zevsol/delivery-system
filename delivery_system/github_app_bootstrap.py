@@ -18,7 +18,7 @@ import ssl
 import stat
 import threading
 from typing import Any, BinaryIO, Callable, Mapping, Protocol
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 import uuid
 
 import jwt
@@ -124,6 +124,7 @@ class GitHubAppBootstrapConfig:
     repository_identity: str
     repository_id: int
     private_key_path: str | os.PathLike[str]
+    https_proxy: str | None = None
 
     def __post_init__(self) -> None:
         if not _positive_id(self.app_id) or not _positive_id(self.repository_id):
@@ -139,6 +140,7 @@ class GitHubAppBootstrapConfig:
             path = self.private_key_path
         if type(path) is not str or not path or not os.path.isabs(path):
             raise _configuration_error()
+        _proxy_endpoint(self.https_proxy)
         object.__setattr__(self, "repository_identity", repository)
         object.__setattr__(self, "private_key_path", path)
 
@@ -414,27 +416,57 @@ def _path(repository_identity: str, suffix: str) -> str:
     return f"/repos/{quote(owner, safe='')}/{quote(name, safe='')}{suffix}"
 
 
+def _proxy_endpoint(value: str | None) -> tuple[str, int] | None:
+    """Validate the explicit HTTP CONNECT proxy without accepting credentials."""
+
+    if value is None:
+        return None
+    if type(value) is not str or not value.strip():
+        raise _configuration_error()
+    try:
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme.lower() != "http"
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in ("", "/")
+            or not parsed.hostname
+        ):
+            raise ValueError
+        port = parsed.port if parsed.port is not None else 80
+    except (TypeError, ValueError):
+        raise _configuration_error() from None
+    if not 1 <= port <= 65535:
+        raise _configuration_error()
+    return parsed.hostname, port
+
+
 class HttpsGitHubAppBootstrapTransport:
     """Fixed-origin, one-attempt HTTPS transport for bootstrap operations."""
 
-    __slots__ = ()
+    __slots__ = ("_proxy_host", "_proxy_port")
+
+    def __init__(self, https_proxy: str | None = None) -> None:
+        endpoint = _proxy_endpoint(https_proxy)
+        object.__setattr__(self, "_proxy_host", endpoint[0] if endpoint else None)
+        object.__setattr__(self, "_proxy_port", endpoint[1] if endpoint else None)
 
     def __repr__(self) -> str:
         return "<HttpsGitHubAppBootstrapTransport protected>"
 
-    @staticmethod
-    def _request(method: str, path: str, credential: str, body: bytes | None = None) -> GitHubAppBootstrapResponse:
+    def _request(self, method: str, path: str, credential: str, body: bytes | None = None) -> GitHubAppBootstrapResponse:
         if method not in {"GET", "POST"} or type(path) is not str or not path.startswith("/"):
             raise _acquisition_error()
         if body is not None and (type(body) is not bytes or len(body) > MAX_REQUEST_BYTES):
             raise _acquisition_error()
-        response = _attempt(lambda: HttpsGitHubAppBootstrapTransport._request_once(method, path, credential, body))
+        response = _attempt(lambda: self._request_once(method, path, credential, body))
         if type(response) is not GitHubAppBootstrapResponse:
             raise _acquisition_error()
         return response
 
-    @staticmethod
-    def _request_once(method: str, path: str, credential: str, body: bytes | None) -> GitHubAppBootstrapResponse:
+    def _request_once(self, method: str, path: str, credential: str, body: bytes | None) -> GitHubAppBootstrapResponse:
         headers = {
             "Accept": ACCEPT,
             "Authorization": f"Bearer {credential}",
@@ -445,11 +477,21 @@ class HttpsGitHubAppBootstrapTransport:
             headers["Content-Type"] = "application/json"
         connection = None
         try:
-            connection = http.client.HTTPSConnection(
-                API_HOST,
-                timeout=CONNECT_TIMEOUT_SECONDS,
-                context=ssl.create_default_context(),
-            )
+            context = ssl.create_default_context()
+            if self._proxy_host is None:
+                connection = http.client.HTTPSConnection(
+                    API_HOST,
+                    timeout=CONNECT_TIMEOUT_SECONDS,
+                    context=context,
+                )
+            else:
+                connection = http.client.HTTPSConnection(
+                    self._proxy_host,
+                    self._proxy_port,
+                    timeout=CONNECT_TIMEOUT_SECONDS,
+                    context=context,
+                )
+                connection.set_tunnel(API_HOST, 443)
             connection.connect()
             if getattr(connection, "sock", None) is not None:
                 connection.sock.settimeout(READ_TIMEOUT_SECONDS)
@@ -550,7 +592,7 @@ class GitHubAppInstallationCredentialBootstrap:
                 raise _configuration_error()
         object.__setattr__(self, "_GitHubAppInstallationCredentialBootstrap__config", config)
         object.__setattr__(self, "_GitHubAppInstallationCredentialBootstrap__private_key_source", private_key_source or FileGitHubAppPrivateKeySource(config.private_key_path))
-        object.__setattr__(self, "_GitHubAppInstallationCredentialBootstrap__transport", transport or HttpsGitHubAppBootstrapTransport())
+        object.__setattr__(self, "_GitHubAppInstallationCredentialBootstrap__transport", transport or HttpsGitHubAppBootstrapTransport(config.https_proxy))
         object.__setattr__(self, "_GitHubAppInstallationCredentialBootstrap__clock", clock)
         object.__setattr__(self, "_GitHubAppInstallationCredentialBootstrap__instance_factory", credential_instance_id_factory)
         object.__setattr__(self, "_GitHubAppInstallationCredentialBootstrap__reserved_instance_ids", set())

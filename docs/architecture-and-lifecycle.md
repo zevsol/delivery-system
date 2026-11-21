@@ -64,7 +64,7 @@ Evidence follows `generation → required persistence → interpretation → rep
 
 ## Integration-harness boundary
 
-A tested reusable harness is justified before another comparable live integration workflow. Candidate shared responsibilities are current-checkout provenance, explicit environment construction, subprocess lifecycle, sanitized telemetry, retained evidence, native accounting, cleanup, and failure classification. It is not an implemented product capability. See `ARC-HARNESS-01`.
+A reusable offline integration harness now validates checkout provenance, explicit Host configuration and sandbox scope, subprocess timeout cleanup, sanitized retained evidence, operation accounting, and ambiguous-outcome classification. It is test infrastructure, not a product Runtime capability. Real GitHub Apply acceptance remains deferred until an exact sandbox Host identity is configured and a live canary is separately authorized. See `ARC-HARNESS-01`.
 
 ## Installation, upgrade, and uninstall status
 
