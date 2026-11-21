@@ -43,7 +43,8 @@ from delivery_system.github_app_credential import GitHubAppInstallationCredentia
 
 
 NOW = datetime(2026, 9, 6, 12, tzinfo=timezone.utc)
-CONFIG = GitHubAppBootstrapConfig(12345, "owner/repo", 67890, "/outside/app.pem")
+PRIVATE_KEY_PATH = str(Path.cwd() / "outside" / "app.pem")
+CONFIG = GitHubAppBootstrapConfig(12345, "owner/repo", 67890, PRIVATE_KEY_PATH)
 TOKEN = "synthetic-installation-token"
 INSTALLATION_ID = 54321
 INSTANCE_IDS = iter((str(uuid.uuid4()), str(uuid.uuid4())))
@@ -223,10 +224,10 @@ def bootstrap(source=None, transport=None, config=CONFIG, instance_factory=None)
 class ConfigurationTests(unittest.TestCase):
     def test_rejects_invalid_configuration(self):
         cases = [
-            (True, "owner/repo", 1, "C:\\a.pem"),
-            (0, "owner/repo", 1, "C:\\a.pem"),
-            (1, "owner/repo", 0, "C:\\a.pem"),
-            (1, "invalid", 1, "C:\\a.pem"),
+            (True, "owner/repo", 1, PRIVATE_KEY_PATH),
+            (0, "owner/repo", 1, PRIVATE_KEY_PATH),
+            (1, "owner/repo", 0, PRIVATE_KEY_PATH),
+            (1, "invalid", 1, PRIVATE_KEY_PATH),
             (1, "owner/repo", 1, "relative.pem"),
             (1, "owner/repo", 1, ""),
         ]
@@ -499,7 +500,7 @@ class BootstrapTests(unittest.TestCase):
                     bootstrap(transport=transport).acquire()
 
     def test_remote_boolean_ids_are_rejected(self):
-        config = GitHubAppBootstrapConfig(1, "owner/repo", 1, "/outside/app.pem")
+        config = GitHubAppBootstrapConfig(1, "owner/repo", 1, PRIVATE_KEY_PATH)
 
         def matching_transport():
             return FakeTransport(
